@@ -77,6 +77,61 @@ export const MAX_BYTES_INBOX = envInt("FETCH_MAX_BYTES_INBOX", 64 * 1024);
 /** Additional hostnames (beyond IP classification) to deny — comma-separated. */
 export const DENY_CIDRS = envStr("CRAWL_DENY_CIDRS", "");
 
+/**
+ * Descriptive User-Agent for every guardedFetch (§5). A real UA string with a contact URL is good
+ * crawler citizenship and lets origin operators identify / block us.
+ */
+export const FETCH_USER_AGENT = envStr(
+  "FETCH_USER_AGENT",
+  "solid-webid-index/0.1 (+https://github.com/jeswr/solid-webid-index; SSRF-guarded crawler)"
+);
+
+/**
+ * Cloud-internal hostname suffixes denied on top of IP classification (§5 security C4). A host whose
+ * lowercased name equals or ends with one of these is refused BEFORE any DNS resolution, so a name
+ * that an internal resolver would map to a metadata/cluster endpoint can never be reached. Defence in
+ * depth: the IP classifier already blocks the addresses these names resolve to, but a denied name is
+ * cheaper and closes split-horizon DNS gaps.
+ */
+export const FETCH_HOSTNAME_DENYLIST: readonly string[] = envStr(
+  "FETCH_HOSTNAME_DENYLIST",
+  [
+    "metadata.google.internal",
+    "metadata.goog",
+    ".internal",
+    ".svc.cluster.local",
+    ".cluster.local",
+    ".vercel-internal.com",
+    "localhost",
+    ".localhost",
+    ".local",
+  ].join(",")
+)
+  .split(",")
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
+
+/**
+ * Response content-type allowlist for guardedFetch (§5). Only the RDF serialisations the app accepts
+ * are permitted on the FINAL response; `text/html`/RDFa is excluded (smaller attack surface — the
+ * robots.txt path uses its own `text/plain` allowlist). Matched against the bare media type (the part
+ * before `;`), case-insensitively.
+ */
+export const FETCH_RDF_CONTENT_TYPES: readonly string[] = [
+  "text/turtle",
+  "application/ld+json",
+  "application/json", // some servers serve JSON-LD as application/json
+  "application/n-triples",
+  "application/n-quads",
+  "application/trig",
+  "text/n3",
+  "application/rdf+xml",
+];
+
+/** The `Accept` header guardedFetch sends for RDF documents (mirrors {@link FETCH_RDF_CONTENT_TYPES}). */
+export const FETCH_RDF_ACCEPT =
+  "text/turtle, application/ld+json;q=0.9, application/n-triples;q=0.8, */*;q=0.1";
+
 // ─── Parser bomb caps (§5 security C3) ───────────────────────────────────────
 
 /** Max quads from a single RDF parse (applies to N3 streaming counter + post-toRDF ceiling). */
