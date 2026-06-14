@@ -55,6 +55,21 @@ export class CanonicalError extends Error {
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
 /**
+ * Loopback-only host check. `http:` is cleartext, so even under `allowLoopback` (dev/tests) it is
+ * accepted ONLY for loopback hosts — never for a real origin like `http://alice.example`.
+ * Mirrors the SSRF loopback set: `localhost`, `127.0.0.0/8`, and IPv6 `::1`.
+ */
+function isLoopbackHost(hostname: string): boolean {
+  const h = hostname.toLowerCase();
+  return (
+    h === "localhost" ||
+    h === "::1" ||
+    h === "[::1]" ||
+    /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h)
+  );
+}
+
+/**
  * Parse `raw` with WHATWG `URL`, normalise userinfo rejection and default-port stripping, apply
  * the trailing-slash policy, and return the result as a mutable URL object.
  * The fragment is NOT touched here — callers decide what to do with it.
@@ -74,11 +89,19 @@ function parseAndNormalise(raw: string, allowLoopback: boolean): URL {
       `Unsupported scheme "${u.protocol}"; only https: (and http: in dev) are accepted.`
     );
   }
-  if (u.protocol === "http:" && !allowLoopback) {
-    throw new CanonicalError(
-      raw,
-      "http: is not permitted in production; use https: (set allowLoopback for dev/tests)."
-    );
+  if (u.protocol === "http:") {
+    if (!allowLoopback) {
+      throw new CanonicalError(
+        raw,
+        "http: is not permitted in production; use https: (set allowLoopback for dev/tests)."
+      );
+    }
+    if (!isLoopbackHost(u.hostname)) {
+      throw new CanonicalError(
+        raw,
+        `http: under allowLoopback is permitted only for loopback hosts; "${u.hostname}" is not loopback.`
+      );
+    }
   }
 
   // Reject userinfo — DESIGN.md §2.2 "reject u.username || u.password"

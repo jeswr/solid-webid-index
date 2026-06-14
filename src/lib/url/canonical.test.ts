@@ -154,14 +154,33 @@ describe("canonicalDocUrl", () => {
       ).toBe("http://127.0.0.1/card");
     });
 
-    it("http and https of the same host+path are NOT equal (under allowLoopback)", () => {
-      const http = canonicalDocUrl("http://alice.example/card", {
+    it("http and https of the same loopback host+path are NOT equal (under allowLoopback)", () => {
+      const http = canonicalDocUrl("http://127.0.0.1/card", {
         allowLoopback: true,
       });
-      const https = canonicalDocUrl("https://alice.example/card", {
+      const https = canonicalDocUrl("https://127.0.0.1/card", {
         allowLoopback: true,
       });
       expect(http).not.toBe(https);
+    });
+
+    it("rejects http: for a NON-loopback host even under allowLoopback", () => {
+      // allowLoopback must not turn into 'accept all cleartext origins'
+      expect(() =>
+        canonicalDocUrl("http://alice.example/card", { allowLoopback: true })
+      ).toThrow(CanonicalError);
+      expect(() =>
+        canonicalWebId("http://alice.example/card#me", { allowLoopback: true })
+      ).toThrow(CanonicalError);
+    });
+
+    it("accepts http: for localhost and 127.x under allowLoopback", () => {
+      expect(
+        canonicalDocUrl("http://localhost/card", { allowLoopback: true })
+      ).toBe("http://localhost/card");
+      expect(
+        canonicalDocUrl("http://127.0.0.5/card", { allowLoopback: true })
+      ).toBe("http://127.0.0.5/card");
     });
   });
 
