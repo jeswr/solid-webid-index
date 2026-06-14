@@ -564,7 +564,7 @@ export class PgStore implements ReadStore, SearchIndex, CrawlCoordinator {
    * pglite note: pglite runs real Postgres internally (WASM), so FOR UPDATE SKIP
    * LOCKED is fully supported — verified by the concurrency test in pgStore.test.ts.
    */
-  async claim(workerId: string, batchSize: number): Promise<DocRecord[]> {
+  async claim(_workerId: string, batchSize: number): Promise<DocRecord[]> {
     const now = Date.now();
     // A row is reclaimable if it has been claimed for longer than LEASE_MS.
     // Import LEASE_MS from config so the threshold is the single-source constant.
@@ -572,6 +572,15 @@ export class PgStore implements ReadStore, SearchIndex, CrawlCoordinator {
     // the constructor to config (tests inject their own batchSize).
     const { LEASE_MS } = await import("../config.js");
     const expiredBefore = now - LEASE_MS;
+
+    // Generate a FRESH UNIQUE opaque token for this claim() call.  All rows in
+    // the batch share the same token (one token per claim() invocation is
+    // sufficient — the batch is atomic).  Using a UUID means a restarted worker
+    // or a re-claim of the same workerId CANNOT produce the same token, so a
+    // stale markDone() from a previous claim never matches the new owner's token.
+    // workerId is retained as the caller's logical identity but is NOT stored in
+    // claim_token — keeping the two concerns separate.
+    const claimToken = crypto.randomUUID();
 
     const rows = await this.db.query<DocRow>(
       `WITH eligible AS (
@@ -594,7 +603,7 @@ export class PgStore implements ReadStore, SearchIndex, CrawlCoordinator {
          FROM eligible
         WHERE doc.doc_url = eligible.doc_url
         RETURNING doc.*`,
-      [now, expiredBefore, batchSize, workerId]
+      [now, expiredBefore, batchSize, claimToken]
     );
 
     return rows.map(rowToRecord);

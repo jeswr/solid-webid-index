@@ -375,7 +375,10 @@ describe("PgStore — CrawlCoordinator", () => {
     expect(claimed).toHaveLength(1);
     expect(claimed[0].docUrl).toBe("https://frank.example/card");
     expect(claimed[0].state).toBe("claimed");
-    expect(claimed[0].claimToken).toBe("worker-1");
+    // claim_token is now a fresh UUID, NOT the workerId
+    expect(claimed[0].claimToken).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    );
     expect(claimed[0].attempts).toBe(1);
     expect(claimed[0].claimedAt).not.toBeNull();
   });
@@ -388,10 +391,16 @@ describe("PgStore — CrawlCoordinator", () => {
 
     const claimed = await store.claim("worker-1", 5);
     expect(claimed.length).toBeLessThanOrEqual(5);
-    // All returned rows must be marked claimed
+    // All returned rows must be marked claimed with the SAME unique token (one per claim() call)
+    expect(claimed.length).toBeGreaterThan(0);
+    const batchToken = claimed[0].claimToken;
+    expect(batchToken).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    );
     for (const row of claimed) {
       expect(row.state).toBe("claimed");
-      expect(row.claimToken).toBe("worker-1");
+      // All rows in the same batch share the same token
+      expect(row.claimToken).toBe(batchToken);
     }
   });
 
@@ -406,7 +415,10 @@ describe("PgStore — CrawlCoordinator", () => {
     // First worker claims the row
     const first = await store.claim("worker-A", 8);
     expect(first).toHaveLength(1);
-    expect(first[0].claimToken).toBe("worker-A");
+    // Token is a UUID, not the workerId
+    expect(first[0].claimToken).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    );
 
     // Second worker must not re-claim the same row (it's still claimed + lease not expired)
     const second = await store.claim("worker-B", 8);
@@ -437,14 +449,26 @@ describe("PgStore — CrawlCoordinator", () => {
     // With 20 rows and batchSize=8 each, both workers should get rows
     expect(setA.length + setB.length).toBeGreaterThan(0);
 
-    // All returned rows must be marked claimed with the correct token
+    // All returned rows must be marked claimed.
+    // Each claim() call produces ONE unique UUID token shared across its batch —
+    // so all rows in setA share the same token, and all rows in setB share a
+    // DIFFERENT token.  Neither token equals the workerId string.
+    const uuidPattern =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const tokenA = setA[0]?.claimToken;
+    const tokenB = setB[0]?.claimToken;
+    expect(tokenA).toMatch(uuidPattern);
+    expect(tokenB).toMatch(uuidPattern);
+    // The two batches must have different tokens
+    expect(tokenA).not.toBe(tokenB);
+
     for (const row of setA) {
       expect(row.state).toBe("claimed");
-      expect(row.claimToken).toBe("worker-concurrent-A");
+      expect(row.claimToken).toBe(tokenA);
     }
     for (const row of setB) {
       expect(row.state).toBe("claimed");
-      expect(row.claimToken).toBe("worker-concurrent-B");
+      expect(row.claimToken).toBe(tokenB);
     }
   });
 
@@ -471,7 +495,12 @@ describe("PgStore — CrawlCoordinator", () => {
     const reclaimed = await freshStore.claim("worker-second", 8);
     expect(reclaimed).toHaveLength(1);
     expect(reclaimed[0].docUrl).toBe("https://expired2.example/card");
-    expect(reclaimed[0].claimToken).toBe("worker-second");
+    // Token is a fresh UUID, not the workerId string
+    expect(reclaimed[0].claimToken).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    );
+    // The reclaim token must be different from the first worker's token
+    expect(reclaimed[0].claimToken).not.toBe(first[0].claimToken);
     expect(reclaimed[0].attempts).toBe(2); // incremented from the first claim
   });
 
@@ -497,18 +526,22 @@ describe("PgStore — CrawlCoordinator", () => {
   // ─── Lease-fence tests (roborev HIGH fix) ──────────────────────────────────
 
   it("markDone() with a STALE token is a safe no-op — new owner's state survives", async () => {
-    // Scenario: worker-A claims the row, its lease expires, worker-B reclaims it.
-    // worker-A's late markDone (stale token) must NOT clobber worker-B's in-progress state.
+    // Scenario: worker-A claims the row (gets a unique UUID tokenA), its lease expires,
+    // worker-B reclaims it (gets a DIFFERENT unique UUID tokenB).
+    // worker-A's late markDone(tokenA) must NOT clobber worker-B's in-progress state.
     const { LEASE_MS } = await import("../config.js");
     const { store: freshStore, db: freshDb } = await makeTestStore();
 
     await freshStore.enqueue("https://stale-token.example/card");
 
-    // worker-A claims the row
+    // worker-A claims the row — receives a unique UUID token
     const firstClaimed = await freshStore.claim("worker-A", 8);
     expect(firstClaimed).toHaveLength(1);
-    // claimToken is set by claim() — asserted non-null above via toHaveLength(1)
-    const staleToken = firstClaimed[0].claimToken as string; // worker-A's token
+    const tokenA = firstClaimed[0].claimToken as string;
+    // token is a UUID, not the workerId
+    expect(tokenA).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    );
 
     // Backdate claimed_at so worker-A's lease appears expired
     const expiredClaimedAt = Date.now() - LEASE_MS - 1;
@@ -517,12 +550,17 @@ describe("PgStore — CrawlCoordinator", () => {
       [expiredClaimedAt]
     );
 
-    // worker-B reclaims the expired row — has a different token
+    // worker-B reclaims the expired row — gets a DIFFERENT unique UUID token
     const secondClaimed = await freshStore.claim("worker-B", 8);
     expect(secondClaimed).toHaveLength(1);
-    expect(secondClaimed[0].claimToken).toBe("worker-B");
+    const tokenB = secondClaimed[0].claimToken as string;
+    expect(tokenB).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    );
+    // Critical: tokenB must differ from tokenA so the fence actually works
+    expect(tokenB).not.toBe(tokenA);
 
-    // worker-A's late markDone with its stale token must be a no-op
+    // worker-A's late markDone with its now-stale tokenA must be a no-op
     await expect(
       freshStore.markDone(
         "https://stale-token.example/card",
@@ -531,15 +569,103 @@ describe("PgStore — CrawlCoordinator", () => {
           httpStatus: 200,
           webid: "https://stale-worker.example/card#me",
         },
-        staleToken
+        tokenA
       )
     ).resolves.toBeUndefined(); // must NOT throw
 
     // worker-B's state and token must be preserved — not clobbered by worker-A
     const rowAfter = await freshStore.get("https://stale-token.example/card");
     expect(rowAfter?.state).toBe("claimed"); // still in worker-B's claimed state
-    expect(rowAfter?.claimToken).toBe("worker-B"); // worker-B still owns it
+    expect(rowAfter?.claimToken).toBe(tokenB); // worker-B's UUID token still present
     expect(rowAfter?.webid).toBeNull(); // worker-A's webid must NOT have been written
+  });
+
+  it("two sequential claims of the same row (after expiry) yield DIFFERENT claim tokens", async () => {
+    // This directly tests the uniqueness invariant: even re-claiming the same row
+    // with the same workerId must produce a fresh token each time.
+    const { LEASE_MS } = await import("../config.js");
+    const { store: freshStore, db: freshDb } = await makeTestStore();
+
+    await freshStore.enqueue("https://token-uniqueness.example/card");
+
+    // First claim
+    const first = await freshStore.claim("worker-same", 8);
+    expect(first).toHaveLength(1);
+    const token1 = first[0].claimToken as string;
+    expect(token1).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    );
+
+    // Backdate to expire the lease
+    await freshDb.query(
+      `UPDATE doc SET claimed_at = $1 WHERE doc_url = 'https://token-uniqueness.example/card'`,
+      [Date.now() - LEASE_MS - 1]
+    );
+
+    // Same worker reclaims — must get a DIFFERENT token
+    const second = await freshStore.claim("worker-same", 8);
+    expect(second).toHaveLength(1);
+    const token2 = second[0].claimToken as string;
+    expect(token2).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    );
+
+    // The two tokens MUST be different — this is the core of the fix
+    expect(token2).not.toBe(token1);
+  });
+
+  it("worker-B's markDone(tokenB) succeeds after worker-A's stale markDone(tokenA) no-ops", async () => {
+    // Full lifecycle: A claims → lease expires → B reclaims → A's markDone is no-op
+    //                → B's markDone succeeds and is visible.
+    const { LEASE_MS } = await import("../config.js");
+    const { store: freshStore, db: freshDb } = await makeTestStore();
+
+    await freshStore.enqueue("https://full-lifecycle.example/card");
+
+    // worker-A claims
+    const claimedA = await freshStore.claim("worker-A", 8);
+    expect(claimedA).toHaveLength(1);
+    const tokenA = claimedA[0].claimToken as string;
+
+    // Expire worker-A's lease
+    await freshDb.query(
+      `UPDATE doc SET claimed_at = $1 WHERE doc_url = 'https://full-lifecycle.example/card'`,
+      [Date.now() - LEASE_MS - 1]
+    );
+
+    // worker-B reclaims
+    const claimedB = await freshStore.claim("worker-B", 8);
+    expect(claimedB).toHaveLength(1);
+    const tokenB = claimedB[0].claimToken as string;
+    expect(tokenB).not.toBe(tokenA);
+
+    // worker-A's stale markDone — no-op
+    await freshStore.markDone(
+      "https://full-lifecycle.example/card",
+      { state: "done", httpStatus: 200, webid: "https://stale.example/#me" },
+      tokenA
+    );
+
+    // Row is still claimed by B
+    const midRow = await freshStore.get("https://full-lifecycle.example/card");
+    expect(midRow?.state).toBe("claimed");
+    expect(midRow?.claimToken).toBe(tokenB);
+    expect(midRow?.webid).toBeNull(); // A's write was no-op
+
+    // worker-B's markDone succeeds
+    await freshStore.markDone(
+      "https://full-lifecycle.example/card",
+      { state: "done", httpStatus: 200, webid: "https://real.example/#me" },
+      tokenB
+    );
+
+    const finalRow = await freshStore.get(
+      "https://full-lifecycle.example/card"
+    );
+    expect(finalRow?.state).toBe("done");
+    expect(finalRow?.claimToken).toBeNull();
+    expect(finalRow?.claimedAt).toBeNull();
+    expect(finalRow?.webid).toBe("https://real.example/#me"); // B's write succeeded
   });
 
   it("markDone() with the CORRECT token succeeds and clears the lease", async () => {
@@ -548,7 +674,11 @@ describe("PgStore — CrawlCoordinator", () => {
     await freshStore.enqueue("https://correct-token.example/card");
     const claimed = await freshStore.claim("worker-correct", 8);
     expect(claimed).toHaveLength(1);
+    // Token is a UUID returned by claim(), not the workerId
     const token = claimed[0].claimToken as string;
+    expect(token).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    );
 
     await expect(
       freshStore.markDone(
@@ -594,7 +724,10 @@ describe("PgStore — CrawlCoordinator", () => {
     const reclaimed = await freshStore.claim("worker-recrawl", 8);
     expect(reclaimed).toHaveLength(1);
     expect(reclaimed[0].docUrl).toBe("https://due-recrawl.example/card");
-    expect(reclaimed[0].claimToken).toBe("worker-recrawl");
+    // Token is a UUID, not the workerId
+    expect(reclaimed[0].claimToken).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    );
     expect(reclaimed[0].state).toBe("claimed");
   });
 
@@ -618,7 +751,10 @@ describe("PgStore — CrawlCoordinator", () => {
     const claimed = await freshStore.claim("worker-failed-recrawl", 8);
     expect(claimed).toHaveLength(1);
     expect(claimed[0].docUrl).toBe("https://due-failed.example/card");
-    expect(claimed[0].claimToken).toBe("worker-failed-recrawl");
+    // Token is a UUID, not the workerId
+    expect(claimed[0].claimToken).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    );
   });
 
   it("claim() — a not-yet-due 'done' row is NOT claimed", async () => {
