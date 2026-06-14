@@ -26,6 +26,30 @@ and the **storage stack is now just Vercel + Neon — no other vendors**.
 
 Where the sections below say Turso/libSQL/FTS5/QStash, read Neon/Postgres/tsvector/Cron+self-chain.
 
+## DECISION ADDENDUM — 2026-06-14 (RDF libraries: use the solid-ai-coding skill libs, never a bespoke parser)
+
+All RDF parsing, extraction, and serialisation MUST use the libraries the vendored solid-ai-coding
+skills prescribe (`.agents/skills/`). **Do NOT implement a custom RDF parser** (no inline
+`new Parser().parse(...)`, no `rdf-parse`).
+
+- **Parse:** `@jeswr/fetch-rdf` — `parseRdf(body, contentType, { baseIRI })` → `n3.Store`
+  (Turtle/N-Triples/N-Quads/TriG via n3; JSON-LD via jsonld-streaming-parser). For crawling
+  attacker URLs, fetch the bytes through our SSRF chokepoint `guardedFetch`, then hand the text +
+  content-type to `parseRdf` (guardedFetch = network safety; parseRdf = the sanctioned parse). See
+  the `solid-fetch-rdf` skill.
+- **Extract:** `@solid/object` — `new WebIdDataset(dataset, DataFactory).mainSubject` yields an
+  `Agent` with `.name`, `.photoUrl`, `.oidcIssuer: Set`, `.knows: Set`, `.storageUrls: Set`, etc. —
+  exactly the crawler's fields. Use it instead of manual quad matching. See the `solid-object`
+  skill (incl. its `ProfileAgent` reference class for richer UI rendering).
+- **Serialise:** `n3.Writer` (per `solid-fetch-rdf`/AGENTS.md) — never hand-concatenate triples.
+
+**Caps go UPSTREAM (the maintainer owns `@jeswr/fetch-rdf`).** `ParseRdfOptions` today exposes only
+`baseIRI` — it has no `maxQuads` and no JSON-LD remote-`@context` control. The parser-bomb / quad
+caps and the safe-by-default (no-remote-fetch) JSON-LD documentLoader are contributed to
+`jeswr/fetch-rdf` upstream (then consumed here, via a git dependency until published) — not
+reimplemented as a local wrapper. `parse-caps` (pss-ylr) therefore = wire the upstreamed capped
+`parseRdf` + `@solid/object` into the crawl/extract path, and depends on the upstream-caps task.
+
 ## 0. Goal & non-negotiables
 
 A public, Linked-Data-native index of Solid WebIDs with **feature parity** to
