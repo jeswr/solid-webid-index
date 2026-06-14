@@ -246,8 +246,22 @@ export interface CrawlCoordinator {
 
   /**
    * Finalise a completed crawl attempt: update state, validators, and next_eligible_at.
+   *
+   * @param claimToken  The token returned by the claim() call that owns this row.
+   *   The UPDATE is fenced to `WHERE doc_url = docUrl AND claim_token = claimToken`.
+   *   If the token no longer matches (row was reclaimed by another worker after this
+   *   worker's lease expired), the update touches 0 rows and is treated as a SAFE
+   *   NO-OP — the stale completion is silently discarded.  Pass `null` / `undefined`
+   *   only when calling outside the claim→markDone lifecycle (e.g. tests that call
+   *   enqueue() then markDone() directly without going through claim()); in that case
+   *   the fence is skipped and the traditional "0 rows = unknown docUrl → throw"
+   *   behaviour is preserved.
    */
-  markDone(docUrl: string, result: CrawlResult): Promise<void>;
+  markDone(
+    docUrl: string,
+    result: CrawlResult,
+    claimToken?: string | null
+  ): Promise<void>;
 
   /**
    * Returns true when the doc is due for re-crawl.

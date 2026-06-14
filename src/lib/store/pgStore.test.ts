@@ -479,16 +479,170 @@ describe("PgStore — CrawlCoordinator", () => {
     await store.enqueue("https://release.example/card");
     const claimed = await store.claim("worker-X", 8);
     expect(claimed).toHaveLength(1);
+    const token = claimed[0].claimToken;
+    expect(token).not.toBeNull();
 
-    await store.markDone("https://release.example/card", {
-      state: "done",
-      httpStatus: 200,
-    });
+    await store.markDone(
+      "https://release.example/card",
+      { state: "done", httpStatus: 200 },
+      token
+    );
 
     const doc = await store.get("https://release.example/card");
     expect(doc?.state).toBe("done");
     expect(doc?.claimToken).toBeNull();
     expect(doc?.claimedAt).toBeNull();
+  });
+
+  // ─── Lease-fence tests (roborev HIGH fix) ──────────────────────────────────
+
+  it("markDone() with a STALE token is a safe no-op — new owner's state survives", async () => {
+    // Scenario: worker-A claims the row, its lease expires, worker-B reclaims it.
+    // worker-A's late markDone (stale token) must NOT clobber worker-B's in-progress state.
+    const { LEASE_MS } = await import("../config.js");
+    const { store: freshStore, db: freshDb } = await makeTestStore();
+
+    await freshStore.enqueue("https://stale-token.example/card");
+
+    // worker-A claims the row
+    const firstClaimed = await freshStore.claim("worker-A", 8);
+    expect(firstClaimed).toHaveLength(1);
+    // claimToken is set by claim() — asserted non-null above via toHaveLength(1)
+    const staleToken = firstClaimed[0].claimToken as string; // worker-A's token
+
+    // Backdate claimed_at so worker-A's lease appears expired
+    const expiredClaimedAt = Date.now() - LEASE_MS - 1;
+    await freshDb.query(
+      `UPDATE doc SET claimed_at = $1 WHERE doc_url = 'https://stale-token.example/card'`,
+      [expiredClaimedAt]
+    );
+
+    // worker-B reclaims the expired row — has a different token
+    const secondClaimed = await freshStore.claim("worker-B", 8);
+    expect(secondClaimed).toHaveLength(1);
+    expect(secondClaimed[0].claimToken).toBe("worker-B");
+
+    // worker-A's late markDone with its stale token must be a no-op
+    await expect(
+      freshStore.markDone(
+        "https://stale-token.example/card",
+        {
+          state: "done",
+          httpStatus: 200,
+          webid: "https://stale-worker.example/card#me",
+        },
+        staleToken
+      )
+    ).resolves.toBeUndefined(); // must NOT throw
+
+    // worker-B's state and token must be preserved — not clobbered by worker-A
+    const rowAfter = await freshStore.get("https://stale-token.example/card");
+    expect(rowAfter?.state).toBe("claimed"); // still in worker-B's claimed state
+    expect(rowAfter?.claimToken).toBe("worker-B"); // worker-B still owns it
+    expect(rowAfter?.webid).toBeNull(); // worker-A's webid must NOT have been written
+  });
+
+  it("markDone() with the CORRECT token succeeds and clears the lease", async () => {
+    const { store: freshStore } = await makeTestStore();
+
+    await freshStore.enqueue("https://correct-token.example/card");
+    const claimed = await freshStore.claim("worker-correct", 8);
+    expect(claimed).toHaveLength(1);
+    const token = claimed[0].claimToken as string;
+
+    await expect(
+      freshStore.markDone(
+        "https://correct-token.example/card",
+        { state: "done", httpStatus: 200, isSolid: true },
+        token
+      )
+    ).resolves.toBeUndefined();
+
+    const doc = await freshStore.get("https://correct-token.example/card");
+    expect(doc?.state).toBe("done");
+    expect(doc?.claimToken).toBeNull();
+    expect(doc?.claimedAt).toBeNull();
+    expect(doc?.isSolid).toBe(true);
+  });
+
+  // ─── Due-recrawl eligibility tests (roborev MEDIUM fix) ──────────────────
+
+  it("claim() — a due 'done' row (next_eligible_at in the past) IS re-claimable", async () => {
+    const { store: freshStore } = await makeTestStore();
+
+    await freshStore.enqueue("https://due-recrawl.example/card");
+
+    // First worker claims + marks done with next_eligible_at in the past
+    const firstClaimed = await freshStore.claim("worker-initial", 8);
+    expect(firstClaimed).toHaveLength(1);
+    const firstToken = firstClaimed[0].claimToken as string;
+
+    await freshStore.markDone(
+      "https://due-recrawl.example/card",
+      {
+        state: "done",
+        httpStatus: 200,
+        nextEligibleAt: Date.now() - 1, // already due
+      },
+      firstToken
+    );
+
+    const afterDone = await freshStore.get("https://due-recrawl.example/card");
+    expect(afterDone?.state).toBe("done");
+
+    // A new worker should be able to claim the due-done row
+    const reclaimed = await freshStore.claim("worker-recrawl", 8);
+    expect(reclaimed).toHaveLength(1);
+    expect(reclaimed[0].docUrl).toBe("https://due-recrawl.example/card");
+    expect(reclaimed[0].claimToken).toBe("worker-recrawl");
+    expect(reclaimed[0].state).toBe("claimed");
+  });
+
+  it("claim() — a due 'failed' row (next_eligible_at in the past) IS re-claimable", async () => {
+    const { store: freshStore } = await makeTestStore();
+
+    await freshStore.enqueue("https://due-failed.example/card");
+
+    // Directly set the row to 'failed' with a past next_eligible_at via put()
+    const doc = await freshStore.get("https://due-failed.example/card");
+    // doc is always set — just enqueued above; cast to narrow the type
+    const docRecord = doc as NonNullable<typeof doc>;
+    await freshStore.put({
+      ...docRecord,
+      state: "failed",
+      failClass: "transient",
+      nextEligibleAt: Date.now() - 1, // already due
+    });
+
+    // A worker should be able to claim the due-failed row
+    const claimed = await freshStore.claim("worker-failed-recrawl", 8);
+    expect(claimed).toHaveLength(1);
+    expect(claimed[0].docUrl).toBe("https://due-failed.example/card");
+    expect(claimed[0].claimToken).toBe("worker-failed-recrawl");
+  });
+
+  it("claim() — a not-yet-due 'done' row is NOT claimed", async () => {
+    const { store: freshStore } = await makeTestStore();
+
+    await freshStore.enqueue("https://not-yet-due.example/card");
+    const firstClaimed = await freshStore.claim("worker-initial-nd", 8);
+    expect(firstClaimed).toHaveLength(1);
+    const firstToken = firstClaimed[0].claimToken as string;
+
+    // Mark done with next_eligible_at far in the future
+    await freshStore.markDone(
+      "https://not-yet-due.example/card",
+      {
+        state: "done",
+        httpStatus: 200,
+        nextEligibleAt: Date.now() + 14 * 24 * 60 * 60 * 1000, // 14 days from now
+      },
+      firstToken
+    );
+
+    // No worker should claim it — it's not due yet
+    const notClaimed = await freshStore.claim("worker-should-not-get", 8);
+    expect(notClaimed).toHaveLength(0);
   });
 });
 

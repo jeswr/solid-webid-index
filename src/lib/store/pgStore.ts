@@ -527,14 +527,18 @@ export class PgStore implements ReadStore, SearchIndex, CrawlCoordinator {
   }
 
   /**
-   * Atomically claim a batch of pending (or expired-lease) frontier rows.
+   * Atomically claim a batch of pending (or expired-lease, or due-terminal) frontier rows.
    *
    * SQL pattern — single statement, one round-trip:
    *
    *   WITH eligible AS (
    *     SELECT doc_url FROM doc
-   *     WHERE (state = 'pending' AND next_eligible_at <= now)
-   *        OR (state = 'claimed' AND claimed_at <= expiredBefore)
+   *     WHERE (
+   *       (state IN ('pending','done','failed') AND next_eligible_at <= now)
+   *       OR
+   *       (state = 'claimed' AND claimed_at <= expiredBefore)
+   *     )
+   *     AND noindex = FALSE
    *     ORDER BY depth ASC, next_eligible_at ASC
    *     LIMIT batchSize
    *     FOR UPDATE SKIP LOCKED          -- skip rows locked by concurrent workers
@@ -550,9 +554,12 @@ export class PgStore implements ReadStore, SearchIndex, CrawlCoordinator {
    * row this transaction has already locked — concurrent workers therefore receive
    * disjoint row sets with no blocking and no double-claims.
    *
-   * Lease expiry: a row with state='claimed' and claimed_at <= (now - LEASE_MS)
-   * is treated as reclaimable (crash recovery). markDone() clears the lease on
-   * normal completion.
+   * Eligibility:
+   *   - pending rows whose next_eligible_at <= now (immediate crawl)
+   *   - done/failed rows whose next_eligible_at <= now (due recrawl — DESIGN.md §3.4)
+   *   - claimed rows whose claimed_at <= (now - LEASE_MS) (crash recovery)
+   *
+   * markDone() clears the lease on normal completion with a token-fenced UPDATE.
    *
    * pglite note: pglite runs real Postgres internally (WASM), so FOR UPDATE SKIP
    * LOCKED is fully supported — verified by the concurrency test in pgStore.test.ts.
@@ -570,9 +577,9 @@ export class PgStore implements ReadStore, SearchIndex, CrawlCoordinator {
       `WITH eligible AS (
          SELECT doc_url FROM doc
          WHERE (
-           (state = 'pending'  AND next_eligible_at <= $1)
+           (state IN ('pending', 'done', 'failed') AND next_eligible_at <= $1)
            OR
-           (state = 'claimed'  AND claimed_at IS NOT NULL AND claimed_at <= $2)
+           (state = 'claimed' AND claimed_at IS NOT NULL AND claimed_at <= $2)
          )
          AND noindex = FALSE
          ORDER BY depth ASC, next_eligible_at ASC
@@ -593,10 +600,63 @@ export class PgStore implements ReadStore, SearchIndex, CrawlCoordinator {
     return rows.map(rowToRecord);
   }
 
-  async markDone(docUrl: string, result: CrawlResult): Promise<void> {
+  async markDone(
+    docUrl: string,
+    result: CrawlResult,
+    claimToken?: string | null
+  ): Promise<void> {
+    // When a claimToken is provided, fence the UPDATE so only the owning worker
+    // can write back results.  If the lease expired and another worker reclaimed
+    // the row, our token no longer matches — 0 rows updated is a STALE completion
+    // (safe no-op: the new owner's in-progress state must not be clobbered).
+    //
+    // When no claimToken is provided (e.g. tests that call enqueue→markDone directly
+    // without going through claim()), fall back to the traditional doc_url-only
+    // predicate, and treat 0 rows as a caller error (unknown URL → throw).
+    if (claimToken != null) {
+      await this.db.query<{ doc_url: string }>(
+        `UPDATE doc SET
+           state            = $2,
+           http_status      = $3,
+           etag             = COALESCE($4, etag),
+           last_modified    = COALESCE($5, last_modified),
+           content_hash     = COALESCE($6, content_hash),
+           raw_rdf          = COALESCE($7, raw_rdf),
+           is_solid         = COALESCE($8, is_solid),
+           webid            = COALESCE($9, webid),
+           fail_class       = $10,
+           error            = $11,
+           next_eligible_at = $12,
+           last_crawled     = $13,
+           claim_token      = NULL,
+           claimed_at       = NULL
+         WHERE doc_url = $1
+           AND claim_token = $14
+         RETURNING doc_url`,
+        [
+          docUrl,
+          result.state,
+          result.httpStatus ?? null,
+          result.etag ?? null,
+          result.lastModified ?? null,
+          result.contentHash ?? null,
+          result.rawRdf ?? null,
+          result.isSolid ?? null,
+          result.webid ?? null,
+          result.failClass ?? null,
+          result.error ?? null,
+          result.nextEligibleAt ?? Date.now() + 14 * 24 * 60 * 60 * 1000,
+          Date.now(),
+          claimToken,
+        ]
+      );
+      // 0 rows updated = stale completion (token mismatch — row reclaimed by another
+      // worker).  Safe no-op: do NOT throw, do NOT clobber the new owner's state.
+      return;
+    }
+
+    // No claimToken: traditional path (enqueue→markDone without claim).
     // RETURNING doc_url lets us detect a no-op UPDATE (0 rows matched).
-    // The crawl flow always calls enqueue() before claim()/markDone(), so a
-    // zero-row result is always a caller bug — throw rather than silently drop.
     const updated = await this.db.query<{ doc_url: string }>(
       `UPDATE doc SET
          state            = $2,
