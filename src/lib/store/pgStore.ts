@@ -700,6 +700,26 @@ export function splitSqlStatements(sql: string): string[] {
     }
 
     // Statement terminator
+    // Dollar-quoted body ($$...$$ or $tag$...$tag$) — Postgres function bodies,
+    // DO blocks, etc. Everything up to the matching close tag is opaque and may
+    // contain ';', '--', or other '$'. The tag regex requires an empty tag or one
+    // starting with a letter/underscore, so parameter placeholders like $1 never match.
+    if (ch === "$") {
+      const tag = /^\$([A-Za-z_]\w*)?\$/.exec(sql.slice(i))?.[0];
+      if (tag) {
+        const end = sql.indexOf(tag, i + tag.length);
+        if (end === -1) {
+          // Unterminated dollar-quote: append the remainder verbatim and stop.
+          current += sql.slice(i);
+          i = sql.length;
+        } else {
+          current += sql.slice(i, end + tag.length);
+          i = end + tag.length;
+        }
+        continue;
+      }
+    }
+
     if (ch === ";") {
       const trimmed = current.trim();
       if (trimmed.length > 0) {

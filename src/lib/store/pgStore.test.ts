@@ -567,4 +567,29 @@ describe("splitSqlStatements() — robustness", () => {
     const stmts = splitSqlStatements(sql);
     expect(stmts).toHaveLength(0);
   });
+
+  it("does not split on a semicolon inside a $$ dollar-quoted body", () => {
+    const sql =
+      "CREATE FUNCTION f() RETURNS int AS $$ BEGIN; RETURN 1; END; $$ LANGUAGE plpgsql; SELECT 1;";
+    const stmts = splitSqlStatements(sql);
+    expect(stmts).toHaveLength(2);
+    expect(stmts[0]).toContain("$$ BEGIN; RETURN 1; END; $$");
+    expect(stmts[1]).toBe("SELECT 1");
+  });
+
+  it("handles tagged dollar-quotes ($tag$ … $tag$)", () => {
+    const sql = "DO $body$ BEGIN; PERFORM 1; END $body$; SELECT 2;";
+    const stmts = splitSqlStatements(sql);
+    expect(stmts).toHaveLength(2);
+    expect(stmts[0]).toContain("$body$ BEGIN; PERFORM 1; END $body$");
+    expect(stmts[1]).toBe("SELECT 2");
+  });
+
+  it("does not treat $1 parameter placeholders as dollar-quotes", () => {
+    const sql = "UPDATE t SET a=$1 WHERE id=$2; SELECT 3;";
+    const stmts = splitSqlStatements(sql);
+    expect(stmts).toHaveLength(2);
+    expect(stmts[0]).toBe("UPDATE t SET a=$1 WHERE id=$2");
+    expect(stmts[1]).toBe("SELECT 3");
+  });
 });
