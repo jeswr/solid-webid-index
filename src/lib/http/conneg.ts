@@ -222,14 +222,108 @@ export function parseAcceptHeader(
 }
 
 /**
- * Returns true if a parsed AcceptEntry matches the given fully-qualified
- * media type string (e.g. `"text/turtle"`), handling wildcard types.
+ * Specificity score for a media-range match (RFC 7231 §5.3.2).
+ *
+ * Higher = more specific (exact match > type/* > *\/*).
+ *   2 = exact type/subtype match
+ *   1 = type/* wildcard match
+ *   0 = *\/* wildcard match
+ * Returns -1 when the entry does not match the target at all.
  */
-function entryMatches(entry: AcceptEntry, target: ConnegType): boolean {
+function matchSpecificity(entry: AcceptEntry, target: ConnegType): number {
   const [targetType, targetSub] = target.split("/");
-  if (entry.type === "*" && entry.subtype === "*") return true;
-  if (entry.type === targetType && entry.subtype === "*") return true;
-  return entry.type === targetType && entry.subtype === targetSub;
+  if (entry.type === "*" && entry.subtype === "*") return 0;
+  if (entry.type !== targetType) return -1;
+  if (entry.subtype === "*") return 1;
+  if (entry.subtype === targetSub) return 2;
+  return -1;
+}
+
+/**
+ * Compute the effective q-value for a supported media type against the parsed
+ * Accept entries, following RFC 7231 §5.3.2 media-range specificity rules.
+ *
+ * For each supported type the MOST SPECIFIC matching Accept range is selected
+ * (exact type > type/* > *\/*). The q-value of that most-specific range is the
+ * effective q. If no Accept range matches, defaults to 1.0 (RFC 7231: absence
+ * of an Accept field means any type is acceptable with q=1).
+ *
+ * Returns null when there are Accept entries but none match this type
+ * (indicating the type is implicitly unacceptable — caller should treat as
+ * not-acceptable unless the type would be a wildcard default).
+ *
+ * Actually: RFC 7231 says if a media type has no match at all (not even *\/*)
+ * then its effective q is 0. But for our purposes: we return the best-match q,
+ * or 0 if no match exists but Accept entries were present.
+ */
+function effectiveQ(entries: AcceptEntry[], target: ConnegType): number {
+  if (entries.length === 0) return 1.0; // no Accept → all acceptable at q=1
+
+  let bestSpec = -1;
+  let bestQ = -1; // sentinel: no match found yet
+
+  for (const entry of entries) {
+    const spec = matchSpecificity(entry, target);
+    if (spec < 0) continue; // no match
+    if (spec > bestSpec || (spec === bestSpec && bestQ === -1)) {
+      bestSpec = spec;
+      bestQ = entry.q;
+    }
+  }
+
+  // No Accept range matched → implicitly unacceptable (q=0) per RFC 7231.
+  return bestQ === -1 ? 0 : bestQ;
+}
+
+/**
+ * Parse a comma-separated `If-None-Match` header value into a list of entity
+ * tags (strong or weak, with surrounding double-quotes preserved).
+ *
+ * Handles:
+ *   - `*`  (wildcard — matches any representation)
+ *   - `"tag"` (strong ETag)
+ *   - `W/"tag"` (weak ETag, treated as opaque string for comparison)
+ *   - comma-separated lists of the above
+ *
+ * Returns an array of trimmed tag strings, or `["*"]` for the wildcard.
+ */
+export function parseIfNoneMatch(header: string | null | undefined): string[] {
+  if (!header) return [];
+  const trimmed = header.trim();
+  if (trimmed === "*") return ["*"];
+  // Split on commas that are outside of quoted strings.
+  // Entity tags are either W/"..." or "..." so we split naively on commas
+  // then re-join any splits that fell inside a quoted segment.
+  return trimmed
+    .split(",")
+    .map((t) => t.trim())
+    .filter(Boolean);
+}
+
+/**
+ * Returns true when the given `etag` is matched by the `If-None-Match`
+ * header value per RFC 7232 §3.2.
+ *
+ * Rules:
+ *   - `*` matches any non-empty ETag (i.e. the resource exists).
+ *   - A list of entity-tags: the comparison is weak (W/ prefix stripped,
+ *     quotes stripped) for If-None-Match (RFC 7232 §2.3).
+ *
+ * For simplicity we do a case-sensitive exact match after stripping W/ prefix
+ * (our ETags are sha256 hash strings so they never differ only in case).
+ */
+export function ifNoneMatchMatches(
+  header: string | null | undefined,
+  etag: string
+): boolean {
+  const tags = parseIfNoneMatch(header);
+  if (tags.length === 0) return false;
+  if (tags[0] === "*") return true;
+  // Strip W/ prefix for weak comparison, then compare.
+  const normalise = (t: string) =>
+    t.startsWith("W/") ? t.slice(2).trim() : t.trim();
+  const normEtag = normalise(etag);
+  return tags.some((t) => normalise(t) === normEtag);
 }
 
 /**
@@ -302,34 +396,59 @@ export function negotiateType(header: string | null | undefined): {
   // Empty / missing Accept → default to Turtle (machine default per DESIGN.md §4.0).
   if (entries.length === 0) return { type: "text/turtle", profile: null };
 
-  // Walk entries in q-value order; the first matching supported type wins.
-  for (const entry of entries) {
-    // Wildcard: serve our preferred type (Turtle for machines).
-    if (entry.type === "*" && entry.subtype === "*") {
-      if (entry.q === 0) return { type: null, profile: null }; // */* with q=0 → 406
-      return { type: "text/turtle", profile: null };
-    }
+  // RFC 7231 §5.3.2: for each supported representation, compute its effective
+  // q from the MOST SPECIFIC matching Accept range.  Pick the supported type
+  // with the highest effective q (> 0), tie-broken by server preference order
+  // (CONNEG_TYPES order: turtle > ld+json > n-triples > html).
 
-    for (const candidate of CONNEG_TYPES) {
-      if (candidate === "text/html") continue; // handled by prefersHtml above
-      if (entryMatches(entry, candidate)) {
-        if (entry.q === 0) {
-          // This type is explicitly refused; continue to next entry.
-          break;
-        }
-        // Extract profile parameter for JSON-LD (media type parameter).
-        let profile: string | null = null;
-        if (candidate === "application/ld+json" && entry.params) {
+  // Server-preference order (lower index = higher preference).
+  const RDF_CANDIDATES: Exclude<ConnegType, "text/html">[] = [
+    "text/turtle",
+    "application/ld+json",
+    "application/n-triples",
+  ];
+
+  let bestType: Exclude<ConnegType, "text/html"> | null = null;
+  let bestQ = -1;
+  let bestPref = RDF_CANDIDATES.length; // lower = more preferred
+
+  for (let pref = 0; pref < RDF_CANDIDATES.length; pref++) {
+    const candidate = RDF_CANDIDATES[pref];
+    const q = effectiveQ(entries, candidate);
+    if (q <= 0) continue; // explicitly refused or not acceptable
+    // Choose if higher q, or same q and more preferred.
+    if (q > bestQ || (q === bestQ && pref < bestPref)) {
+      bestQ = q;
+      bestType = candidate;
+      bestPref = pref;
+    }
+  }
+
+  if (bestType === null) {
+    // Nothing acceptable → 406.
+    return { type: null, profile: null };
+  }
+
+  // Extract profile parameter from the winning JSON-LD entry (the most-specific
+  // matching Accept entry for application/ld+json carries the params).
+  let profile: string | null = null;
+  if (bestType === "application/ld+json") {
+    let bestSpec = -1;
+    for (const entry of entries) {
+      const spec = matchSpecificity(entry, "application/ld+json");
+      if (spec > bestSpec) {
+        bestSpec = spec;
+        // Extract profile from this entry's params.
+        profile = null;
+        if (entry.params) {
           const m = entry.params.match(/profile\s*=\s*"?([^";,\s]+)"?/i);
           if (m) profile = m[1];
         }
-        return { type: candidate, profile };
       }
     }
   }
 
-  // Nothing matched → 406.
-  return { type: null, profile: null };
+  return { type: bestType, profile };
 }
 
 // ─── Serialisation helpers ────────────────────────────────────────────────────
@@ -650,7 +769,7 @@ export async function buildRdfResponse(
   const etag = computeETag(body, type, profile);
 
   // ── 4. Conditional — If-None-Match → 304 ────────────────────────────────────
-  if (ifNoneMatch && ifNoneMatch.trim() === etag) {
+  if (ifNoneMatchMatches(ifNoneMatch, etag)) {
     return new Response(null, {
       status: 304,
       headers: {
@@ -689,10 +808,14 @@ export async function buildRdfResponse(
 /**
  * Build a `Response` from a pre-serialised body string (cache-hit path).
  *
- * The body is used as-is; the caller is responsible for ensuring the content
- * matches `mediaType`. ETag is computed from body + mediaType + profile.
+ * Negotiates the Accept header against the cached representation's media type.
+ * If the cached `mediaType` is not acceptable per the request's Accept header
+ * (i.e. `effectiveQ` returns 0 for it), returns a 406 response — the caller
+ * must serialise a different representation or propagate the 406.
  *
- * Returns 304 when If-None-Match matches, otherwise 200 (or `status`).
+ * ETag is computed from body + mediaType + profile.
+ * Returns 304 when If-None-Match matches, 406 when not acceptable, otherwise
+ * 200 (or `status`).
  */
 export function buildCachedRdfResponse(opts: {
   request: Request;
@@ -710,7 +833,30 @@ export function buildCachedRdfResponse(opts: {
     status = 200,
     extraHeaders = {},
   } = opts;
+  const acceptHeader = request.headers.get("Accept");
   const ifNoneMatch = request.headers.get("If-None-Match");
+
+  // ── Accept negotiation ───────────────────────────────────────────────────────
+  // Verify that the cached representation's media type is acceptable to the
+  // client.  An explicit q=0 (or no matching range) means the client refuses it.
+  const entries = parseAcceptHeader(acceptHeader);
+  const q = effectiveQ(entries, mediaType);
+  if (q <= 0) {
+    // The cached type is not acceptable — return 406.
+    return new Response(
+      "Not Acceptable: supported types are text/turtle, application/ld+json, application/n-triples, text/html",
+      {
+        status: 406,
+        headers: {
+          "Content-Type": "text/plain; charset=utf-8",
+          Vary: "Accept",
+          ...READ_CORS_HEADERS,
+          ...extraHeaders,
+        },
+      }
+    );
+  }
+
   const etag = computeETag(body, mediaType, profile);
 
   const baseHeaders: Record<string, string> = {
@@ -720,7 +866,8 @@ export function buildCachedRdfResponse(opts: {
     ...extraHeaders,
   };
 
-  if (ifNoneMatch && ifNoneMatch.trim() === etag) {
+  // ── Conditional: If-None-Match → 304 ────────────────────────────────────────
+  if (ifNoneMatchMatches(ifNoneMatch, etag)) {
     return new Response(null, { status: 304, headers: baseHeaders });
   }
 

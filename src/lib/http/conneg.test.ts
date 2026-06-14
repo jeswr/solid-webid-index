@@ -24,8 +24,10 @@ import {
   buildCachedRdfResponse,
   buildRdfResponse,
   computeETag,
+  ifNoneMatchMatches,
   negotiateType,
   parseAcceptHeader,
+  parseIfNoneMatch,
   prefersHtml,
   serializeJsonLdCompacted,
   serializeNTriples,
@@ -225,6 +227,124 @@ describe("negotiateType", () => {
   it("ignores text/turtle with q=0 and falls through to next type", () => {
     const { type } = negotiateType("text/turtle;q=0, application/ld+json");
     expect(type).toBe("application/ld+json");
+  });
+
+  // ── Finding 1: q=0 + media-range specificity ────────────────────────────────
+
+  it("text/turtle;q=0, */*;q=1 does NOT return Turtle — returns next acceptable type", () => {
+    // Turtle is explicitly refused (q=0 takes precedence over */*);
+    // server preference order picks application/ld+json next.
+    const { type } = negotiateType("text/turtle;q=0, */*;q=1");
+    expect(type).not.toBe("text/turtle");
+    expect(type).toBe("application/ld+json");
+  });
+
+  it("a type with q=0 is never chosen even when */* has higher q", () => {
+    // All RDF types explicitly refused — nothing left to serve.
+    const { type } = negotiateType(
+      "text/turtle;q=0, application/ld+json;q=0, application/n-triples;q=0, */*;q=1"
+    );
+    // */* has q=1 but server prefers Turtle and all explicit RDF types are q=0;
+    // the specific q=0 range beats the wildcard for those types → 406.
+    expect(type).toBeNull();
+  });
+
+  it("most-specific range wins over */*: exact type match takes precedence", () => {
+    // */* at q=1, but application/ld+json is specifically at q=0.8.
+    // For ld+json, the exact match (q=0.8) is more specific than */* (q=1).
+    // For turtle, */* applies (q=1). So turtle wins.
+    const { type } = negotiateType("*/*;q=1, application/ld+json;q=0.8");
+    // turtle has effective q=1 (from */*); ld+json has q=0.8 (exact match);
+    // n-triples has q=1 (from */*). Turtle is most preferred server type at q=1.
+    expect(type).toBe("text/turtle");
+  });
+
+  it("most-specific range wins: explicit lower-q beats wildcard higher-q for that type", () => {
+    // turtle is pinned at q=0.5 via exact match, */* at q=0.9.
+    // turtle's effective q = 0.5 (exact > wildcard); ld+json's effective q = 0.9 (*/*).
+    const { type } = negotiateType("text/turtle;q=0.5, */*;q=0.9");
+    expect(type).toBe("application/ld+json");
+  });
+
+  it("nothing-acceptable → 406 when all supported types are refused", () => {
+    const { type } = negotiateType("application/rdf+xml");
+    expect(type).toBeNull();
+  });
+
+  it("*/* with q=0 yields 406 (no fallback)", () => {
+    const { type } = negotiateType("*/*;q=0");
+    expect(type).toBeNull();
+  });
+});
+
+// ─── parseIfNoneMatch + ifNoneMatchMatches ───────────────────────────────────
+
+describe("parseIfNoneMatch", () => {
+  it("returns empty array for null", () => {
+    expect(parseIfNoneMatch(null)).toEqual([]);
+  });
+
+  it("returns empty array for empty string", () => {
+    expect(parseIfNoneMatch("")).toEqual([]);
+  });
+
+  it("parses a single ETag", () => {
+    expect(parseIfNoneMatch('"abc123"')).toEqual(['"abc123"']);
+  });
+
+  it("parses a comma-separated list of ETags", () => {
+    const tags = parseIfNoneMatch('"tag1", "tag2", "tag3"');
+    expect(tags).toHaveLength(3);
+    expect(tags).toContain('"tag1"');
+    expect(tags).toContain('"tag2"');
+    expect(tags).toContain('"tag3"');
+  });
+
+  it("returns ['*'] for the wildcard", () => {
+    expect(parseIfNoneMatch("*")).toEqual(["*"]);
+  });
+
+  it("trims whitespace around tags", () => {
+    const tags = parseIfNoneMatch('  "tag1" ,  "tag2"  ');
+    expect(tags).toContain('"tag1"');
+    expect(tags).toContain('"tag2"');
+  });
+});
+
+describe("ifNoneMatchMatches", () => {
+  it("returns false for null header", () => {
+    expect(ifNoneMatchMatches(null, '"sha256-abc"')).toBe(false);
+  });
+
+  it("returns false when ETag is not in the list", () => {
+    expect(ifNoneMatchMatches('"sha256-other"', '"sha256-abc"')).toBe(false);
+  });
+
+  it("returns true for exact single match", () => {
+    expect(ifNoneMatchMatches('"sha256-abc"', '"sha256-abc"')).toBe(true);
+  });
+
+  it("returns true when ETag appears in a multi-value list", () => {
+    // Finding 3: multi-value If-None-Match
+    expect(
+      ifNoneMatchMatches('"sha256-old", "sha256-abc"', '"sha256-abc"')
+    ).toBe(true);
+  });
+
+  it("returns false when ETag does not appear in a multi-value list", () => {
+    expect(
+      ifNoneMatchMatches('"sha256-old1", "sha256-old2"', '"sha256-abc"')
+    ).toBe(false);
+  });
+
+  it("returns true for wildcard *", () => {
+    // Finding 3: If-None-Match: * matches any existing representation
+    expect(ifNoneMatchMatches("*", '"sha256-anything"')).toBe(true);
+  });
+
+  it("handles W/ weak ETag prefix in the header", () => {
+    // Weak comparison strips W/ prefix
+    expect(ifNoneMatchMatches('W/"sha256-abc"', '"sha256-abc"')).toBe(true);
   });
 });
 
@@ -535,6 +655,36 @@ describe("buildRdfResponse", () => {
     expect(link).toContain("json-ld#context");
   });
 
+  // ── Finding 3: multi-value If-None-Match in buildRdfResponse ──────────────
+
+  it("multi-value If-None-Match containing the current ETag → 304", async () => {
+    // Get the ETag from an initial response.
+    const first = await buildRdfResponse({
+      request: req("text/turtle"),
+      quads: sampleQuads(),
+    });
+    if (first === null) throw new Error("expected non-null first response");
+    const etag = first.headers.get("ETag");
+    if (etag === null) throw new Error("expected ETag header");
+
+    // Send If-None-Match with multiple tags, including the current one.
+    const second = await buildRdfResponse({
+      request: req("text/turtle", `"sha256-old1", ${etag}, "sha256-old2"`),
+      quads: sampleQuads(),
+    });
+    if (second === null) throw new Error("expected non-null second response");
+    expect(second.status).toBe(304);
+  });
+
+  it("If-None-Match: * → 304 (wildcard matches any representation)", async () => {
+    const resp = await buildRdfResponse({
+      request: req("text/turtle", "*"),
+      quads: sampleQuads(),
+    });
+    if (resp === null) throw new Error("expected non-null response");
+    expect(resp.status).toBe(304);
+  });
+
   it("compacted vs expanded JSON-LD produce different ETags", async () => {
     const resp1 = await buildRdfResponse({
       request: req("application/ld+json"),
@@ -586,5 +736,68 @@ describe("buildCachedRdfResponse", () => {
     });
     expect(resp.headers.get("Vary")).toBe("Accept");
     expect(resp.headers.get("ETag")).toMatch(/^"sha256-[0-9a-f]{16}"$/);
+  });
+
+  // ── Finding 2: buildCachedRdfResponse must negotiate Accept ───────────────
+
+  it("returns 406 when cached mediaType is not acceptable per Accept header", () => {
+    // Client wants application/rdf+xml; cached body is text/turtle → 406.
+    const resp = buildCachedRdfResponse({
+      request: req("application/rdf+xml"),
+      body: "some turtle",
+      mediaType: "text/turtle",
+    });
+    expect(resp.status).toBe(406);
+    expect(resp.headers.get("Vary")).toBe("Accept");
+  });
+
+  it("returns 406 when cached mediaType is explicitly refused with q=0", () => {
+    // text/turtle;q=0, */*;q=1 — turtle refused by name.
+    const resp = buildCachedRdfResponse({
+      request: req("text/turtle;q=0, */*;q=1"),
+      body: "some turtle",
+      mediaType: "text/turtle",
+    });
+    expect(resp.status).toBe(406);
+  });
+
+  it("returns 200 when cached mediaType is acceptable", () => {
+    const resp = buildCachedRdfResponse({
+      request: req("text/turtle"),
+      body: "some turtle",
+      mediaType: "text/turtle",
+    });
+    expect(resp.status).toBe(200);
+  });
+
+  it("returns 200 when */* matches the cached mediaType", () => {
+    const resp = buildCachedRdfResponse({
+      request: req("*/*"),
+      body: "some turtle",
+      mediaType: "text/turtle",
+    });
+    expect(resp.status).toBe(200);
+  });
+
+  // ── Finding 3: multi-value If-None-Match in buildCachedRdfResponse ─────────
+
+  it("multi-value If-None-Match containing the current ETag → 304", () => {
+    const body = "some turtle";
+    const etag = computeETag(body, "text/turtle");
+    const resp = buildCachedRdfResponse({
+      request: req("text/turtle", `"sha256-old", ${etag}`),
+      body,
+      mediaType: "text/turtle",
+    });
+    expect(resp.status).toBe(304);
+  });
+
+  it("If-None-Match: * → 304 in cached path (wildcard)", () => {
+    const resp = buildCachedRdfResponse({
+      request: req("text/turtle", "*"),
+      body: "some turtle",
+      mediaType: "text/turtle",
+    });
+    expect(resp.status).toBe(304);
   });
 });
