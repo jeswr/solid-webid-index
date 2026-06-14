@@ -65,6 +65,22 @@ CREATE INDEX IF NOT EXISTS idx_doc_recrawl  ON doc (state, last_crawled);
 -- FTS GIN index — required for @@ operator to be fast
 CREATE INDEX IF NOT EXISTS idx_doc_fts      ON doc USING GIN (fts_vector);
 
+-- ─── suggest_budget — shared anti-amplification budget per suggestion root ────
+--
+-- One row per suggestion-rooted subtree (keyed by root_seed), holding the REMAINING
+-- node budget that is CONSUMED — not reset per node — as descendants are enqueued
+-- (anti-amplification C2, DESIGN.md §5). The crawler decrements `remaining` atomically
+-- on every enqueue under that root and stops once it reaches 0, so a suggestion with
+-- budget N can enqueue AT MOST N total descendants regardless of fan-out. The atomic
+-- `UPDATE … SET remaining = remaining - 1 WHERE root_seed = $1 AND remaining > 0
+-- RETURNING remaining` makes this correct under concurrent/serverless invocations.
+
+CREATE TABLE IF NOT EXISTS suggest_budget (
+  root_seed   TEXT     PRIMARY KEY,            -- the suggestion root this budget governs
+  remaining   INTEGER  NOT NULL                -- nodes still enqueuable under this root (>= 0)
+                       CHECK (remaining >= 0)
+);
+
 -- ─── host_politeness — per-host crawl rate and robots state ──────────────────
 
 CREATE TABLE IF NOT EXISTS host_politeness (

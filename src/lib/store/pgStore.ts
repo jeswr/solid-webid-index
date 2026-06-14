@@ -504,30 +504,72 @@ export class PgStore
       depth?: number;
       rootSeed?: string | null;
       suggestBudget?: number | null;
+      webid?: string | null;
       source?: DocSource;
       discoveredFrom?: string | null;
       nextEligibleAt?: number;
     }
   ): Promise<void> {
     const host = extractHost(docUrl);
+    const rootSeed = opts?.rootSeed ?? null;
+    const suggestBudget = opts?.suggestBudget ?? null;
+
+    // Seed the SHARED suggestion-root budget BEFORE inserting the doc. When a suggestion-rooted
+    // document is enqueued with a budget, the budget belongs to the whole subtree (keyed on
+    // root_seed), so all descendants CONSUME from this one counter (anti-amplification C2). ON
+    // CONFLICT DO NOTHING means a re-enqueue of the same root never resets a partially-spent budget.
+    if (suggestBudget != null && rootSeed != null) {
+      await this.db.query(
+        `INSERT INTO suggest_budget (root_seed, remaining)
+         VALUES ($1, $2)
+         ON CONFLICT (root_seed) DO NOTHING`,
+        [rootSeed, Math.max(0, suggestBudget)]
+      );
+    }
+
     await this.db.query(
       `INSERT INTO doc (
-         doc_url, host, state, depth, root_seed, suggest_budget,
+         doc_url, host, webid, state, depth, root_seed, suggest_budget,
          source, discovered_from, next_eligible_at, enqueued_at
-       ) VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, $8, $9)
+       ) VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9, $10)
        ON CONFLICT (doc_url) DO NOTHING`,
       [
         docUrl,
         host,
+        opts?.webid ?? null,
         opts?.depth ?? 0,
-        opts?.rootSeed ?? null,
-        opts?.suggestBudget ?? null,
+        rootSeed,
+        suggestBudget,
         opts?.source ?? "seed",
         opts?.discoveredFrom ?? null,
         opts?.nextEligibleAt ?? 0,
         Date.now(),
       ]
     );
+  }
+
+  async tryConsumeSuggestBudget(rootSeed: string): Promise<boolean> {
+    // Atomic decrement: at most one invocation can take the LAST slot, so a budget of N grants at
+    // most N successful consumptions across all concurrent/serverless callers. 0 rows returned =
+    // budget exhausted (remaining was already 0) or no budget row for this root.
+    const rows = await this.db.query<{ remaining: number }>(
+      `UPDATE suggest_budget
+          SET remaining = remaining - 1
+        WHERE root_seed = $1
+          AND remaining > 0
+        RETURNING remaining`,
+      [rootSeed]
+    );
+    return rows.length > 0;
+  }
+
+  async countFrontier(): Promise<number> {
+    // Live frontier = pending + claimed rows. Both are part of the in-flight frontier; counting only
+    // 'pending' under-counts under active crawling and lets FRONTIER_CAP be exceeded.
+    const rows = await this.db.query<{ n: number | string }>(
+      `SELECT COUNT(*) AS n FROM doc WHERE state IN ('pending', 'claimed')`
+    );
+    return rows[0] ? Number(rows[0].n) : 0;
   }
 
   /**

@@ -219,6 +219,15 @@ export interface CrawlCoordinator {
    * Syntactic-only (no DNS) — SSRF classification happens later in guardedFetch.
    * Idempotent: if the URL already exists, the row is left unchanged (INSERT … ON CONFLICT DO NOTHING).
    * nextEligibleAt defaults to 0 (immediate).
+   *
+   * `webid` is the discovered canonical WebID (WITH its #fragment) for this document — e.g. a
+   * `knows` target `https://x.example/profile#alice` strips to doc `…/profile` (the frontier key)
+   * but carries the subject `…/profile#alice`. Persisting it means the crawler parses/extracts the
+   * REAL subject on first crawl instead of assuming `#me` (DESIGN.md §3.3).
+   *
+   * When `suggestBudget` and `rootSeed` are both set, a shared `suggest_budget` row for that root is
+   * created (INSERT … ON CONFLICT DO NOTHING) so the suggestion-rooted subtree has a single CONSUMED
+   * budget (anti-amplification C2) — see {@link tryConsumeSuggestBudget}.
    */
   enqueue(
     docUrl: string,
@@ -226,11 +235,30 @@ export interface CrawlCoordinator {
       depth?: number;
       rootSeed?: string | null;
       suggestBudget?: number | null;
+      webid?: string | null;
       source?: DocSource;
       discoveredFrom?: string | null;
       nextEligibleAt?: number;
     }
   ): Promise<void>;
+
+  /**
+   * Atomically consume one node from a suggestion root's SHARED budget (anti-amplification C2).
+   *
+   * Runs `UPDATE suggest_budget SET remaining = remaining - 1 WHERE root_seed = $1 AND remaining > 0
+   * RETURNING remaining` — a single atomic statement, so concurrent/serverless invocations can never
+   * over-spend a budget. Returns true when a slot was granted (budget decremented), false when the
+   * budget is exhausted (or the root has no budget row). The budget is CONSUMED across the whole
+   * subtree, not reset per node, so a suggestion with budget N enqueues AT MOST N total descendants.
+   */
+  tryConsumeSuggestBudget(rootSeed: string): Promise<boolean>;
+
+  /**
+   * Count the LIVE frontier — rows in state 'pending' OR 'claimed'. Used to enforce FRONTIER_CAP
+   * against the true in-flight frontier (under active crawling, claimed rows are part of the
+   * frontier; counting only 'pending' under-counts and lets the cap be exceeded).
+   */
+  countFrontier(): Promise<number>;
 
   /**
    * Atomically claim a batch of pending docs for this worker.

@@ -246,6 +246,10 @@ async function processDoc(
     res = await guardedFetch(row.docUrl, {
       allowLoopback,
       dnsLookup: ctx.opts.dnsLookup,
+      // Honour X-Robots-Tag: noindex INSIDE the fetch — before the content-type allowlist and before
+      // the body is read — so an opted-out doc is tombstoned without parsing even when its body is
+      // malformed / oversized / a non-RDF content-type (DESIGN.md §4.8 H2).
+      honourNoindexHeader: true,
       conditional: {
         etag: row.etag ?? undefined,
         lastModified: row.lastModified ?? undefined,
@@ -253,6 +257,26 @@ async function processDoc(
     });
   } catch (err: unknown) {
     return finalizeFailure(store, row, err, now, hostDelay);
+  }
+
+  // ── noindex honouring (PRE-PARSE) ────────────────────────────────────────
+  // guardedFetch flags a final 2xx response carrying X-Robots-Tag: noindex BEFORE reading/parsing the
+  // body. Tombstone the row so it is hidden from every read surface (get/exists/list/search) AND
+  // blocked from re-crawl across all paths. The body was never read; nothing about the person is
+  // indexed — and a malformed/oversized noindex body is still tombstoned (not skipped/errored).
+  if (res.noindex) {
+    await store.markDone(
+      row.docUrl,
+      {
+        state: "tombstone",
+        httpStatus: res.status,
+        error: "noindex (X-Robots-Tag) — not indexed",
+        nextEligibleAt: farFuture(now()),
+      },
+      row.claimToken
+    );
+    await store.stampHost(row.host, now() + hostDelay, 0);
+    return { fetched: true, added: 0, errored: false };
   }
 
   // ── 304 Not Modified — cheap re-validation, zero profile writes ───────────
@@ -349,24 +373,6 @@ async function processDoc(
     return finalizeFailure(store, row, err, now, hostDelay);
   }
 
-  // noindex honouring: an X-Robots-Tag: noindex on the profile document means we never index it.
-  // Tombstone the row so it is hidden from every read surface (get/exists/list/search) AND blocked
-  // from re-crawl across all paths — DESIGN.md §4.8 H2. We do NOT store raw_rdf for it. The fetched
-  // body is discarded; nothing about the person is indexed.
-  if (hasNoindex(res.response)) {
-    await store.markDone(
-      row.docUrl,
-      {
-        state: "tombstone",
-        httpStatus: res.status,
-        error: "noindex (X-Robots-Tag) — not indexed",
-        nextEligibleAt: farFuture(now()),
-      },
-      row.claimToken
-    );
-    return { fetched: true, added: 0, errored: false };
-  }
-
   // Content-hash gate: identical canonical body → no rewrite, just re-schedule (M5).
   const recrawl = isSolid
     ? RECRAWL_INTERVAL_SOLID_MS
@@ -436,9 +442,15 @@ async function enqueueKnows(
   if (childDepth > MAX_DEPTH) return 0;
 
   // Suggestion-rooted subtree budget (anti-amplification C2): when this excursion descends from a
-  // suggestion (suggestBudget set), stop enqueuing once the budget is exhausted. A null budget means
-  // a seed/catalog excursion (no per-subtree cap; bounded by MAX_DEPTH + FRONTIER_CAP).
-  if (parent.suggestBudget != null && parent.suggestBudget <= 0) return 0;
+  // suggestion (suggestBudget set AND a rootSeed to key the shared budget on), every child enqueued
+  // ANYWHERE in the subtree CONSUMES one slot from a single shared counter (store.tryConsumeSuggestBudget),
+  // not a per-node budget that resets to (budget-1) at every node. A budget of N therefore enqueues AT
+  // MOST N total descendants regardless of fan-out. A null budget means a seed/catalog excursion (no
+  // per-subtree cap; bounded by MAX_DEPTH + FRONTIER_CAP). A budget without a rootSeed cannot be shared
+  // (nothing to key it on) — treat as exhausted to fail closed rather than amplify.
+  const budgeted = parent.suggestBudget != null;
+  const budgetRoot = parent.rootSeed;
+  if (budgeted && budgetRoot == null) return 0;
 
   let added = 0;
   // De-dup within this document first (two knows pointing at the same doc, or #me vs #card).
@@ -447,6 +459,9 @@ async function enqueueKnows(
     let childDoc: string;
     let childWebId: string;
     try {
+      // canonicalWebId KEEPS the fragment (the RDF subject, e.g. …/profile#alice); canonicalDocUrl
+      // STRIPS it (the frontier key, …/profile). We persist the former so the child is parsed with
+      // its REAL subject on first crawl instead of assuming #me (DESIGN.md §3.3).
       childWebId = canonicalWebId(target, {
         allowLoopback: ctx.allowLoopback,
       });
@@ -470,53 +485,38 @@ async function enqueueKnows(
     // FRONTIER_CAP: re-check before each insert so a single document cannot blow the cap.
     if (await frontierFull(store)) break;
 
+    // Shared suggestion-root budget: consume one slot ATOMICALLY before enqueuing. If the budget is
+    // exhausted, stop the whole fan-out — no further descendants under this root may be enqueued.
+    if (budgeted && budgetRoot != null) {
+      const granted = await store.tryConsumeSuggestBudget(budgetRoot);
+      if (!granted) break;
+    }
+
     await store.enqueue(childDoc, {
       depth: childDepth,
       source: "knows",
       discoveredFrom: parent.docUrl,
       rootSeed: parent.rootSeed,
-      suggestBudget:
-        parent.suggestBudget != null ? parent.suggestBudget - 1 : null,
+      // Propagate the budget value (null for non-suggestion excursions). The SHARED counter is keyed
+      // on rootSeed and already seeded at the root's enqueue; this value is informational on the row.
+      suggestBudget: parent.suggestBudget,
+      // Persist the discovered canonical WebID (WITH fragment) so the child is parsed/extracted with
+      // its real subject on first crawl, not an assumed `#me`.
+      webid: childWebId,
       nextEligibleAt: 0,
     });
-    // The WebID fragment is preserved on the enqueued doc's eventual record (markDone sets webid);
-    // childWebId is referenced here so the canonical WebID is computed (and validated) at enqueue.
-    void childWebId;
     added += 1;
   }
   return added;
 }
 
 /**
- * FRONTIER_CAP check. Counts pending+claimed rows via list() pages. We page rather than COUNT(*) to
- * stay within the portable ReadStore surface; we only need to know whether the cap is reached, so we
- * stop as soon as the count crosses the cap.
+ * FRONTIER_CAP check against the LIVE frontier (pending + claimed). Under active crawling, claimed
+ * rows are part of the frontier — counting only `pending` under-counts and lets the cap be exceeded.
+ * countFrontier() runs a single indexed COUNT over state IN ('pending','claimed') (DESIGN.md §3.2 H6).
  */
 async function frontierFull(store: CrawlStore): Promise<boolean> {
-  // exists() + enqueue() are the hot path; this guard is best-effort. We approximate the frontier as
-  // pending rows (claimed rows are bounded by BATCH_SIZE × concurrent invocations and negligible vs
-  // FRONTIER_CAP). Page through pending rows up to the cap.
-  let counted = 0;
-  let cursor: string | undefined;
-  // listFrontier is exposed via the store's ReadStore.list when available; fall back to "not full"
-  // if the store does not implement list (the CrawlStore type only requires exists()).
-  const listable = store as Partial<ReadStore>;
-  if (typeof listable.list !== "function") return false;
-  const PAGE = 500;
-  // Cap the number of pages we scan so this guard itself is bounded.
-  const maxPages = Math.ceil(FRONTIER_CAP / PAGE) + 1;
-  for (let page = 0; page < maxPages; page += 1) {
-    const { rows, nextCursor } = await listable.list({
-      state: "pending",
-      limit: PAGE,
-      cursor,
-    });
-    counted += rows.length;
-    if (counted >= FRONTIER_CAP) return true;
-    if (!nextCursor) break;
-    cursor = nextCursor;
-  }
-  return counted >= FRONTIER_CAP;
+  return (await store.countFrontier()) >= FRONTIER_CAP;
 }
 
 // ─── Failure handling ─────────────────────────────────────────────────────────
@@ -700,13 +700,6 @@ function isTransientError(err: unknown): boolean {
   }
   // Unknown throw shape: be conservative and treat as transient so a real pod isn't lost.
   return true;
-}
-
-/** True when the response carries an X-Robots-Tag whose value contains `noindex` (case-insensitive). */
-function hasNoindex(response: Response): boolean {
-  const tag = response.headers.get("x-robots-tag");
-  if (!tag) return false;
-  return tag.toLowerCase().includes("noindex");
 }
 
 /** Parse a Retry-After header (delta-seconds OR HTTP-date) into a delay in ms, or null. */

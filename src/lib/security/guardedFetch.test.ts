@@ -569,6 +569,71 @@ describe("guardedFetch — content-type allowlist", () => {
   });
 });
 
+describe("guardedFetch — honourNoindexHeader (pre-parse noindex short-circuit)", () => {
+  it("returns noindex:true WITHOUT rejecting on content-type or reading the body", async () => {
+    // noindex + a non-RDF content-type that the allowlist would normally REJECT. With
+    // honourNoindexHeader the noindex check runs FIRST, so the call resolves (no throw) with
+    // noindex:true and an empty body — the caller tombstones without parsing.
+    routes.set("/noidx", (_req, res) => {
+      res.writeHead(200, {
+        "content-type": "text/html",
+        "x-robots-tag": "noindex",
+      });
+      res.end("<html>not rdf {{{ broken</html>");
+    });
+    const r = await guardedFetch(`${base}/noidx`, {
+      allowLoopback: true,
+      honourNoindexHeader: true,
+    });
+    expect(r.noindex).toBe(true);
+    expect(r.status).toBe(200);
+    expect(r.text).toBe("");
+    expect(r.bytes.length).toBe(0);
+  });
+
+  it("a noindex value combined with other directives is still honoured (case-insensitive)", async () => {
+    routes.set("/noidx2", (_req, res) => {
+      res.writeHead(200, {
+        "content-type": "text/turtle",
+        "x-robots-tag": "googlebot: NoIndex, nofollow",
+      });
+      res.end("@prefix x: <x:> . x:a x:b x:c .");
+    });
+    const r = await guardedFetch(`${base}/noidx2`, {
+      allowLoopback: true,
+      honourNoindexHeader: true,
+    });
+    expect(r.noindex).toBe(true);
+    expect(r.text).toBe("");
+  });
+
+  it("without honourNoindexHeader, a noindex non-RDF body is still content-type rejected", async () => {
+    routes.set("/noidx3", (_req, res) => {
+      res.writeHead(200, {
+        "content-type": "text/html",
+        "x-robots-tag": "noindex",
+      });
+      res.end("<html>nope</html>");
+    });
+    await expect(
+      guardedFetch(`${base}/noidx3`, { allowLoopback: true })
+    ).rejects.toBeInstanceOf(GuardedFetchError);
+  });
+
+  it("an RDF doc WITHOUT noindex returns noindex:false and the body (regression)", async () => {
+    routes.set("/plain", (_req, res) => {
+      res.writeHead(200, { "content-type": "text/turtle" });
+      res.end("@prefix x: <x:> . x:a x:b x:c .");
+    });
+    const r = await guardedFetch(`${base}/plain`, {
+      allowLoopback: true,
+      honourNoindexHeader: true,
+    });
+    expect(r.noindex).toBe(false);
+    expect(r.text).toContain("x:a");
+  });
+});
+
 describe("guardedFetch — body cap", () => {
   it("aborts an oversize body (streamed past the cap)", async () => {
     routes.set("/big", (_req, res) => {

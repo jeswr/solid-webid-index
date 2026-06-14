@@ -135,7 +135,8 @@ CREATE TABLE doc (
                      CHECK (state IN ('pending','claimed','done','error','skipped','blocked','tombstoned')),
   depth            INTEGER NOT NULL DEFAULT 0,
   root_seed        TEXT,                      -- the trusted-seed doc this excursion descends from (C2)
-  suggest_budget   INTEGER,                   -- remaining node budget for a suggestion-rooted subtree (C2)
+  suggest_budget   INTEGER,                   -- informational copy of the subtree budget; the AUTHORITATIVE
+                                              -- shared budget is a CONSUMED counter in suggest_budget(root_seed) (C2)
   source           TEXT NOT NULL,             -- seed|catalog|inbox|knows|seeAlso|sameAs|recheck
   discovered_from  TEXT,
   -- lease / fencing (atomic claim, crash-safe)
@@ -159,6 +160,16 @@ CREATE TABLE doc (
 CREATE INDEX idx_doc_ready ON doc(state, next_eligible_at);
 CREATE INDEX idx_doc_host  ON doc(host, state, next_eligible_at);
 CREATE INDEX idx_doc_recrawl ON doc(state, last_crawled);
+
+-- 2.1.a′  Shared suggestion-root budget (anti-amplification C2). ONE row per suggestion-rooted
+-- subtree, keyed on root_seed, holding the REMAINING node budget. enqueue CONSUMES it atomically
+-- (UPDATE … SET remaining = remaining-1 WHERE root_seed=:r AND remaining>0 RETURNING remaining), so a
+-- suggestion with budget N enqueues AT MOST N total descendants regardless of fan-out — correct under
+-- concurrent/serverless invocations (the doc.suggest_budget column is an informational copy only).
+CREATE TABLE suggest_budget (
+  root_seed  TEXT PRIMARY KEY,
+  remaining  INTEGER NOT NULL CHECK (remaining >= 0)
+);
 
 -- 2.1.b  Per-host politeness (state must be in the DB — invocations are stateless)
 CREATE TABLE host_state (
@@ -347,8 +358,8 @@ If a concurrency test ever shows double-claims, fall back to per-row CAS
 |---|---|---|
 | `MAX_DEPTH` | 3 | claim filter + enqueue |
 | depth reset | 0 **only** if reachable from a trusted seed within the Solid component (C2) | extract |
-| per-suggestion node budget | 50 (suggestion-rooted subtree cap, tracked in `suggest_budget`) (C2) | enqueue |
-| `FRONTIER_CAP` | from daily drain rate (~10–20k) (arch C2) | enqueue via indexed `COUNT` (H6) |
+| per-suggestion node budget | 50 (suggestion-rooted subtree cap, a SHARED `suggest_budget(root_seed)` counter CONSUMED across the whole subtree — not reset per node) (C2) | enqueue via atomic decrement |
+| `FRONTIER_CAP` | from daily drain rate (~10–20k) (arch C2) | enqueue via indexed `COUNT` over pending+claimed (H6) |
 | per-host frontier cap | N rows/host (anti-starvation) (C3) | enqueue |
 | `BATCH_SIZE` | 8 | claim `LIMIT` |
 | batches-per-invocation loop | until `TIME_BUDGET_MS` (C2 — many batches, ONE QStash msg) | runBatch loop |
@@ -388,7 +399,9 @@ loop while now < deadline AND daily budget not exhausted:
      project fields (typed accessors) → upsertProjection(...) in ONE batch tx  // H4
      for each foaf:knows obj (≤MAX_OUTLINKS, syntactic-canonical, not tombstoned):
         childDepth = (reachableFromTrustedSeed && isSolid) ? 0 : depth+1       // C2
-        if childDepth ≤ MAX_DEPTH && underCaps && suggestBudget>0: enqueue(...) // syntactic; no DNS (M4)
+        childWebId = canonicalWebId(obj)  // KEEPS the #fragment → persisted as the child's subject (M3)
+        if childDepth ≤ MAX_DEPTH && countFrontier()<FRONTIER_CAP && tryConsumeSuggestBudget(root_seed):
+           enqueue(childDoc, {webid: childWebId, root_seed, ...})              // syntactic; no DNS (M4)
      finalize(state='done', next_eligible_at = now + RECRAWL_INTERVAL, validators)  // fenced (H3/M2)
 if more eligible work AND daily QStash budget not exhausted:
   publishSelf(delayMs)                          // ONE QStash msg per drained invocation, not per batch (C2)
@@ -575,7 +588,10 @@ permanent `tombstone` (canonical key) checked at **enqueue, fetch, and projectio
 serve `/p/{slug}` as `410` + `no-store`; regenerate the (paged) dump tombstone-filtered. Also honour
 **`noindex` at crawl time**: `idx:noIndex true` OR `X-Robots-Tag: noindex` on the profile doc OR
 robots.txt Disallow → never index / erase if present (multiple signals, default-deny on the existing
-`X-Robots-Tag` so it works today — H2).
+`X-Robots-Tag` so it works today — H2). The `X-Robots-Tag` is inspected by `guardedFetch`
+(`honourNoindexHeader`) on the final 2xx response BEFORE the content-type allowlist and BEFORE the body
+is read, so an opted-out document is tombstoned WITHOUT parsing — even a malformed/oversized/non-RDF
+noindex body is tombstoned, never skipped-as-error.
 
 ### 4.9 Health — `GET /.well-known/health` → `200` JSON `{status, entries, lastCrawlAt, queueDepth,
 version}` + `Link: <…/void>; rel="describedby"` (RDF stats are the single source — sw L4); `no-store`.

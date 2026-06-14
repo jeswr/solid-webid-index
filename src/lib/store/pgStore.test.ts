@@ -780,6 +780,92 @@ describe("PgStore — CrawlCoordinator", () => {
     const notClaimed = await freshStore.claim("worker-should-not-get", 8);
     expect(notClaimed).toHaveLength(0);
   });
+
+  // ─── shared suggest budget (anti-amplification C2) ───────────────────────────
+
+  it("enqueue() seeds a shared suggest_budget row keyed on rootSeed", async () => {
+    const { store } = await makeTestStore();
+    await store.enqueue("https://root.example/card", {
+      source: "inbox",
+      rootSeed: "https://root.example/card",
+      suggestBudget: 3,
+    });
+    // Three consumptions succeed, the fourth is refused — the budget is shared + finite.
+    expect(
+      await store.tryConsumeSuggestBudget("https://root.example/card")
+    ).toBe(true);
+    expect(
+      await store.tryConsumeSuggestBudget("https://root.example/card")
+    ).toBe(true);
+    expect(
+      await store.tryConsumeSuggestBudget("https://root.example/card")
+    ).toBe(true);
+    expect(
+      await store.tryConsumeSuggestBudget("https://root.example/card")
+    ).toBe(false);
+  });
+
+  it("tryConsumeSuggestBudget() returns false for a root with no budget row", async () => {
+    const { store } = await makeTestStore();
+    expect(
+      await store.tryConsumeSuggestBudget("https://unknown.example/card")
+    ).toBe(false);
+  });
+
+  it("enqueue() does NOT reset a partially-spent shared budget on re-enqueue", async () => {
+    const { store } = await makeTestStore();
+    await store.enqueue("https://re.example/card", {
+      source: "inbox",
+      rootSeed: "https://re.example/card",
+      suggestBudget: 2,
+    });
+    expect(await store.tryConsumeSuggestBudget("https://re.example/card")).toBe(
+      true
+    );
+    // Re-enqueue with the same root + budget must NOT reset remaining (ON CONFLICT DO NOTHING).
+    await store.enqueue("https://re.example/card", {
+      source: "inbox",
+      rootSeed: "https://re.example/card",
+      suggestBudget: 2,
+    });
+    // Only one slot remains.
+    expect(await store.tryConsumeSuggestBudget("https://re.example/card")).toBe(
+      true
+    );
+    expect(await store.tryConsumeSuggestBudget("https://re.example/card")).toBe(
+      false
+    );
+  });
+
+  // ─── live frontier count (FRONTIER_CAP enforcement) ──────────────────────────
+
+  it("countFrontier() counts pending AND claimed rows (not just pending)", async () => {
+    const { store } = await makeTestStore();
+    await store.enqueue("https://f1.example/card");
+    await store.enqueue("https://f2.example/card");
+    await store.enqueue("https://f3.example/card");
+    expect(await store.countFrontier()).toBe(3);
+
+    // Claim one row → it moves pending → claimed. A pending-only count would drop to 2; the LIVE
+    // frontier count must STILL be 3 because a claimed row is in-flight, part of the frontier.
+    const claimed = await store.claim("worker-frontier", 1);
+    expect(claimed).toHaveLength(1);
+    expect(await store.countFrontier()).toBe(3);
+  });
+
+  it("countFrontier() excludes terminal states (done/skipped/tombstone)", async () => {
+    const { store } = await makeTestStore();
+    await store.enqueue("https://done.example/card");
+    const claimed = await store.claim("worker-term", 1);
+    await store.markDone(
+      "https://done.example/card",
+      { state: "done", httpStatus: 200, nextEligibleAt: Date.now() + 1e12 },
+      claimed[0].claimToken as string
+    );
+    await store.enqueue("https://pending.example/card");
+    // Only the still-pending row counts toward the live frontier.
+    expect(await store.countFrontier()).toBe(1);
+  });
 });
 
 // ─── roborev finding tests ────────────────────────────────────────────────────

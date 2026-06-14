@@ -87,6 +87,47 @@ function serveProfile(
   });
 }
 
+/**
+ * Serve a Turtle profile whose subject is an EXPLICIT WebID IRI (e.g. `${base}/frag#alice`, NOT the
+ * `#me` convention). Used to prove the crawler parses/extracts the persisted discovered WebID subject
+ * rather than assuming `#me`.
+ */
+function serveProfileWithSubject(
+  path: string,
+  subject: string,
+  opts: { knows?: string[]; solid?: boolean } = {}
+): void {
+  const knowsTtl =
+    opts.knows && opts.knows.length > 0
+      ? `; foaf:knows ${opts.knows.map((k) => `<${k}>`).join(", ")} `
+      : "";
+  const oidc =
+    opts.solid !== false ? "; solid:oidcIssuer <https://idp.example> " : "";
+  const ttl = `@prefix foaf: <http://xmlns.com/foaf/0.1/> .
+@prefix solid: <http://www.w3.org/ns/solid/terms#> .
+<${subject}> a foaf:Person ; foaf:name "${path}" ${oidc}${knowsTtl}.
+`;
+  routes.set(path, (_req, res) => {
+    res.writeHead(200, { "content-type": "text/turtle" });
+    res.end(ttl);
+  });
+}
+
+/**
+ * Serve a profile that `knows` a LARGE number of distinct children (high fan-out) so the
+ * anti-amplification budget is exercised. Each child is a served Solid profile with no further knows.
+ */
+function serveFanout(path: string, childCount: number): string[] {
+  const children: string[] = [];
+  for (let i = 0; i < childCount; i += 1) {
+    const childPath = `${path}-c${i}`;
+    serveProfile(childPath, {});
+    children.push(webIdOf(childPath));
+  }
+  serveProfile(path, { knows: children });
+  return children;
+}
+
 /** docUrl for a fixture path (fragment-stripped — what the frontier keys on). */
 function docOf(path: string): string {
   return `${base}${path}`;
@@ -352,6 +393,159 @@ describe("runCrawlBatch — noindex honouring", () => {
     // would also exclude tombstones), so instead assert exists() is false (tombstone) and it was not
     // claimed (attempts still 0 would require raw access; exists()==false is the observable invariant).
     expect(await store.exists(docOf("/victim"))).toBe(false);
+  });
+});
+
+describe("runCrawlBatch — anti-amplification: SHARED suggest budget (KEY correctness)", () => {
+  it("a suggestion with budget N enqueues AT MOST N descendants despite high fan-out at one node", async () => {
+    const { store } = await makeStore();
+    const BUDGET = 3;
+    const FANOUT = 12;
+    // /root knows 12 distinct children — far more than the budget. Only BUDGET may be enqueued.
+    serveFanout("/root", FANOUT);
+
+    await store.enqueue(docOf("/root"), {
+      source: "inbox",
+      depth: 0,
+      rootSeed: docOf("/root"),
+      suggestBudget: BUDGET,
+    });
+
+    const totals = await drain(store);
+
+    // The whole suggestion-rooted subtree enqueued AT MOST BUDGET descendants — the invariant.
+    expect(totals.added).toBeLessThanOrEqual(BUDGET);
+    // It actually used the budget (not zero) — the fan-out was larger than the budget.
+    expect(totals.added).toBe(BUDGET);
+
+    // Count the doc rows that descend from the root (everything except the root itself).
+    const { rows } = await store.list({ limit: 1000 });
+    const descendants = rows.filter((r) => r.docUrl !== docOf("/root"));
+    expect(descendants.length).toBeLessThanOrEqual(BUDGET);
+    // The shared budget row is fully consumed.
+    expect(await store.tryConsumeSuggestBudget(docOf("/root"))).toBe(false);
+  });
+
+  it("the budget is CONSUMED across the whole subtree (multi-level), not reset per node", async () => {
+    const { store } = await makeStore();
+    const BUDGET = 4;
+    // A branching tree: /s knows two children, each of which knows two grandchildren (fan-out 2 at
+    // every node, several levels). A per-node reset budget would let each node spend BUDGET-1 — an
+    // explosion. The shared budget must cap the TOTAL descendants at BUDGET.
+    serveProfile("/s", { knows: [webIdOf("/s-a"), webIdOf("/s-b")] });
+    serveProfile("/s-a", { knows: [webIdOf("/s-a1"), webIdOf("/s-a2")] });
+    serveProfile("/s-b", { knows: [webIdOf("/s-b1"), webIdOf("/s-b2")] });
+    serveProfile("/s-a1", {});
+    serveProfile("/s-a2", {});
+    serveProfile("/s-b1", {});
+    serveProfile("/s-b2", {});
+
+    await store.enqueue(docOf("/s"), {
+      source: "inbox",
+      depth: 0,
+      rootSeed: docOf("/s"),
+      suggestBudget: BUDGET,
+    });
+
+    const totals = await drain(store);
+
+    // TOTAL descendants enqueued across ALL levels is bounded by the single shared budget.
+    expect(totals.added).toBeLessThanOrEqual(BUDGET);
+    const { rows } = await store.list({ limit: 1000 });
+    const descendants = rows.filter((r) => r.docUrl !== docOf("/s"));
+    expect(descendants.length).toBeLessThanOrEqual(BUDGET);
+  });
+
+  it("a seed/catalog excursion (no suggestBudget) is NOT capped by the shared budget", async () => {
+    const { store } = await makeStore();
+    serveFanout("/seedroot", 5);
+    await store.enqueue(docOf("/seedroot"), { source: "seed", depth: 0 });
+    const totals = await drain(store);
+    // No suggestBudget → all 5 children enqueued (bounded only by MAX_DEPTH + FRONTIER_CAP).
+    expect(totals.added).toBe(5);
+  });
+});
+
+describe("runCrawlBatch — discovered WebID fragment is persisted + used as subject", () => {
+  it("a knows target with a non-#me fragment is persisted and re-crawled with the correct subject", async () => {
+    const { store } = await makeStore();
+    // /finder knows alice whose WebID is …/profile#alice (NOT #me). Its profile document is at
+    // …/profile and the RDF subject is the fragmented WebID.
+    const aliceWebId = `${base}/profile#alice`;
+    serveProfile("/finder", { knows: [aliceWebId] });
+    serveProfileWithSubject("/profile", aliceWebId, {});
+
+    await store.enqueue(docOf("/finder"), { source: "seed", depth: 0 });
+    await drain(store);
+
+    const finder = await store.get(docOf("/finder"));
+    expect(finder?.state).toBe("done");
+
+    const alice = await store.get(docOf("/profile"));
+    expect(alice, "alice doc enqueued").not.toBeNull();
+    expect(alice?.state).toBe("done");
+    // The discovered canonical WebID (with #alice) was persisted, not stripped to #me.
+    expect(alice?.webid).toBe(aliceWebId);
+    // Because the persisted subject was used for extraction, the solid:oidcIssuer on #alice was seen.
+    expect(alice?.isSolid).toBe(true);
+  });
+
+  it("a non-#me subject is NOT detected when the WebID was not persisted (regression guard)", async () => {
+    const { store } = await makeStore();
+    // Same fragmented-subject doc, but enqueued directly with NO webid → falls back to #me, which does
+    // not match the #alice subject, so isSolid stays false. This pins the behaviour the fix corrects.
+    const aliceWebId = `${base}/loneprofile#alice`;
+    serveProfileWithSubject("/loneprofile", aliceWebId, {});
+    await store.enqueue(docOf("/loneprofile"), { source: "seed", depth: 0 });
+    await drain(store);
+
+    const rec = await store.get(docOf("/loneprofile"));
+    expect(rec?.state).toBe("done");
+    // No persisted webid → assumed #me → the #alice subject's oidcIssuer is invisible.
+    expect(rec?.webid).toBe(`${docOf("/loneprofile")}#me`);
+    expect(rec?.isSolid).toBe(false);
+  });
+});
+
+describe("runCrawlBatch — noindex tombstoned WITHOUT parsing the body", () => {
+  it("a noindex response with a non-RDF / garbage body is tombstoned, not errored", async () => {
+    const { store } = await makeStore();
+    // noindex header + a body that is NOT RDF and a non-RDF content-type. Pre-fix, guardedFetch would
+    // reject the content-type and the row would be 'skipped' (deterministic error). Post-fix, the
+    // noindex header short-circuits BEFORE the content-type allowlist + body read → tombstone.
+    routes.set("/garbage", (_req, res) => {
+      res.writeHead(200, {
+        "content-type": "text/html",
+        "x-robots-tag": "noindex",
+      });
+      res.end("<html>not rdf at all <<< broken {{{</html>");
+    });
+    await store.enqueue(docOf("/garbage"), { source: "seed", depth: 0 });
+    const summary = await runCrawlBatch(store, { allowLoopback: true });
+
+    // Tombstoned (hidden from reads), and NOT counted as an error — the body was never parsed.
+    expect(summary.errors).toBe(0);
+    expect(await store.get(docOf("/garbage"))).toBeNull();
+    expect(await store.exists(docOf("/garbage"))).toBe(false);
+  });
+
+  it("a noindex doc's knows are NOT enqueued even with a garbage body (no parse, no fan-out)", async () => {
+    const { store } = await makeStore();
+    // A noindex doc whose (non-RDF) body could not be parsed for knows anyway — proves the fan-out is
+    // skipped because the body is never read, not merely because the parse failed.
+    routes.set("/noidx-garbage", (_req, res) => {
+      res.writeHead(200, {
+        "content-type": "application/octet-stream",
+        "x-robots-tag": "noindex",
+      });
+      res.end(Buffer.from([0x00, 0x01, 0x02, 0xff]));
+    });
+    serveProfile("/should-not-be-found", {});
+    await store.enqueue(docOf("/noidx-garbage"), { source: "seed", depth: 0 });
+    await drain(store);
+
+    expect(await store.exists(docOf("/noidx-garbage"))).toBe(false);
+    expect(await store.exists(docOf("/should-not-be-found"))).toBe(false);
   });
 });
 
