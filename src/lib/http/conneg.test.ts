@@ -800,4 +800,101 @@ describe("buildCachedRdfResponse", () => {
     });
     expect(resp.status).toBe(304);
   });
+
+  // ── Profile-aware JSON-LD cache validation (roborev finding) ───────────────
+  // A cached expanded JSON-LD body must NOT be served when the Accept header
+  // negotiates compacted (or any other profile).  The media-type check alone
+  // is insufficient — profile must also match.
+
+  it("cached expanded JSON-LD is NOT served when Accept negotiates compacted (no profile) → 406", () => {
+    const expandedProfile = "http://localhost:3000/ns/context.jsonld#expanded";
+    const body = '["some","expanded","json-ld"]';
+    // Cache holds an expanded representation; client sends Accept: application/ld+json
+    // with no profile → negotiates compacted (profile=null).  Must return 406.
+    const resp = buildCachedRdfResponse({
+      request: req("application/ld+json"),
+      body,
+      mediaType: "application/ld+json",
+      profile: expandedProfile,
+    });
+    expect(resp.status).toBe(406);
+    expect(resp.headers.get("Vary")).toBe("Accept");
+  });
+
+  it("cached compacted JSON-LD IS served when Accept negotiates compacted (profile match) → 200", () => {
+    // Cache holds compacted (profile=null); client requests with no profile.
+    const body = '{"@context":{},"@id":"https://alice.example/card#me"}';
+    const resp = buildCachedRdfResponse({
+      request: req("application/ld+json"),
+      body,
+      mediaType: "application/ld+json",
+      profile: null,
+    });
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get("Content-Type")).toContain("application/ld+json");
+  });
+
+  it("cached compacted JSON-LD is NOT served when Accept negotiates expanded → 406", () => {
+    const expandedProfile = "http://localhost:3000/ns/context.jsonld#expanded";
+    const body = '{"@context":{},"@id":"https://alice.example/card#me"}';
+    // Cache = compacted (profile=null); client wants expanded.
+    const resp = buildCachedRdfResponse({
+      request: req(`application/ld+json;profile="${expandedProfile}"`),
+      body,
+      mediaType: "application/ld+json",
+      profile: null,
+    });
+    expect(resp.status).toBe(406);
+  });
+
+  it("cached expanded JSON-LD IS served when Accept explicitly requests that profile → 200", () => {
+    const expandedProfile = "http://localhost:3000/ns/context.jsonld#expanded";
+    const body = '["some","expanded","json-ld"]';
+    const resp = buildCachedRdfResponse({
+      request: req(`application/ld+json;profile="${expandedProfile}"`),
+      body,
+      mediaType: "application/ld+json",
+      profile: expandedProfile,
+    });
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get("Content-Type")).toContain("application/ld+json");
+  });
+
+  it("cached flattened JSON-LD is NOT served when Accept requests compacted → 406", () => {
+    const flatProfile = "http://localhost:3000/ns/context.jsonld#flattened";
+    const body = '{"@context":{},"@graph":[]}';
+    // Cache = flattened; client wants compacted (no profile).
+    const resp = buildCachedRdfResponse({
+      request: req("application/ld+json"),
+      body,
+      mediaType: "application/ld+json",
+      profile: flatProfile,
+    });
+    expect(resp.status).toBe(406);
+  });
+
+  it("profile check does not affect non-JSON-LD cached types (turtle path unchanged)", () => {
+    // Turtle has no profile concept; any cached turtle should serve when type matches.
+    const body = "@prefix foaf: <http://xmlns.com/foaf/0.1/> .";
+    const resp = buildCachedRdfResponse({
+      request: req("text/turtle"),
+      body,
+      mediaType: "text/turtle",
+      // profile is irrelevant for turtle; passing one must not cause a 406
+      profile: null,
+    });
+    expect(resp.status).toBe(200);
+  });
+
+  it("profile check does not affect n-triples cached type", () => {
+    const body =
+      '<https://alice.example/card#me> <http://xmlns.com/foaf/0.1/name> "Alice" .\n';
+    const resp = buildCachedRdfResponse({
+      request: req("application/n-triples"),
+      body,
+      mediaType: "application/n-triples",
+      profile: null,
+    });
+    expect(resp.status).toBe(200);
+  });
 });

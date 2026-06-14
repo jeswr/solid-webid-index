@@ -857,6 +857,38 @@ export function buildCachedRdfResponse(opts: {
     );
   }
 
+  // ── Profile-aware JSON-LD cache validation ───────────────────────────────────
+  // For application/ld+json the cached body was produced for a specific profile
+  // (compacted / expanded / flattened).  The media-type check above only confirms
+  // that application/ld+json is acceptable; it does NOT verify that the profile
+  // the client is requesting matches the profile of the cached body.
+  //
+  // Strategy: call negotiateType() which extracts the profile from the Accept
+  // header and compare it to the cached profile.  If they differ, return 406 so
+  // the caller knows it must re-serialise the correct variant.
+  //
+  // Non-JSON-LD types (turtle, n-triples) have no profile — skip this check.
+  if (mediaType === "application/ld+json") {
+    const { profile: negotiatedProfile } = negotiateType(acceptHeader);
+    // normalise null / undefined to the empty string for comparison
+    const cachedProfileNorm = profile ?? null;
+    const negotiatedProfileNorm = negotiatedProfile ?? null;
+    if (cachedProfileNorm !== negotiatedProfileNorm) {
+      return new Response(
+        "Not Acceptable: supported types are text/turtle, application/ld+json, application/n-triples, text/html",
+        {
+          status: 406,
+          headers: {
+            "Content-Type": "text/plain; charset=utf-8",
+            Vary: "Accept",
+            ...READ_CORS_HEADERS,
+            ...extraHeaders,
+          },
+        }
+      );
+    }
+  }
+
   const etag = computeETag(body, mediaType, profile);
 
   const baseHeaders: Record<string, string> = {
