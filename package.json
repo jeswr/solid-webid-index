@@ -7,7 +7,7 @@
     "build": "next build",
     "lint": "biome check .",
     "format": "biome format .",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "next typegen && tsc --noEmit",
     "test": "vitest run"
   },
   "dependencies": {

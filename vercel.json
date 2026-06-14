@@ -4,8 +4,8 @@
   "regions": ["iad1"],
   "crons": [{ "path": "/api/_jobs/tick", "schedule": "0 2 * * *" }],
   "functions": {
-    "app/api/_jobs/crawl/route.ts": { "maxDuration": 300, "memory": 1024 },
-    "app/api/_jobs/index/route.ts": { "maxDuration": 300, "memory": 1024 },
-    "app/api/**/route.ts": { "maxDuration": 60, "memory": 256 }
+    "src/app/api/_jobs/crawl/route.ts": { "maxDuration": 300, "memory": 1024 },
+    "src/app/api/_jobs/index/route.ts": { "maxDuration": 300, "memory": 1024 },
+    "src/app/api/**/route.ts": { "maxDuration": 60, "memory": 256 }
   }
 }
