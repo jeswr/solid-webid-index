@@ -236,18 +236,40 @@ export interface CrawlCoordinator {
    * Atomically claim a batch of pending docs for this worker.
    *
    * Implementation: SELECT … FOR UPDATE SKIP LOCKED (Postgres / pss-5i8).
-   * STUB: throws NotImplementedError — implemented in pss-5i8.
    *
-   * @param workerId   Unique worker / invocation identifier (used as claim_token).
+   * A FRESH UNIQUE opaque token (crypto.randomUUID()) is generated per claim()
+   * invocation and stored in claim_token for all claimed rows.  The token is
+   * returned on each claimed DocRecord (claimToken field) so the caller can pass
+   * it to markDone().  workerId is the caller's logical identity and is NOT
+   * stored in the database — keeping the two concerns separate ensures that a
+   * restarted worker or a re-claim with the same workerId cannot collide with a
+   * previous claim's token, making the lease fence genuinely effective.
+   *
+   * @param workerId   Caller's logical identity label (not stored as claim_token).
    * @param batchSize  Max rows to claim in one call.
    * @returns          The claimed rows (may be fewer than batchSize when the frontier is thin).
+   *                   Each row's claimToken field carries the unique token for this batch.
    */
   claim(workerId: string, batchSize: number): Promise<DocRecord[]>;
 
   /**
    * Finalise a completed crawl attempt: update state, validators, and next_eligible_at.
+   *
+   * @param claimToken  The token returned by the claim() call that owns this row.
+   *   The UPDATE is fenced to `WHERE doc_url = docUrl AND claim_token = claimToken`.
+   *   If the token no longer matches (row was reclaimed by another worker after this
+   *   worker's lease expired), the update touches 0 rows and is treated as a SAFE
+   *   NO-OP — the stale completion is silently discarded.  Pass `null` / `undefined`
+   *   only when calling outside the claim→markDone lifecycle (e.g. tests that call
+   *   enqueue() then markDone() directly without going through claim()); in that case
+   *   the fence is skipped and the traditional "0 rows = unknown docUrl → throw"
+   *   behaviour is preserved.
    */
-  markDone(docUrl: string, result: CrawlResult): Promise<void>;
+  markDone(
+    docUrl: string,
+    result: CrawlResult,
+    claimToken?: string | null
+  ): Promise<void>;
 
   /**
    * Returns true when the doc is due for re-crawl.
