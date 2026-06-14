@@ -75,6 +75,15 @@ export interface GuardedFetchOptions {
     readonly etag?: string;
     readonly lastModified?: string;
   };
+  /**
+   * Honour `X-Robots-Tag: noindex` on the FINAL 2xx response BEFORE the content-type allowlist and
+   * BEFORE reading the body. When set and the final response carries `noindex`, the body is cancelled
+   * (never read) and the result is returned with `noindex: true`, empty `text`/`bytes`, and WITHOUT
+   * rejecting on content-type. This lets the caller tombstone an opted-out document without ever
+   * parsing it — even when the noindex body is malformed, oversized, or a non-RDF content-type that
+   * would otherwise be refused. Default false (content-type allowlist applies as before).
+   */
+  readonly honourNoindexHeader?: boolean;
 }
 
 export interface GuardedFetchResult {
@@ -90,6 +99,12 @@ export interface GuardedFetchResult {
   readonly bytes: Uint8Array;
   /** HTTP status of the final response. */
   readonly status: number;
+  /**
+   * True when `honourNoindexHeader` was set AND the final 2xx response carried `X-Robots-Tag:
+   * noindex`. In that case the body was NOT read (`text`/`bytes` are empty) and the content-type
+   * allowlist was NOT applied — the caller should tombstone the document without parsing it.
+   */
+  readonly noindex: boolean;
 }
 
 /**
@@ -179,6 +194,7 @@ export async function guardedFetch(
   const allowedContentTypes = (
     opts.allowedContentTypes ?? FETCH_RDF_CONTENT_TYPES
   ).map((t) => t.toLowerCase());
+  const honourNoindexHeader = opts.honourNoindexHeader ?? false;
 
   const headers: Record<string, string> = {
     accept,
@@ -276,10 +292,15 @@ export async function guardedFetch(
           ?.trim()
           .toLowerCase() ?? "";
 
-      // Bodyless statuses (304 Not Modified from a conditional request; 204/205 No Content)
-      // carry no body and commonly omit Content-Type — they must NOT be rejected by the
-      // content-type allowlist. Return an empty bounded body and let the caller act on `status`.
-      if (status === 304 || status === 204 || status === 205) {
+      // Body-irrelevant statuses bypass the content-type allowlist and return an empty bounded body,
+      // letting the caller act on `status`:
+      //   - 304 Not Modified (conditional request), 204/205 No Content — carry no body and commonly
+      //     omit Content-Type.
+      //   - Any error status >= 400 — the body is an error page (HTML/plain), never RDF we would
+      //     parse, so reading/allowlisting it is pointless. The crawler classifies by status
+      //     (5xx/429 transient vs other 4xx deterministic). The body is cancelled, not read, so this
+      //     does NOT widen the SSRF surface (no attacker-controlled bytes are ingested).
+      if (status === 304 || status === 204 || status === 205 || status >= 400) {
         void res.body?.cancel().catch(() => {});
         return {
           response: res,
@@ -288,6 +309,25 @@ export async function guardedFetch(
           text: "",
           bytes: new Uint8Array(0),
           status,
+          noindex: false,
+        };
+      }
+
+      // noindex short-circuit (DESIGN.md §4.8 H2): when the caller opted in and the FINAL response
+      // carries `X-Robots-Tag: noindex`, the document is opted out of indexing. Honour it BEFORE the
+      // content-type allowlist and BEFORE reading the body — cancel the body, never parse it. This is
+      // why an opted-out doc with a malformed / oversized / non-RDF body is still tombstoned (returned
+      // with noindex:true) rather than rejected on content-type or read into memory.
+      if (honourNoindexHeader && responseHasNoindex(res)) {
+        void res.body?.cancel().catch(() => {});
+        return {
+          response: res,
+          finalUrl,
+          contentType,
+          text: "",
+          bytes: new Uint8Array(0),
+          status,
+          noindex: true,
         };
       }
 
@@ -318,7 +358,15 @@ export async function guardedFetch(
       }
       const text = new TextDecoder("utf-8").decode(bytes);
 
-      return { response: res, finalUrl, contentType, text, bytes, status };
+      return {
+        response: res,
+        finalUrl,
+        contentType,
+        text,
+        bytes,
+        status,
+        noindex: false,
+      };
     }
   } finally {
     clearTimeout(timer);
@@ -331,6 +379,12 @@ function parseUrl(raw: string): URL {
   } catch {
     throw new GuardedFetchError(`URL is malformed: ${raw}.`);
   }
+}
+
+/** True when the response's `X-Robots-Tag` header value contains `noindex` (case-insensitive). */
+function responseHasNoindex(res: Response): boolean {
+  const tag = res.headers.get("x-robots-tag");
+  return tag?.toLowerCase().includes("noindex") ?? false;
 }
 
 function reason(error: unknown): string {

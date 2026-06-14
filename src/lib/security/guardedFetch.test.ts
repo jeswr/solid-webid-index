@@ -516,6 +516,37 @@ describe("guardedFetch — happy path (loopback test hook)", () => {
   });
 });
 
+describe("guardedFetch — error statuses bypass the content-type allowlist", () => {
+  // An error response body is never RDF we would parse, so guardedFetch returns it bodyless (the
+  // body is cancelled, not read) and surfaces the status — the crawler classifies 5xx/429 transient
+  // vs other 4xx deterministic. This does NOT widen the SSRF surface (no attacker bytes ingested).
+  it.each([404, 401, 403, 429, 500, 503])(
+    "returns a bodyless result for HTTP %i with a non-RDF (text/plain) body",
+    async (code) => {
+      routes.set(`/err${code}`, (_req, res) => {
+        res.writeHead(code, { "content-type": "text/plain" });
+        res.end(`error ${code}`);
+      });
+      const r = await guardedFetch(`${base}/err${code}`, {
+        allowLoopback: true,
+      });
+      expect(r.status).toBe(code);
+      expect(r.text).toBe(""); // body cancelled, not read
+      expect(r.bytes.length).toBe(0);
+    }
+  );
+
+  it("returns a bodyless result for a 410 Gone with no content-type", async () => {
+    routes.set("/gone", (_req, res) => {
+      res.writeHead(410);
+      res.end("gone");
+    });
+    const r = await guardedFetch(`${base}/gone`, { allowLoopback: true });
+    expect(r.status).toBe(410);
+    expect(r.text).toBe("");
+  });
+});
+
 describe("guardedFetch — content-type allowlist", () => {
   it("rejects text/html (RDFa excluded)", async () => {
     routes.set("/html", (_req, res) => {
@@ -535,6 +566,71 @@ describe("guardedFetch — content-type allowlist", () => {
     await expect(
       guardedFetch(`${base}/noct`, { allowLoopback: true })
     ).rejects.toBeInstanceOf(GuardedFetchError);
+  });
+});
+
+describe("guardedFetch — honourNoindexHeader (pre-parse noindex short-circuit)", () => {
+  it("returns noindex:true WITHOUT rejecting on content-type or reading the body", async () => {
+    // noindex + a non-RDF content-type that the allowlist would normally REJECT. With
+    // honourNoindexHeader the noindex check runs FIRST, so the call resolves (no throw) with
+    // noindex:true and an empty body — the caller tombstones without parsing.
+    routes.set("/noidx", (_req, res) => {
+      res.writeHead(200, {
+        "content-type": "text/html",
+        "x-robots-tag": "noindex",
+      });
+      res.end("<html>not rdf {{{ broken</html>");
+    });
+    const r = await guardedFetch(`${base}/noidx`, {
+      allowLoopback: true,
+      honourNoindexHeader: true,
+    });
+    expect(r.noindex).toBe(true);
+    expect(r.status).toBe(200);
+    expect(r.text).toBe("");
+    expect(r.bytes.length).toBe(0);
+  });
+
+  it("a noindex value combined with other directives is still honoured (case-insensitive)", async () => {
+    routes.set("/noidx2", (_req, res) => {
+      res.writeHead(200, {
+        "content-type": "text/turtle",
+        "x-robots-tag": "googlebot: NoIndex, nofollow",
+      });
+      res.end("@prefix x: <x:> . x:a x:b x:c .");
+    });
+    const r = await guardedFetch(`${base}/noidx2`, {
+      allowLoopback: true,
+      honourNoindexHeader: true,
+    });
+    expect(r.noindex).toBe(true);
+    expect(r.text).toBe("");
+  });
+
+  it("without honourNoindexHeader, a noindex non-RDF body is still content-type rejected", async () => {
+    routes.set("/noidx3", (_req, res) => {
+      res.writeHead(200, {
+        "content-type": "text/html",
+        "x-robots-tag": "noindex",
+      });
+      res.end("<html>nope</html>");
+    });
+    await expect(
+      guardedFetch(`${base}/noidx3`, { allowLoopback: true })
+    ).rejects.toBeInstanceOf(GuardedFetchError);
+  });
+
+  it("an RDF doc WITHOUT noindex returns noindex:false and the body (regression)", async () => {
+    routes.set("/plain", (_req, res) => {
+      res.writeHead(200, { "content-type": "text/turtle" });
+      res.end("@prefix x: <x:> . x:a x:b x:c .");
+    });
+    const r = await guardedFetch(`${base}/plain`, {
+      allowLoopback: true,
+      honourNoindexHeader: true,
+    });
+    expect(r.noindex).toBe(false);
+    expect(r.text).toContain("x:a");
   });
 });
 

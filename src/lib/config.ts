@@ -60,6 +60,39 @@ export const RECRAWL_INTERVAL_OTHER_MS = envInt(
 /** Max transient-failure retries before a doc is marked error (then re-eligible after cooldown). */
 export const MAX_ATTEMPTS = envInt("CRAWL_MAX_ATTEMPTS", 5);
 
+/**
+ * Minimum delay (ms) between two fetches to the SAME host (politeness, §5). After each fetch the
+ * host's `next_allowed_at` is stamped to `now + HOST_CRAWL_DELAY_MS`; the crawler skips a host whose
+ * `next_allowed_at` is still in the future and re-pends its rows. Default 1s.
+ */
+export const HOST_CRAWL_DELAY_MS = envInt("CRAWL_HOST_DELAY_MS", 1_000);
+
+/**
+ * Base backoff (ms) applied to a doc's `next_eligible_at` after a TRANSIENT failure. The actual delay
+ * grows exponentially with the doc's attempt count (`base * 2^(attempts-1)`), capped at
+ * {@link TRANSIENT_BACKOFF_MAX_MS}. Default 60s.
+ */
+export const TRANSIENT_BACKOFF_BASE_MS = envInt(
+  "CRAWL_TRANSIENT_BACKOFF_BASE_MS",
+  60_000
+);
+
+/** Cap (ms) on the exponential transient-failure backoff. Default 6 hours. */
+export const TRANSIENT_BACKOFF_MAX_MS = envInt(
+  "CRAWL_TRANSIENT_BACKOFF_MAX_MS",
+  6 * 60 * 60 * 1000
+);
+
+/**
+ * Cooldown (ms) before a doc that exhausted {@link MAX_ATTEMPTS} transient retries (state `failed`)
+ * becomes re-eligible. A flapping-but-real pod is never marked permanently dead (DESIGN.md §3.4 H7).
+ * Default 24 hours.
+ */
+export const FAILED_COOLDOWN_MS = envInt(
+  "CRAWL_FAILED_COOLDOWN_MS",
+  24 * 60 * 60 * 1000
+);
+
 // ─── Fetch / guardedFetch limits (§5) ────────────────────────────────────────
 
 /** Total fetch timeout per document in ms (covers DNS + connect + TLS + response body). */
