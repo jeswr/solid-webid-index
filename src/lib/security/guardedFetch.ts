@@ -34,11 +34,11 @@ import {
   MAX_BYTES_PROFILE,
   MAX_REDIRECTS,
 } from "../config";
-import { readBoundedBytes } from "./body";
+import { BodyTooLargeError, readBoundedBytes } from "./body";
 import { type LookupAddress, assertNotSsrf, pinnedLookup } from "./ssrf";
 
 export { SsrfError } from "./ssrf";
-export { BodyTooLargeError } from "./body";
+export { BodyTooLargeError };
 
 /** Raised by guardedFetch for non-SSRF failures (bad scheme/port, disallowed content-type, redirect
  * cap, redirect loop, scheme downgrade, network error). SSRF failures throw {@link SsrfError}. */
@@ -276,6 +276,21 @@ export async function guardedFetch(
           ?.trim()
           .toLowerCase() ?? "";
 
+      // Bodyless statuses (304 Not Modified from a conditional request; 204/205 No Content)
+      // carry no body and commonly omit Content-Type — they must NOT be rejected by the
+      // content-type allowlist. Return an empty bounded body and let the caller act on `status`.
+      if (status === 304 || status === 204 || status === 205) {
+        void res.body?.cancel().catch(() => {});
+        return {
+          response: res,
+          finalUrl,
+          contentType,
+          text: "",
+          bytes: new Uint8Array(0),
+          status,
+        };
+      }
+
       if (!allowedContentTypes.includes(contentType)) {
         void res.body?.cancel().catch(() => {});
         throw new GuardedFetchError(
@@ -283,7 +298,24 @@ export async function guardedFetch(
         );
       }
 
-      const bytes = await readBoundedBytes(res, { maxBytes, controller });
+      let bytes: Uint8Array;
+      try {
+        bytes = await readBoundedBytes(res, { maxBytes, controller });
+      } catch (error: unknown) {
+        // Preserve the body-too-large contract; convert an abort during body streaming
+        // (the shared timeout fired mid-read) into the guardedFetch timeout error shape.
+        if (error instanceof BodyTooLargeError) throw error;
+        if (controller.signal.aborted) {
+          throw new GuardedFetchError(
+            `Fetch body timed out after ${timeoutMs}ms: ${finalUrl}.`,
+            { cause: error }
+          );
+        }
+        throw new GuardedFetchError(
+          `Failed reading body for ${finalUrl}: ${reason(error)}`,
+          { cause: error }
+        );
+      }
       const text = new TextDecoder("utf-8").decode(bytes);
 
       return { response: res, finalUrl, contentType, text, bytes, status };

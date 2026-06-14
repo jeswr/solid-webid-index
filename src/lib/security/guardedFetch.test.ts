@@ -469,6 +469,25 @@ describe("guardedFetch — happy path (loopback test hook)", () => {
     expect(r.status).toBe(304);
   });
 
+  it("accepts a 304 with NO content-type (bodyless status bypasses the allowlist)", async () => {
+    routes.set("/cond-noct", (req, res) => {
+      if (req.headers["if-none-match"] === '"v2"') {
+        res.writeHead(304); // real 304s commonly omit Content-Type
+        res.end();
+        return;
+      }
+      res.writeHead(200, { "content-type": "text/turtle" });
+      res.end(TTL);
+    });
+    const r = await guardedFetch(`${base}/cond-noct`, {
+      allowLoopback: true,
+      conditional: { etag: '"v2"' },
+    });
+    expect(r.status).toBe(304);
+    expect(r.text).toBe("");
+    expect(r.bytes.length).toBe(0);
+  });
+
   it("sends a descriptive User-Agent", async () => {
     let seenUa = "";
     routes.set("/ua", (req, res) => {
@@ -544,6 +563,20 @@ describe("guardedFetch — timeout", () => {
     });
     await expect(
       guardedFetch(`${base}/slow`, { allowLoopback: true, timeoutMs: 150 })
+    ).rejects.toBeInstanceOf(GuardedFetchError);
+  });
+
+  it("surfaces a body-stream timeout (after headers) as GuardedFetchError", async () => {
+    routes.set("/slowbody", (_req, res) => {
+      // Headers + an allowed content-type arrive immediately (passing the allowlist),
+      // then the body stalls past the timeout — readBoundedBytes must abort and the
+      // failure must surface as GuardedFetchError, not a raw abort/stream error.
+      res.writeHead(200, { "content-type": "text/turtle" });
+      res.write("<https://a.example/#me> ");
+      // intentionally never res.end() within the window
+    });
+    await expect(
+      guardedFetch(`${base}/slowbody`, { allowLoopback: true, timeoutMs: 150 })
     ).rejects.toBeInstanceOf(GuardedFetchError);
   });
 });
