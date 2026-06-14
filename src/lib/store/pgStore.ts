@@ -527,15 +527,70 @@ export class PgStore implements ReadStore, SearchIndex, CrawlCoordinator {
   }
 
   /**
-   * STUB — implemented in pss-5i8.
+   * Atomically claim a batch of pending (or expired-lease) frontier rows.
    *
-   * The full implementation uses SELECT … FOR UPDATE SKIP LOCKED (DESIGN.md §3.1 addendum)
-   * for atomic batch claiming without double-claims under concurrency.
+   * SQL pattern — single statement, one round-trip:
+   *
+   *   WITH eligible AS (
+   *     SELECT doc_url FROM doc
+   *     WHERE (state = 'pending' AND next_eligible_at <= now)
+   *        OR (state = 'claimed' AND claimed_at <= expiredBefore)
+   *     ORDER BY depth ASC, next_eligible_at ASC
+   *     LIMIT batchSize
+   *     FOR UPDATE SKIP LOCKED          -- skip rows locked by concurrent workers
+   *   )
+   *   UPDATE doc SET
+   *     state = 'claimed', claim_token = $token,
+   *     claimed_at = $now, attempts = attempts + 1
+   *   FROM eligible
+   *   WHERE doc.doc_url = eligible.doc_url
+   *   RETURNING *
+   *
+   * SKIP LOCKED means a concurrent worker claiming at the same instant skips any
+   * row this transaction has already locked — concurrent workers therefore receive
+   * disjoint row sets with no blocking and no double-claims.
+   *
+   * Lease expiry: a row with state='claimed' and claimed_at <= (now - LEASE_MS)
+   * is treated as reclaimable (crash recovery). markDone() clears the lease on
+   * normal completion.
+   *
+   * pglite note: pglite runs real Postgres internally (WASM), so FOR UPDATE SKIP
+   * LOCKED is fully supported — verified by the concurrency test in pgStore.test.ts.
    */
-  async claim(_workerId: string, _batchSize: number): Promise<DocRecord[]> {
-    throw new Error(
-      "CrawlCoordinator.claim(): not implemented — deferred to pss-5i8 (SELECT FOR UPDATE SKIP LOCKED)"
+  async claim(workerId: string, batchSize: number): Promise<DocRecord[]> {
+    const now = Date.now();
+    // A row is reclaimable if it has been claimed for longer than LEASE_MS.
+    // Import LEASE_MS from config so the threshold is the single-source constant.
+    // We inline the import here to keep the adapter config-aware without coupling
+    // the constructor to config (tests inject their own batchSize).
+    const { LEASE_MS } = await import("../config.js");
+    const expiredBefore = now - LEASE_MS;
+
+    const rows = await this.db.query<DocRow>(
+      `WITH eligible AS (
+         SELECT doc_url FROM doc
+         WHERE (
+           (state = 'pending'  AND next_eligible_at <= $1)
+           OR
+           (state = 'claimed'  AND claimed_at IS NOT NULL AND claimed_at <= $2)
+         )
+         AND noindex = FALSE
+         ORDER BY depth ASC, next_eligible_at ASC
+         LIMIT $3
+         FOR UPDATE SKIP LOCKED
+       )
+       UPDATE doc
+          SET state       = 'claimed',
+              claim_token = $4,
+              claimed_at  = $1,
+              attempts    = attempts + 1
+         FROM eligible
+        WHERE doc.doc_url = eligible.doc_url
+        RETURNING doc.*`,
+      [now, expiredBefore, batchSize, workerId]
     );
+
+    return rows.map(rowToRecord);
   }
 
   async markDone(docUrl: string, result: CrawlResult): Promise<void> {

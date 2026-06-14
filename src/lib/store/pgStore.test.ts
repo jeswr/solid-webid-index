@@ -368,8 +368,127 @@ describe("PgStore — CrawlCoordinator", () => {
     expect(await store.needsRecrawl("https://heidi.example/card")).toBe(false);
   });
 
-  it("claim() throws NotImplementedError (stub for pss-5i8)", async () => {
-    await expect(store.claim("worker-1", 8)).rejects.toThrow("pss-5i8");
+  it("enqueue() + claim() — claim() returns the enqueued pending row", async () => {
+    await store.enqueue("https://frank.example/card");
+
+    const claimed = await store.claim("worker-1", 8);
+    expect(claimed).toHaveLength(1);
+    expect(claimed[0].docUrl).toBe("https://frank.example/card");
+    expect(claimed[0].state).toBe("claimed");
+    expect(claimed[0].claimToken).toBe("worker-1");
+    expect(claimed[0].attempts).toBe(1);
+    expect(claimed[0].claimedAt).not.toBeNull();
+  });
+
+  it("claim() returns at most batchSize rows", async () => {
+    // Enqueue 10 pending rows
+    for (let i = 0; i < 10; i++) {
+      await store.enqueue(`https://batch${i}.example/card`);
+    }
+
+    const claimed = await store.claim("worker-1", 5);
+    expect(claimed.length).toBeLessThanOrEqual(5);
+    // All returned rows must be marked claimed
+    for (const row of claimed) {
+      expect(row.state).toBe("claimed");
+      expect(row.claimToken).toBe("worker-1");
+    }
+  });
+
+  it("claim() returns [] when the frontier is empty", async () => {
+    const claimed = await store.claim("worker-empty", 8);
+    expect(claimed).toHaveLength(0);
+  });
+
+  it("claim() — a fresh (unexpired) claimed row is NOT re-claimed by another worker", async () => {
+    await store.enqueue("https://locked.example/card");
+
+    // First worker claims the row
+    const first = await store.claim("worker-A", 8);
+    expect(first).toHaveLength(1);
+    expect(first[0].claimToken).toBe("worker-A");
+
+    // Second worker must not re-claim the same row (it's still claimed + lease not expired)
+    const second = await store.claim("worker-B", 8);
+    expect(second).toHaveLength(0);
+  });
+
+  it("claim() — two concurrent claim() calls return DISJOINT row sets (the key correctness test)", async () => {
+    // Enqueue 20 rows to give both workers plenty to claim
+    for (let i = 0; i < 20; i++) {
+      await store.enqueue(`https://concurrent${i}.example/card`);
+    }
+
+    // Fire both claim() calls concurrently — they must not share any row
+    const [setA, setB] = await Promise.all([
+      store.claim("worker-concurrent-A", 8),
+      store.claim("worker-concurrent-B", 8),
+    ]);
+
+    const urlsA = new Set(setA.map((r) => r.docUrl));
+    const urlsB = new Set(setB.map((r) => r.docUrl));
+
+    // No URL may appear in both sets
+    for (const url of urlsA) {
+      expect(urlsB.has(url)).toBe(false);
+    }
+
+    // Each set must actually have claimed their rows (not 0 each)
+    // With 20 rows and batchSize=8 each, both workers should get rows
+    expect(setA.length + setB.length).toBeGreaterThan(0);
+
+    // All returned rows must be marked claimed with the correct token
+    for (const row of setA) {
+      expect(row.state).toBe("claimed");
+      expect(row.claimToken).toBe("worker-concurrent-A");
+    }
+    for (const row of setB) {
+      expect(row.state).toBe("claimed");
+      expect(row.claimToken).toBe("worker-concurrent-B");
+    }
+  });
+
+  it("claim() — an expired lease row IS reclaimable after LEASE_MS", async () => {
+    const { LEASE_MS } = await import("../config.js");
+
+    // Use a fresh store+db pair so we can directly backdate claimed_at.
+    const { store: freshStore, db: freshDb } = await makeTestStore();
+
+    await freshStore.enqueue("https://expired2.example/card");
+
+    // First claim — row transitions to 'claimed'
+    const first = await freshStore.claim("worker-first", 8);
+    expect(first).toHaveLength(1);
+
+    // Backdate claimed_at to simulate an expired lease (more than LEASE_MS ago).
+    const expiredClaimedAt = Date.now() - LEASE_MS - 1;
+    await freshDb.query(
+      `UPDATE doc SET claimed_at = $1 WHERE doc_url = 'https://expired2.example/card'`,
+      [expiredClaimedAt]
+    );
+
+    // A second worker should now be able to reclaim the expired row.
+    const reclaimed = await freshStore.claim("worker-second", 8);
+    expect(reclaimed).toHaveLength(1);
+    expect(reclaimed[0].docUrl).toBe("https://expired2.example/card");
+    expect(reclaimed[0].claimToken).toBe("worker-second");
+    expect(reclaimed[0].attempts).toBe(2); // incremented from the first claim
+  });
+
+  it("markDone() releases a claimed row (sets state and clears claim_token)", async () => {
+    await store.enqueue("https://release.example/card");
+    const claimed = await store.claim("worker-X", 8);
+    expect(claimed).toHaveLength(1);
+
+    await store.markDone("https://release.example/card", {
+      state: "done",
+      httpStatus: 200,
+    });
+
+    const doc = await store.get("https://release.example/card");
+    expect(doc?.state).toBe("done");
+    expect(doc?.claimToken).toBeNull();
+    expect(doc?.claimedAt).toBeNull();
   });
 });
 
