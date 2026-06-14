@@ -7,7 +7,7 @@
   },
   "files": {
     "ignoreUnknown": false,
-    "ignore": ["node_modules", ".next", "out", "coverage"]
+    "ignore": ["node_modules", ".next", "out", "coverage", ".agents", "skills-lock.json"]
   },
   "formatter": {
     "enabled": true,
