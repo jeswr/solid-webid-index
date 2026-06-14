@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Next.js
+.next/
+out/
+
+# Turso local
+.turso/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Coverage
+coverage/
+
+# Logs
+*.log
+
+# TypeScript incremental build info
+*.tsbuildinfo
+
+# macOS
+.DS_Store
