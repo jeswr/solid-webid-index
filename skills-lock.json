@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "skills": {
+    "accessible-html-links": {
+      "source": "jeswr/solid-ai-coding",
+      "sourceType": "github",
+      "skillPath": "skills/accessible-html-links/SKILL.md",
+      "computedHash": "21dee9bf19de98acf61af92e8b50dd1e2668bd33b1141b9ed4f0667b6b8573a9"
+    },
+    "solid-client-id": {
+      "source": "jeswr/solid-ai-coding",
+      "sourceType": "github",
+      "skillPath": "skills/solid-client-id/SKILL.md",
+      "computedHash": "abffb118c489341fd25ceb62591e7426a4f0eff6d4031b4620ddefb7b4fa4045"
+    },
+    "solid-fetch-rdf": {
+      "source": "jeswr/solid-ai-coding",
+      "sourceType": "github",
+      "skillPath": "skills/solid-fetch-rdf/SKILL.md",
+      "computedHash": "7ec7257533041d8155755569ee1c48635ba3b293b5ffc8203f3e199544d809ff"
+    },
+    "solid-notifications": {
+      "source": "jeswr/solid-ai-coding",
+      "sourceType": "github",
+      "skillPath": "skills/solid-notifications/SKILL.md",
+      "computedHash": "b2fc461301c3141f0abeb4b41d5cea8e1a4d99f7dcd9560a4690ed84fcc43844"
+    },
+    "solid-object": {
+      "source": "jeswr/solid-ai-coding",
+      "sourceType": "github",
+      "skillPath": "skills/solid-object/SKILL.md",
+      "computedHash": "ca6ec066661958cd900891fda203123a8ca7abef8cfa2d6c85cfe3b711f7aaa6"
+    },
+    "solid-reactive-authentication": {
+      "source": "jeswr/solid-ai-coding",
+      "sourceType": "github",
+      "skillPath": "skills/solid-reactive-authentication/SKILL.md",
+      "computedHash": "366a79f6c72c0c2e5193f6c6fc6aa82e0c3b25eb87eedc7f76e8bdbe969755bb"
+    },
+    "solid-scale-and-sharding": {
+      "source": "jeswr/solid-ai-coding",
+      "sourceType": "github",
+      "skillPath": "skills/solid-scale-and-sharding/SKILL.md",
+      "computedHash": "40b286a170f727c076c496c727b3c1fb86fa73012b13e1743f9adb74dbdc50c3"
+    },
+    "solid-server-matrix": {
+      "source": "jeswr/solid-ai-coding",
+      "sourceType": "github",
+      "skillPath": "skills/solid-server-matrix/SKILL.md",
+      "computedHash": "5366149059842b82e12e561c9b8d679527fb999e22f5eecce80c0ed765ca5b8f"
+    },
+    "solid-test-infrastructure": {
+      "source": "jeswr/solid-ai-coding",
+      "sourceType": "github",
+      "skillPath": "skills/solid-test-infrastructure/SKILL.md",
+      "computedHash": "aae04f6a85d53b7efd4ea5c13cc61795b3b2afbae5f29ed0725cb3a6ff9580e5"
+    },
+    "solid-type-index": {
+      "source": "jeswr/solid-ai-coding",
+      "sourceType": "github",
+      "skillPath": "skills/solid-type-index/SKILL.md",
+      "computedHash": "63847caf11f54a7d1087f42d2aa0835c8f5f1083d6e983432285a72826a45203"
+    }
+  }
+}
