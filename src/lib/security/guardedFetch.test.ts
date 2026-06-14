@@ -488,6 +488,22 @@ describe("guardedFetch — happy path (loopback test hook)", () => {
     expect(r.bytes.length).toBe(0);
   });
 
+  it.each([204, 205])(
+    "accepts a bodyless %i (No Content / Reset) with no content-type",
+    async (code) => {
+      routes.set(`/empty${code}`, (_req, res) => {
+        res.writeHead(code);
+        res.end();
+      });
+      const r = await guardedFetch(`${base}/empty${code}`, {
+        allowLoopback: true,
+      });
+      expect(r.status).toBe(code);
+      expect(r.text).toBe("");
+      expect(r.bytes.length).toBe(0);
+    }
+  );
+
   it("sends a descriptive User-Agent", async () => {
     let seenUa = "";
     routes.set("/ua", (req, res) => {
