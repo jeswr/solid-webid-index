@@ -4,6 +4,28 @@
 > are **references only** — consult for behaviour, copy nothing. This is one concrete, deployable
 > Next.js app on Vercel Hobby, not a framework.
 
+## DECISION ADDENDUM — 2026-06-14 (supersedes the storage + scheduling sections below)
+
+Storage is simplified to a **single Vercel-Marketplace database: Neon (Serverless Postgres)**,
+provisioned with `vercel install neon` (credentials auto-injected). This **replaces Turso/libSQL**
+and the **storage stack is now just Vercel + Neon — no other vendors**.
+
+- **Full-text search:** Postgres native FTS — `tsvector` + GIN index + `ts_rank`/`websearch_to_tsquery`
+  (replaces SQLite FTS5/bm25). Same search quality, one fewer engine.
+- **Atomic crawl claim:** `SELECT … FOR UPDATE SKIP LOCKED` on the frontier table (cleaner + more
+  correct than the SQLite lease/fence dance). This is the home for bead `claim-verify`.
+- **Crawl scheduling simplified:** drop **Upstash QStash**. The frontier drains via (a) the
+  POST-suggest-triggered immediate crawl, (b) self-chaining bounded batches (a run triggers the next
+  batch before its timeout), and (c) a daily Vercel Cron sweep for re-crawl + leftover frontier. QStash
+  can be reintroduced later if sub-daily unattended cadence is needed (a Pro-tier concern).
+- **Why:** Neon is the canonical free Postgres on Vercel (0.5 GB storage, 100 compute-hours/mo,
+  scale-to-zero, 5 GB egress — generous for a text index of WebIDs); one DB does FTS + queue +
+  relations; provider-agnostic Postgres keeps Supabase as a drop-in alternative. The DB-agnostic
+  Storage ports (ReadStore/SearchIndex/CrawlCoordinator) are unchanged — only the adapter + schema
+  move from SQLite to Postgres. Tests use **pglite** (in-process Postgres, no server/network).
+
+Where the sections below say Turso/libSQL/FTS5/QStash, read Neon/Postgres/tsvector/Cron+self-chain.
+
 ## 0. Goal & non-negotiables
 
 A public, Linked-Data-native index of Solid WebIDs with **feature parity** to
