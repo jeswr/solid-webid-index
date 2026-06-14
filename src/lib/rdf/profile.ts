@@ -27,35 +27,47 @@ export { RdfFetchError, ParseLimitError };
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
 /**
- * Recursively count all JSON nodes (objects, arrays, and primitives) in a
- * parsed JSON value, and measure the maximum nesting depth.
+ * Structural PREFLIGHT before handing a JSON-LD body to jsonld.toRDF: throws
+ * {@link ParseLimitError} as soon as the node count exceeds `maxNodes` or the
+ * nesting depth exceeds `maxDepth`.
  *
- * Returns `{ nodeCount, maxDepth }` where nodeCount counts every non-null
- * value encountered (including the root) and maxDepth is the deepest nesting
- * level (root = depth 1).
- *
- * This is used as a PREFLIGHT before handing a JSON-LD body to jsonld.toRDF.
- * The byte cap already bounds total size; this provides defence-in-depth
+ * ITERATIVE (explicit stack, NO recursion) and SHORT-CIRCUITING by design — a
+ * hostile deeply-nested body must not stack-overflow before the depth cap fires
+ * (the bug a recursive walker has), and an oversized body must never be walked
+ * in full. The byte cap already bounds raw size; this adds a structural guard
  * against JSON-LD expansion quadratics before the quad cap triggers.
+ * Root is depth 1.
  */
-function countJsonNodes(
-  value: unknown,
-  depth = 1
-): { nodeCount: number; maxDepth: number } {
-  if (value === null || typeof value !== "object") {
-    return { nodeCount: 1, maxDepth: depth };
+function assertJsonWithinLimits(
+  root: unknown,
+  maxNodes: number,
+  maxDepth: number
+): void {
+  const stack: Array<[unknown, number]> = [[root, 1]];
+  let nodeCount = 0;
+  while (stack.length > 0) {
+    // biome-ignore lint/style/noNonNullAssertion: guarded by stack.length > 0
+    const [value, depth] = stack.pop()!;
+    nodeCount++;
+    if (nodeCount > maxNodes) {
+      throw new ParseLimitError(
+        `JSON-LD body exceeds MAX_JSON_NODES cap (> ${maxNodes} nodes)`
+      );
+    }
+    if (depth > maxDepth) {
+      throw new ParseLimitError(
+        `JSON-LD body exceeds MAX_JSON_DEPTH cap (> ${maxDepth} deep)`
+      );
+    }
+    if (value !== null && typeof value === "object") {
+      const children = Array.isArray(value)
+        ? value
+        : Object.values(value as Record<string, unknown>);
+      for (const child of children) {
+        stack.push([child, depth + 1]);
+      }
+    }
   }
-  const entries = Array.isArray(value)
-    ? value
-    : Object.values(value as Record<string, unknown>);
-  let nodeCount = 1; // count this object/array itself
-  let maxDepth = depth;
-  for (const child of entries) {
-    const sub = countJsonNodes(child, depth + 1);
-    nodeCount += sub.nodeCount;
-    if (sub.maxDepth > maxDepth) maxDepth = sub.maxDepth;
-  }
-  return { nodeCount, maxDepth };
 }
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -117,17 +129,10 @@ export async function parseProfile({
       parsed = null;
     }
     if (parsed !== null) {
-      const { nodeCount, maxDepth } = countJsonNodes(parsed);
-      if (nodeCount > MAX_JSON_NODES) {
-        throw new ParseLimitError(
-          `JSON-LD body exceeds MAX_JSON_NODES cap (${nodeCount} > ${MAX_JSON_NODES})`
-        );
-      }
-      if (maxDepth > MAX_JSON_DEPTH) {
-        throw new ParseLimitError(
-          `JSON-LD body exceeds MAX_JSON_DEPTH cap (${maxDepth} > ${MAX_JSON_DEPTH})`
-        );
-      }
+      // Iterative + short-circuit: throws on the first cap breach, never
+      // recurses (no stack overflow on hostile deep nesting) and never walks an
+      // oversized body in full.
+      assertJsonWithinLimits(parsed, MAX_JSON_NODES, MAX_JSON_DEPTH);
     }
   }
 
