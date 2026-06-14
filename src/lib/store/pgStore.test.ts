@@ -7,10 +7,14 @@
  */
 
 import { PGlite } from "@electric-sql/pglite";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { PgStore, createPgliteExecutor } from "./pgStore.js";
-import type { DocRecord } from "./ports.js";
+import {
+  PgStore,
+  createPgliteExecutor,
+  splitSqlStatements,
+} from "./pgStore.js";
+import type { DocRecord, DocState } from "./ports.js";
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -366,5 +370,201 @@ describe("PgStore — CrawlCoordinator", () => {
 
   it("claim() throws NotImplementedError (stub for pss-5i8)", async () => {
     await expect(store.claim("worker-1", 8)).rejects.toThrow("pss-5i8");
+  });
+});
+
+// ─── roborev finding tests ────────────────────────────────────────────────────
+// These tests directly cover the four HIGH/MEDIUM/LOW findings addressed by
+// "fix(store): address roborev (require-in-ESM HIGH, search fallback, markDone, migrate)".
+
+describe("roborev fix 1 — no require() in ESM (createNeonExecutor)", () => {
+  it("createNeonExecutor is importable as an ESM module (no require())", async () => {
+    // The HIGH finding was require("@neondatabase/serverless") inside an ESM module.
+    // Verify the fix: createNeonExecutor must be importable without a ReferenceError
+    // on require — if require() were present, the dynamic import would throw in an
+    // ESM context.  The factory itself (before any query) must not throw.
+    const { createNeonExecutor: importedFactory } = await import(
+      "./pgStore.js"
+    );
+    // Constructing an executor must not invoke require() — it only calls neon()
+    // lazily on first query.  We never make a query here, so this is safe.
+    expect(() =>
+      importedFactory("postgresql://test:test@localhost/test")
+    ).not.toThrow();
+  });
+
+  it("pgStore.ts has a top-level ESM import for neon (no require)", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const src = readFileSync(
+      join(process.cwd(), "src/lib/store/pgStore.ts"),
+      "utf-8"
+    );
+    // Must have a top-level ESM import for neon at the module level
+    expect(src).toMatch(
+      /^import\s*\{[^}]*neon[^}]*\}\s*from\s*["']@neondatabase\/serverless["']/m
+    );
+    // Must NOT have require("@neondatabase/serverless") as executable code.
+    // We check lines that are not inside block-comment or line-comment context
+    // by verifying the pattern only matches when preceded by clear require syntax.
+    // The simplest reliable check: the string require("@neondatabase must not appear.
+    expect(src).not.toContain('require("@neondatabase');
+    expect(src).not.toContain("require('@neondatabase");
+  });
+});
+
+describe("roborev fix 2 — search() non-FTS errors are not swallowed", () => {
+  it("a non-FTS executor error propagates out of search() unchanged", async () => {
+    // Build a mock executor whose query() always throws a non-FTS error.
+    // This simulates a connection or schema error that must not be masked.
+    const connectionError = new Error("connection refused");
+
+    const mockExecutor = {
+      query: vi.fn().mockRejectedValue(connectionError),
+      exec: vi.fn().mockResolvedValue(undefined),
+    };
+
+    const store = new PgStore(mockExecutor);
+
+    // search() must rethrow the connection error, not silently fall back.
+    await expect(store.search({ query: "alice", limit: 10 })).rejects.toThrow(
+      "connection refused"
+    );
+  });
+
+  it("search() falls back to plainto_tsquery only when websearch_to_tsquery is absent", async () => {
+    // Simulate an error that looks like 'websearch_to_tsquery does not exist'
+    // (what pglite / older Postgres returns for undefined function).
+    const undefinedFnError = new Error(
+      "function websearch_to_tsquery(unknown, unknown) does not exist"
+    );
+    (undefinedFnError as Error & { code?: string }).code = "42883";
+
+    let callCount = 0;
+    const mockExecutor = {
+      query: vi.fn().mockImplementation((text: string) => {
+        callCount++;
+        if (callCount === 1 && text.includes("websearch_to_tsquery")) {
+          // First call (websearch path) fails with undefined_function
+          return Promise.reject(undefinedFnError);
+        }
+        // Second call (plainto fallback) succeeds with empty rows
+        return Promise.resolve([]);
+      }),
+      exec: vi.fn().mockResolvedValue(undefined),
+    };
+
+    const store = new PgStore(mockExecutor);
+    // Should not throw — the fallback path handles the undefined_function error.
+    const result = await store.search({ query: "alice", limit: 10 });
+    expect(result.rows).toHaveLength(0);
+    expect(callCount).toBe(2); // websearch attempted, then plainto fallback
+  });
+});
+
+describe("roborev fix 3 — markDone() throws on unknown docUrl", () => {
+  it("markDone() throws when the URL was never enqueued", async () => {
+    const { store } = await makeTestStore();
+
+    // Calling markDone() on a URL with no row must throw rather than silently no-op.
+    await expect(
+      store.markDone("https://never-enqueued.example/card", { state: "done" })
+    ).rejects.toThrow(/no row found.*never-enqueued\.example/i);
+  });
+
+  it("markDone() succeeds when the URL was previously enqueued", async () => {
+    const { store } = await makeTestStore();
+
+    await store.enqueue("https://known.example/card");
+    // Must not throw
+    await expect(
+      store.markDone("https://known.example/card", {
+        state: "done",
+        httpStatus: 200,
+      })
+    ).resolves.toBeUndefined();
+
+    const doc = await store.get("https://known.example/card");
+    expect(doc?.state).toBe("done" satisfies DocState);
+  });
+});
+
+describe("roborev fix 4 — migrate() multi-statement and idempotency", () => {
+  it("migrate() applies schema cleanly via exec() (no manual splitting)", async () => {
+    const db = new PGlite();
+    const executor = createPgliteExecutor(db);
+    const store = new PgStore(executor);
+    await expect(store.migrate()).resolves.toBeUndefined();
+    // Verify the doc table exists by inserting a row
+    const { rows } = await db.query<{ doc_url: string }>(
+      "SELECT doc_url FROM doc LIMIT 1"
+    );
+    expect(Array.isArray(rows)).toBe(true);
+  });
+
+  it("migrate() is idempotent — running it three times does not error", async () => {
+    const db = new PGlite();
+    const executor = createPgliteExecutor(db);
+    const store = new PgStore(executor);
+    await store.migrate();
+    await store.migrate();
+    await expect(store.migrate()).resolves.toBeUndefined();
+  });
+});
+
+describe("splitSqlStatements() — robustness", () => {
+  it("splits simple DDL statements on semicolons", () => {
+    const sql = "CREATE TABLE a (id INT); CREATE TABLE b (id INT);";
+    const stmts = splitSqlStatements(sql);
+    expect(stmts).toHaveLength(2);
+    expect(stmts[0]).toBe("CREATE TABLE a (id INT)");
+    expect(stmts[1]).toBe("CREATE TABLE b (id INT)");
+  });
+
+  it("does not split on a semicolon inside a string literal", () => {
+    const sql = `INSERT INTO t VALUES ('val;ue'); SELECT 1;`;
+    const stmts = splitSqlStatements(sql);
+    expect(stmts).toHaveLength(2);
+    expect(stmts[0]).toBe(`INSERT INTO t VALUES ('val;ue')`);
+    expect(stmts[1]).toBe("SELECT 1");
+  });
+
+  it("does not split on a semicolon in a double-quoted identifier", () => {
+    const sql = `SELECT "col;name" FROM t; SELECT 2;`;
+    const stmts = splitSqlStatements(sql);
+    expect(stmts).toHaveLength(2);
+    expect(stmts[0]).toBe(`SELECT "col;name" FROM t`);
+    expect(stmts[1]).toBe("SELECT 2");
+  });
+
+  it("strips line comments (-- …) without breaking adjacent statements", () => {
+    const sql =
+      "-- comment\nCREATE TABLE x (id INT); -- inline\nCREATE TABLE y (id INT);";
+    const stmts = splitSqlStatements(sql);
+    // Both real statements must be present; comment text must not appear
+    expect(stmts.some((s) => s.includes("CREATE TABLE x"))).toBe(true);
+    expect(stmts.some((s) => s.includes("CREATE TABLE y"))).toBe(true);
+    expect(stmts.every((s) => !s.includes("-- comment"))).toBe(true);
+  });
+
+  it("strips block comments /* … */ without breaking adjacent statements", () => {
+    const sql = "/* header */\nCREATE TABLE z (id INT /* col comment */);";
+    const stmts = splitSqlStatements(sql);
+    expect(stmts).toHaveLength(1);
+    expect(stmts[0]).toMatch(/CREATE TABLE z/);
+    expect(stmts[0]).not.toMatch(/\/\*/);
+  });
+
+  it("handles escaped single-quotes ('') inside string literals", () => {
+    const sql = `INSERT INTO t VALUES ('it''s a test; check'); SELECT 1;`;
+    const stmts = splitSqlStatements(sql);
+    expect(stmts).toHaveLength(2);
+    expect(stmts[0]).toContain("it''s a test; check");
+  });
+
+  it("returns an empty array for a blank / comment-only script", () => {
+    const sql = "-- nothing here\n/* block */\n  \n";
+    const stmts = splitSqlStatements(sql);
+    expect(stmts).toHaveLength(0);
   });
 });

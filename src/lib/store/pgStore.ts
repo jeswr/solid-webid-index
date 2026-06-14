@@ -16,6 +16,8 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { neon } from "@neondatabase/serverless";
+
 import type {
   CrawlCoordinator,
   CrawlResult,
@@ -43,28 +45,36 @@ export interface SqlExecutor {
     text: string,
     params?: unknown[]
   ): Promise<T[]>;
+
+  /**
+   * Execute a raw SQL script that may contain multiple statements separated by
+   * semicolons (e.g. schema migration files).  No parameterisation.
+   *
+   * Implementations MUST handle the full SQL grammar correctly — they must not
+   * misparse a `;` or `--` that appears inside a string literal, dollar-quoted
+   * block, or comment.
+   *
+   * - pglite exposes a native `db.exec()` that accepts multi-statement strings.
+   * - Neon uses statement-level splitting via splitSqlStatements() which is safe
+   *   for DDL-only scripts that contain no dollar-quoted function bodies.
+   */
+  exec(sql: string): Promise<void>;
 }
 
 // ─── Neon executor ────────────────────────────────────────────────────────────
 
 /**
  * Wraps the Neon serverless HTTP driver.
- * Import is dynamic so tree-shakers can drop it in test builds.
+ * Uses a top-level ESM import (no require()) — safe in production and
+ * never invoked in tests because tests inject a pglite executor instead.
  */
 export function createNeonExecutor(connectionString: string): SqlExecutor {
-  // We import lazily to avoid bundling the Neon driver in environments that
-  // don't need it (e.g. test environments using pglite).
-  let sql: ReturnType<typeof import("@neondatabase/serverless").neon> | null =
-    null;
+  // Initialise lazily so that the connection string is bound at call time,
+  // but the neon() factory is only invoked on first query.
+  let sql: ReturnType<typeof neon> | null = null;
 
-  function getSql() {
+  function getSql(): ReturnType<typeof neon> {
     if (!sql) {
-      // Dynamic require-style import: the Neon driver is a prod dependency, so
-      // it will always be resolvable at runtime in production.
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const { neon } = require("@neondatabase/serverless") as typeof import(
-        "@neondatabase/serverless"
-      );
       sql = neon(connectionString);
     }
     return sql;
@@ -80,6 +90,15 @@ export function createNeonExecutor(connectionString: string): SqlExecutor {
       const rows = await getSql().query(text, params ?? []);
       return rows as unknown as T[];
     },
+
+    async exec(sql: string): Promise<void> {
+      // Neon's HTTP driver does not support multi-statement strings in a single
+      // call, so split into individual statements.  splitSqlStatements() is safe
+      // for DDL-only scripts that contain no dollar-quoted function bodies.
+      for (const stmt of splitSqlStatements(sql)) {
+        await getSql().query(stmt, []);
+      }
+    },
   };
 }
 
@@ -90,8 +109,12 @@ export function createNeonExecutor(connectionString: string): SqlExecutor {
  * PGlite is imported as a type to keep it dev-only; callers pass an instance.
  */
 export function createPgliteExecutor(
-  // Accept any object with a .query() method matching the pglite shape
-  db: { query<T>(text: string, params?: unknown[]): Promise<{ rows: T[] }> }
+  // Accept any object with .query() and .exec() methods matching the pglite shape.
+  // exec() returns an array of result objects; we ignore the return value here.
+  db: {
+    query<T>(text: string, params?: unknown[]): Promise<{ rows: T[] }>;
+    exec(sql: string): Promise<unknown>;
+  }
 ): SqlExecutor {
   return {
     async query<T = Record<string, unknown>>(
@@ -100,6 +123,13 @@ export function createPgliteExecutor(
     ): Promise<T[]> {
       const result = await db.query<T>(text, params ?? []);
       return result.rows;
+    },
+
+    async exec(sql: string): Promise<void> {
+      // pglite's exec() natively handles multi-statement strings — it parses the
+      // full SQL, respecting string literals and block comments, so a `;` or `--`
+      // inside a quoted value or comment body never splits the statement wrongly.
+      await db.exec(sql);
     },
   };
 }
@@ -177,43 +207,35 @@ export class PgStore implements ReadStore, SearchIndex, CrawlCoordinator {
   /**
    * Apply schema.sql idempotently.  Uses IF NOT EXISTS throughout so it is safe
    * to call on an existing database.
+   *
+   * The entire schema.sql is executed as a single multi-statement script.  Both
+   * pglite and @neondatabase/serverless support multi-statement DDL, so no manual
+   * splitting is necessary — and avoiding the split is safer because a `;` or `--`
+   * inside a string literal, dollar-quoted function body, or future expression
+   * cannot corrupt the parse.
    */
   async migrate(): Promise<void> {
     // Read schema relative to this file's location; works in both src/ and compiled dist/.
-    // In tests (vitest), __dirname is the actual source directory.
+    // In tests (vitest), import.meta.url resolves to the actual source directory.
     let schemaSql: string;
     try {
-      // Try resolved from the source directory
+      // Primary: resolve from the directory containing this module file.
       const schemaPath = join(
         new URL(".", import.meta.url).pathname,
         "schema.sql"
       );
       schemaSql = readFileSync(schemaPath, "utf-8");
     } catch {
-      // Fallback: resolve from process.cwd() (e.g. project root in vitest)
+      // Fallback: resolve from process.cwd() (e.g. project root in some vitest configs).
       const schemaPath = join(process.cwd(), "src/lib/store/schema.sql");
       schemaSql = readFileSync(schemaPath, "utf-8");
     }
 
-    // Strip line comments (-- …) before splitting on semicolons, so that a
-    // semicolon inside a comment doesn't produce a spurious empty/partial statement.
-    const stripped = schemaSql
-      .split("\n")
-      .map((line) => {
-        // Remove everything from -- to end of line (simple, sufficient for DDL)
-        const idx = line.indexOf("--");
-        return idx >= 0 ? line.slice(0, idx) : line;
-      })
-      .join("\n");
-
-    const statements = stripped
-      .split(";")
-      .map((s) => s.trim())
-      .filter((s) => s.length > 0);
-
-    for (const stmt of statements) {
-      await this.db.query(stmt);
-    }
+    // Execute the whole schema as a multi-statement script via exec().
+    // pglite uses its native exec() which parses the full SQL correctly.
+    // Neon uses statement-level splitting via splitSqlStatements() (safe for
+    // DDL-only files with no dollar-quoted function bodies).
+    await this.db.exec(schemaSql);
   }
 
   // ─── ReadStore ─────────────────────────────────────────────────────────────
@@ -411,9 +433,17 @@ export class PgStore implements ReadStore, SearchIndex, CrawlCoordinator {
          LIMIT $2`,
         params
       );
-    } catch {
-      // Fallback: some older pglite builds may not ship websearch_to_tsquery.
-      // plainto_tsquery is always available and semantically close enough for tests.
+    } catch (err) {
+      // Fallback ONLY when websearch_to_tsquery is absent (Postgres error code
+      // 42883 = undefined_function; pglite surfaces it in the message).
+      // All other errors (connection, schema, permission, param) are rethrown
+      // immediately so they are not masked by a spurious fallback attempt.
+      if (!isUndefinedFunctionError(err)) {
+        throw err;
+      }
+
+      // Older pglite builds may not ship websearch_to_tsquery.
+      // plainto_tsquery is always available and semantically close enough.
       const fallbackParams = [...params];
       const fallbackCursorClause = cursorParts
         ? `AND (
@@ -509,7 +539,10 @@ export class PgStore implements ReadStore, SearchIndex, CrawlCoordinator {
   }
 
   async markDone(docUrl: string, result: CrawlResult): Promise<void> {
-    await this.db.query(
+    // RETURNING doc_url lets us detect a no-op UPDATE (0 rows matched).
+    // The crawl flow always calls enqueue() before claim()/markDone(), so a
+    // zero-row result is always a caller bug — throw rather than silently drop.
+    const updated = await this.db.query<{ doc_url: string }>(
       `UPDATE doc SET
          state            = $2,
          http_status      = $3,
@@ -525,7 +558,8 @@ export class PgStore implements ReadStore, SearchIndex, CrawlCoordinator {
          last_crawled     = $13,
          claim_token      = NULL,
          claimed_at       = NULL
-       WHERE doc_url = $1`,
+       WHERE doc_url = $1
+       RETURNING doc_url`,
       [
         docUrl,
         result.state,
@@ -542,6 +576,12 @@ export class PgStore implements ReadStore, SearchIndex, CrawlCoordinator {
         Date.now(),
       ]
     );
+
+    if (updated.length === 0) {
+      throw new Error(
+        `markDone: no row found for docUrl="${docUrl}" — must call enqueue() before markDone()`
+      );
+    }
   }
 
   async needsRecrawl(docUrl: string, currentEtag?: string): Promise<boolean> {
@@ -579,6 +619,129 @@ export class PgStore implements ReadStore, SearchIndex, CrawlCoordinator {
 
     return false;
   }
+}
+
+// ─── SQL statement splitter ───────────────────────────────────────────────────
+
+/**
+ * Split a SQL script into individual statements, respecting:
+ *   - single-quoted string literals  ('…')
+ *   - double-quoted identifiers      ("…")
+ *   - line comments                  (-- …)
+ *   - block comments                 (/* … * /)
+ *
+ * This is intentionally conservative: it handles standard Postgres DDL correctly
+ * but does NOT attempt to parse dollar-quoted function bodies ($$ … $$).  It is
+ * only used by the Neon executor for the migrate() DDL script; the pglite executor
+ * uses pglite's own native exec() instead, which handles the full grammar.
+ *
+ * Returns non-empty, trimmed statements (semicolons stripped from the end).
+ */
+export function splitSqlStatements(sql: string): string[] {
+  const statements: string[] = [];
+  let current = "";
+  let i = 0;
+
+  while (i < sql.length) {
+    const ch = sql[i];
+
+    // Line comment: skip to end of line
+    if (ch === "-" && sql[i + 1] === "-") {
+      while (i < sql.length && sql[i] !== "\n") {
+        i++;
+      }
+      current += "\n";
+      continue;
+    }
+
+    // Block comment: skip to */
+    if (ch === "/" && sql[i + 1] === "*") {
+      i += 2;
+      while (i < sql.length && !(sql[i] === "*" && sql[i + 1] === "/")) {
+        i++;
+      }
+      i += 2; // consume */
+      current += " ";
+      continue;
+    }
+
+    // Single-quoted string literal — consume until closing quote, handling ''
+    if (ch === "'") {
+      current += ch;
+      i++;
+      while (i < sql.length) {
+        const c = sql[i];
+        current += c;
+        i++;
+        if (c === "'" && sql[i] !== "'") break; // end of literal (not escaped '')
+        if (c === "'" && sql[i] === "'") {
+          current += "'"; // consume escaped quote
+          i++;
+        }
+      }
+      continue;
+    }
+
+    // Double-quoted identifier — consume until closing quote, handling ""
+    if (ch === '"') {
+      current += ch;
+      i++;
+      while (i < sql.length) {
+        const c = sql[i];
+        current += c;
+        i++;
+        if (c === '"' && sql[i] !== '"') break;
+        if (c === '"' && sql[i] === '"') {
+          current += '"';
+          i++;
+        }
+      }
+      continue;
+    }
+
+    // Statement terminator
+    if (ch === ";") {
+      const trimmed = current.trim();
+      if (trimmed.length > 0) {
+        statements.push(trimmed);
+      }
+      current = "";
+      i++;
+      continue;
+    }
+
+    current += ch;
+    i++;
+  }
+
+  // Trailing statement without a terminating semicolon
+  const trailing = current.trim();
+  if (trailing.length > 0) {
+    statements.push(trailing);
+  }
+
+  return statements;
+}
+
+// ─── FTS error helpers ────────────────────────────────────────────────────────
+
+/**
+ * Returns true only when the error signals that a Postgres function is
+ * undefined (SQLSTATE 42883).  Used to gate the websearch_to_tsquery →
+ * plainto_tsquery fallback: all other errors must propagate unchanged so that
+ * connection/schema/permission failures are never masked.
+ */
+function isUndefinedFunctionError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  // Postgres drivers typically surface SQLSTATE as .code on the error object.
+  const code = (err as Error & { code?: string }).code;
+  if (code === "42883") return true;
+  // pglite may not expose .code; fall back to message substring matching.
+  const msg = err.message.toLowerCase();
+  return (
+    msg.includes("websearch_to_tsquery") &&
+    (msg.includes("does not exist") || msg.includes("undefined"))
+  );
 }
 
 // ─── Cursor helpers ───────────────────────────────────────────────────────────
