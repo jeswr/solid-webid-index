@@ -516,6 +516,37 @@ describe("guardedFetch — happy path (loopback test hook)", () => {
   });
 });
 
+describe("guardedFetch — error statuses bypass the content-type allowlist", () => {
+  // An error response body is never RDF we would parse, so guardedFetch returns it bodyless (the
+  // body is cancelled, not read) and surfaces the status — the crawler classifies 5xx/429 transient
+  // vs other 4xx deterministic. This does NOT widen the SSRF surface (no attacker bytes ingested).
+  it.each([404, 401, 403, 429, 500, 503])(
+    "returns a bodyless result for HTTP %i with a non-RDF (text/plain) body",
+    async (code) => {
+      routes.set(`/err${code}`, (_req, res) => {
+        res.writeHead(code, { "content-type": "text/plain" });
+        res.end(`error ${code}`);
+      });
+      const r = await guardedFetch(`${base}/err${code}`, {
+        allowLoopback: true,
+      });
+      expect(r.status).toBe(code);
+      expect(r.text).toBe(""); // body cancelled, not read
+      expect(r.bytes.length).toBe(0);
+    }
+  );
+
+  it("returns a bodyless result for a 410 Gone with no content-type", async () => {
+    routes.set("/gone", (_req, res) => {
+      res.writeHead(410);
+      res.end("gone");
+    });
+    const r = await guardedFetch(`${base}/gone`, { allowLoopback: true });
+    expect(r.status).toBe(410);
+    expect(r.text).toBe("");
+  });
+});
+
 describe("guardedFetch — content-type allowlist", () => {
   it("rejects text/html (RDFa excluded)", async () => {
     routes.set("/html", (_req, res) => {

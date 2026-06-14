@@ -25,6 +25,8 @@ import type {
   DocSource,
   DocState,
   FailClass,
+  HostState,
+  PolitenessStore,
   ReadStore,
   SearchIndex,
   SearchResult,
@@ -199,7 +201,9 @@ function rowToRecord(r: DocRow): DocRecord {
  *
  * Instantiate via makeStore() in production or directly with a pglite executor in tests.
  */
-export class PgStore implements ReadStore, SearchIndex, CrawlCoordinator {
+export class PgStore
+  implements ReadStore, SearchIndex, CrawlCoordinator, PolitenessStore
+{
   constructor(private readonly db: SqlExecutor) {}
 
   // ─── migrate ───────────────────────────────────────────────────────────────
@@ -742,6 +746,43 @@ export class PgStore implements ReadStore, SearchIndex, CrawlCoordinator {
     }
 
     return false;
+  }
+
+  // ─── PolitenessStore ─────────────────────────────────────────────────────────
+
+  async getHostState(host: string): Promise<HostState> {
+    const rows = await this.db.query<{
+      next_allowed_at: string;
+      consecutive_errors: number;
+    }>(
+      "SELECT next_allowed_at, consecutive_errors FROM host_politeness WHERE host = $1",
+      [host]
+    );
+    const row = rows[0];
+    if (!row) {
+      // Unknown host → immediately fetchable, no error history.
+      return { host, nextAllowedAt: 0, consecutiveErrors: 0 };
+    }
+    return {
+      host,
+      nextAllowedAt: Number(row.next_allowed_at),
+      consecutiveErrors: Number(row.consecutive_errors),
+    };
+  }
+
+  async stampHost(
+    host: string,
+    nextAllowedAt: number,
+    consecutiveErrors: number
+  ): Promise<void> {
+    await this.db.query(
+      `INSERT INTO host_politeness (host, next_allowed_at, consecutive_errors)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (host) DO UPDATE SET
+         next_allowed_at    = EXCLUDED.next_allowed_at,
+         consecutive_errors = EXCLUDED.consecutive_errors`,
+      [host, nextAllowedAt, consecutiveErrors]
+    );
   }
 }
 

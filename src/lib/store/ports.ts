@@ -280,3 +280,51 @@ export interface CrawlCoordinator {
    */
   needsRecrawl(docUrl: string, currentEtag?: string): Promise<boolean>;
 }
+
+// ─── PolitenessStore ──────────────────────────────────────────────────────────
+
+/**
+ * Per-host politeness state (the `host_politeness` table — DESIGN.md §2.1.b / §5).
+ *
+ * State lives in the DB because invocations are stateless (serverless): the
+ * per-host crawl rate (`next_allowed_at`) must survive across separate function
+ * invocations. The crawler reads `getHostState()` before each fetch and stamps
+ * `next_allowed_at` after each fetch so a same-host second fetch is delayed.
+ * All time columns are epoch milliseconds.
+ */
+export interface HostState {
+  host: string;
+  /** epoch ms — the host must not be fetched again before this instant. */
+  nextAllowedAt: number;
+  /** Count of consecutive transient failures (drives exponential host backoff). */
+  consecutiveErrors: number;
+}
+
+/**
+ * PolitenessStore — per-host rate limiting for the crawler.
+ *
+ * Separate from CrawlCoordinator so the frontier-claim port stays focused. The
+ * Postgres adapter (PgStore) implements all four ports.
+ */
+export interface PolitenessStore {
+  /**
+   * Read the current host politeness row. Returns a zeroed default
+   * (`nextAllowedAt: 0`, `consecutiveErrors: 0`) when the host is unknown — i.e.
+   * an un-throttled host is immediately fetchable.
+   */
+  getHostState(host: string): Promise<HostState>;
+
+  /**
+   * Stamp the next-allowed instant for a host after the round-trip — the
+   * politeness delay — and set/reset the consecutive-error counter. Upserts the row.
+   *
+   * @param host                The registrable host.
+   * @param nextAllowedAt       epoch ms — the host is fetchable again at/after this.
+   * @param consecutiveErrors   New consecutive-error count (0 resets on success).
+   */
+  stampHost(
+    host: string,
+    nextAllowedAt: number,
+    consecutiveErrors: number
+  ): Promise<void>;
+}

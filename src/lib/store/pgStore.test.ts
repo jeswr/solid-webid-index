@@ -1002,3 +1002,29 @@ describe("splitSqlStatements() — robustness", () => {
     expect(stmts[1]).toBe("SELECT 3");
   });
 });
+
+describe("PgStore — PolitenessStore", () => {
+  it("returns a zeroed default for an unknown host (immediately fetchable)", async () => {
+    const { store } = await makeTestStore();
+    const s = await store.getHostState("unknown.example");
+    expect(s).toEqual({
+      host: "unknown.example",
+      nextAllowedAt: 0,
+      consecutiveErrors: 0,
+    });
+  });
+
+  it("stamps and reads back next_allowed_at + consecutive_errors (upsert)", async () => {
+    const { store } = await makeTestStore();
+    await store.stampHost("alice.example", 5000, 2);
+    let s = await store.getHostState("alice.example");
+    expect(s.nextAllowedAt).toBe(5000);
+    expect(s.consecutiveErrors).toBe(2);
+
+    // Upsert overwrites in place (no duplicate row).
+    await store.stampHost("alice.example", 9000, 0);
+    s = await store.getHostState("alice.example");
+    expect(s.nextAllowedAt).toBe(9000);
+    expect(s.consecutiveErrors).toBe(0);
+  });
+});

@@ -276,10 +276,15 @@ export async function guardedFetch(
           ?.trim()
           .toLowerCase() ?? "";
 
-      // Bodyless statuses (304 Not Modified from a conditional request; 204/205 No Content)
-      // carry no body and commonly omit Content-Type — they must NOT be rejected by the
-      // content-type allowlist. Return an empty bounded body and let the caller act on `status`.
-      if (status === 304 || status === 204 || status === 205) {
+      // Body-irrelevant statuses bypass the content-type allowlist and return an empty bounded body,
+      // letting the caller act on `status`:
+      //   - 304 Not Modified (conditional request), 204/205 No Content — carry no body and commonly
+      //     omit Content-Type.
+      //   - Any error status >= 400 — the body is an error page (HTML/plain), never RDF we would
+      //     parse, so reading/allowlisting it is pointless. The crawler classifies by status
+      //     (5xx/429 transient vs other 4xx deterministic). The body is cancelled, not read, so this
+      //     does NOT widen the SSRF surface (no attacker-controlled bytes are ingested).
+      if (status === 304 || status === 204 || status === 205 || status >= 400) {
         void res.body?.cancel().catch(() => {});
         return {
           response: res,
