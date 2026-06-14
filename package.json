@@ -12,6 +12,7 @@
     "check:fetch": "node scripts/check-no-raw-fetch.mjs"
   },
   "dependencies": {
+    "@neondatabase/serverless": "^1.1.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "lucide-react": "^1.17.0",
@@ -27,6 +28,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
+    "@electric-sql/pglite": "^0.5.2",
     "@tailwindcss/postcss": "^4",
     "@types/node": "^20",
     "@types/react": "^19",
