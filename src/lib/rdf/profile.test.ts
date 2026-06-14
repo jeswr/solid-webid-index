@@ -72,6 +72,53 @@ function overCapTurtle(n: number): string {
   return lines.join("\n");
 }
 
+/**
+ * Build a JSON-LD body whose top-level "@graph" array contains `n` node objects,
+ * causing the total JSON node count to exceed `n`.
+ */
+function overNodeCapJsonLd(n: number): string {
+  const graph = Array.from({ length: n }, (_, i) => ({
+    "@id": `https://ex.example/node${i}`,
+    "@type": "http://xmlns.com/foaf/0.1/Person",
+  }));
+  return JSON.stringify({ "@graph": graph });
+}
+
+/**
+ * Build a deeply-nested JSON-LD body with nesting depth `d`.
+ * Each level wraps a `foaf:knows` value that is another object, producing a
+ * chain `d` levels deep.
+ */
+function overDepthCapJsonLd(d: number): string {
+  // Build the object bottom-up: at depth `d` we have a leaf; at each outer
+  // level we wrap in an object with a "foaf:knows" property.
+  let inner: unknown = { "@id": "https://ex.example/leaf" };
+  for (let i = d; i > 1; i--) {
+    inner = {
+      "@id": `https://ex.example/node${i}`,
+      "http://xmlns.com/foaf/0.1/knows": inner,
+    };
+  }
+  return JSON.stringify(inner);
+}
+
+/**
+ * Build a Turtle profile where the subject has `n` distinct foaf:knows triples.
+ */
+function turtleWithKnows(n: number): string {
+  const lines = [
+    "@prefix foaf: <http://xmlns.com/foaf/0.1/> .",
+    "@prefix solid: <http://www.w3.org/ns/solid/terms#> .",
+    `<${WEBID}> a foaf:Person ;`,
+    "    solid:oidcIssuer <https://idp.example/> ;",
+  ];
+  for (let i = 0; i < n; i++) {
+    const sep = i < n - 1 ? " ;" : " .";
+    lines.push(`    foaf:knows <https://person${i}.example/card#me>${sep}`);
+  }
+  return lines.join("\n");
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 describe("parseProfile", () => {
@@ -139,6 +186,56 @@ describe("parseProfile", () => {
     }
   });
 
+  it("rejects a JSON-LD body exceeding MAX_JSON_NODES with a ParseLimitError (no full parse)", async () => {
+    // Set a low PARSE_MAX_JSON_NODES so we can trigger it with a small body.
+    const origEnv = process.env.PARSE_MAX_JSON_NODES;
+    process.env.PARSE_MAX_JSON_NODES = "5";
+    try {
+      vi.resetModules();
+      const {
+        parseProfile: cappedParseProfile,
+        ParseLimitError: CappedParseLimitError,
+      } = await import("./profile");
+      // Build a body with 20 node objects — well over the cap of 5.
+      const body = overNodeCapJsonLd(20);
+      await expect(
+        cappedParseProfile({
+          text: body,
+          contentType: "application/ld+json",
+          baseIri: BASE_IRI,
+        })
+      ).rejects.toBeInstanceOf(CappedParseLimitError);
+    } finally {
+      process.env.PARSE_MAX_JSON_NODES = origEnv;
+      vi.resetModules();
+    }
+  });
+
+  it("rejects a JSON-LD body exceeding MAX_JSON_DEPTH with a ParseLimitError (no full parse)", async () => {
+    // Set a low PARSE_MAX_JSON_DEPTH so we can trigger it with a small body.
+    const origEnv = process.env.PARSE_MAX_JSON_DEPTH;
+    process.env.PARSE_MAX_JSON_DEPTH = "3";
+    try {
+      vi.resetModules();
+      const {
+        parseProfile: cappedParseProfile,
+        ParseLimitError: CappedParseLimitError,
+      } = await import("./profile");
+      // Build a body with nesting depth 10 — well over the cap of 3.
+      const body = overDepthCapJsonLd(10);
+      await expect(
+        cappedParseProfile({
+          text: body,
+          contentType: "application/ld+json",
+          baseIri: BASE_IRI,
+        })
+      ).rejects.toBeInstanceOf(CappedParseLimitError);
+    } finally {
+      process.env.PARSE_MAX_JSON_DEPTH = origEnv;
+      vi.resetModules();
+    }
+  });
+
   it("JSON-LD with a remote @context does not call fetch", async () => {
     // Create a JSON-LD body referencing a remote @context URL.
     // The library default SSRF-safe documentLoader must reject this
@@ -183,6 +280,38 @@ describe("extractWebIdProfile (Turtle)", () => {
     expect(profile.oidcIssuers).toContain("https://idp.example/");
     expect(profile.storageUrls).toContain("https://alice.example/storage/");
     expect(profile.knows).toContain("https://bob.example/card#me");
+  });
+
+  it("caps foaf:knows at MAX_OUTLINKS_PER_DOC and the result is deterministic", async () => {
+    // Use a low cap via env-var so we can test with a small Turtle body.
+    const origEnv = process.env.CRAWL_MAX_OUTLINKS_PER_DOC;
+    process.env.CRAWL_MAX_OUTLINKS_PER_DOC = "3";
+    try {
+      vi.resetModules();
+      const {
+        parseProfile: cappedParseProfile,
+        extractWebIdProfile: cappedExtractWebIdProfile,
+      } = await import("./profile");
+
+      // Build a profile with 10 foaf:knows entries.
+      const turtle = turtleWithKnows(10);
+      const dataset = await cappedParseProfile({
+        text: turtle,
+        contentType: "text/turtle",
+        baseIri: BASE_IRI,
+      });
+      const profile = cappedExtractWebIdProfile(dataset, WEBID);
+
+      // Should be exactly capped at 3.
+      expect(profile.knows).toHaveLength(3);
+
+      // Result must be deterministic (sorted): calling again yields identical order.
+      const profile2 = cappedExtractWebIdProfile(dataset, WEBID);
+      expect(profile.knows).toEqual(profile2.knows);
+    } finally {
+      process.env.CRAWL_MAX_OUTLINKS_PER_DOC = origEnv;
+      vi.resetModules();
+    }
   });
 });
 

@@ -15,9 +15,48 @@ import { ParseLimitError, RdfFetchError, parseRdf } from "@jeswr/fetch-rdf";
 import type { DatasetCore } from "@rdfjs/types";
 import { Agent, WebIdDataset } from "@solid/object";
 import { DataFactory } from "n3";
-import { MAX_QUADS } from "../config";
+import {
+  MAX_JSON_DEPTH,
+  MAX_JSON_NODES,
+  MAX_OUTLINKS_PER_DOC,
+  MAX_QUADS,
+} from "../config";
 
 export { RdfFetchError, ParseLimitError };
+
+// ─── Internal helpers ─────────────────────────────────────────────────────────
+
+/**
+ * Recursively count all JSON nodes (objects, arrays, and primitives) in a
+ * parsed JSON value, and measure the maximum nesting depth.
+ *
+ * Returns `{ nodeCount, maxDepth }` where nodeCount counts every non-null
+ * value encountered (including the root) and maxDepth is the deepest nesting
+ * level (root = depth 1).
+ *
+ * This is used as a PREFLIGHT before handing a JSON-LD body to jsonld.toRDF.
+ * The byte cap already bounds total size; this provides defence-in-depth
+ * against JSON-LD expansion quadratics before the quad cap triggers.
+ */
+function countJsonNodes(
+  value: unknown,
+  depth = 1
+): { nodeCount: number; maxDepth: number } {
+  if (value === null || typeof value !== "object") {
+    return { nodeCount: 1, maxDepth: depth };
+  }
+  const entries = Array.isArray(value)
+    ? value
+    : Object.values(value as Record<string, unknown>);
+  let nodeCount = 1; // count this object/array itself
+  let maxDepth = depth;
+  for (const child of entries) {
+    const sub = countJsonNodes(child, depth + 1);
+    nodeCount += sub.nodeCount;
+    if (sub.maxDepth > maxDepth) maxDepth = sub.maxDepth;
+  }
+  return { nodeCount, maxDepth };
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -49,7 +88,10 @@ export interface WebIdProfile {
  * it here, so remote `@context` IRIs are never fetched.
  *
  * @throws {RdfFetchError}    For unsupported content-type or parse errors.
- * @throws {ParseLimitError}  When the body exceeds `MAX_QUADS` statements.
+ * @throws {ParseLimitError}  When the body exceeds `MAX_QUADS` statements, or
+ *                            when a JSON-LD body exceeds `MAX_JSON_NODES` or
+ *                            `MAX_JSON_DEPTH` (defence-in-depth preflight before
+ *                            jsonld.toRDF expansion).
  */
 export async function parseProfile({
   text,
@@ -60,6 +102,35 @@ export async function parseProfile({
   contentType: string | null;
   baseIri: string;
 }): Promise<DatasetCore> {
+  // ── JSON-LD preflight (defence-in-depth against expansion quadratics) ────────
+  // For application/ld+json (and application/json which may be JSON-LD), count
+  // nodes and measure depth BEFORE handing to jsonld.toRDF. The byte cap
+  // (MAX_BYTES_PROFILE in guardedFetch) already bounds raw size; this adds a
+  // structural guard. Non-JSON-LD paths skip this entirely.
+  const bareType = contentType?.split(";")[0].trim().toLowerCase() ?? "";
+  if (bareType === "application/ld+json" || bareType === "application/json") {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      // Malformed JSON — let parseRdf produce a proper RdfFetchError below.
+      parsed = null;
+    }
+    if (parsed !== null) {
+      const { nodeCount, maxDepth } = countJsonNodes(parsed);
+      if (nodeCount > MAX_JSON_NODES) {
+        throw new ParseLimitError(
+          `JSON-LD body exceeds MAX_JSON_NODES cap (${nodeCount} > ${MAX_JSON_NODES})`
+        );
+      }
+      if (maxDepth > MAX_JSON_DEPTH) {
+        throw new ParseLimitError(
+          `JSON-LD body exceeds MAX_JSON_DEPTH cap (${maxDepth} > ${MAX_JSON_DEPTH})`
+        );
+      }
+    }
+  }
+
   return parseRdf(text, contentType, {
     baseIRI: baseIri,
     maxQuads: MAX_QUADS,
@@ -99,7 +170,14 @@ export function extractWebIdProfile(
   const photoUrl = subject.photoUrl ?? undefined;
   const oidcIssuers = [...subject.oidcIssuer];
   const storageUrls = [...subject.storageUrls];
-  const knows = [...subject.knows];
+
+  // Cap foaf:knows at MAX_OUTLINKS_PER_DOC to bound frontier growth (crawler
+  // amplification defence). The array is sorted before slicing so the cap is
+  // deterministic (stable across re-crawls of the same document). Documents that
+  // legitimately list more than MAX_OUTLINKS_PER_DOC contacts will have their
+  // extra entries silently dropped — the crawler depth+PK-dedup guarantees still
+  // bound total work.
+  const knows = [...subject.knows].sort().slice(0, MAX_OUTLINKS_PER_DOC);
 
   return {
     webId: webIdIri,
