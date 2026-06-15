@@ -81,6 +81,7 @@ function makeDoc(
     noindex: overrides.noindex ?? false,
     rawRdf: overrides.rawRdf ?? null,
     label: overrides.label ?? null,
+    slug: overrides.slug ?? null,
   };
 }
 

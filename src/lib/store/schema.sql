@@ -55,6 +55,12 @@ CREATE TABLE IF NOT EXISTS doc (
   -- Null until the doc has been crawled and a name extracted.
   label             TEXT,
 
+  -- Opaque, deterministic slug for the served entry document /p/{slug}
+  -- (= base32(sha256(webid))[0..24]; DESIGN.md §2.1.c).  Maintained alongside
+  -- `webid`: set whenever a webid is known, so the reverse lookup slug → doc is a
+  -- single indexed read.  Null until the doc has a webid.
+  slug              TEXT,
+
   -- FTS: generated tsvector over raw_rdf (backward-compat; used when label_fts
   -- is unavailable on older rows or when label_fts index is not yet built).
   fts_vector        TSVECTOR    GENERATED ALWAYS AS (
@@ -89,6 +95,14 @@ CREATE TABLE IF NOT EXISTS doc (
 -- form — verified against pglite 0.5.2 in pgStore.test.ts.
 ALTER TABLE doc ADD COLUMN IF NOT EXISTS label TEXT;
 
+-- `webid` and `slug` ALTERs: `webid` is an original column (no-op on any real DB),
+-- but adding it idempotently here means the slug/webid partial indexes below never
+-- fail on a minimal pre-existing `doc` table that predates these columns.  `slug`
+-- shipped with the SW-CONFORMANCE entry routes (DESIGN.md §2.1.c).
+ALTER TABLE doc ADD COLUMN IF NOT EXISTS webid TEXT;
+
+ALTER TABLE doc ADD COLUMN IF NOT EXISTS slug TEXT;
+
 ALTER TABLE doc ADD COLUMN IF NOT EXISTS label_fts TSVECTOR GENERATED ALWAYS AS (
   setweight(to_tsvector('english', coalesce(label, '')), 'A')
   || setweight(to_tsvector('english', coalesce(raw_rdf, '')), 'D')
@@ -104,6 +118,14 @@ CREATE INDEX IF NOT EXISTS idx_doc_fts      ON doc USING GIN (fts_vector);
 
 -- Weighted FTS GIN index (label_fts combines label A + raw_rdf D weights)
 CREATE INDEX IF NOT EXISTS idx_doc_label_fts ON doc USING GIN (label_fts);
+
+-- Slug lookup index — the /p/{slug} entry route resolves slug → doc with a single
+-- indexed read.  Partial (slug IS NOT NULL) keeps it tight; slug is unique per webid
+-- (a sha256-derived value) so at most one live row matches.
+CREATE INDEX IF NOT EXISTS idx_doc_slug ON doc (slug) WHERE slug IS NOT NULL;
+
+-- WebID lookup index — /lookup?webid= and getEntryByWebid resolve webid → doc.
+CREATE INDEX IF NOT EXISTS idx_doc_webid ON doc (webid) WHERE webid IS NOT NULL;
 
 -- ─── suggest_budget — shared anti-amplification budget per suggestion root ────
 --
