@@ -729,7 +729,9 @@ describe("PgStore — CrawlCoordinator", () => {
     // Critical: tokenB must differ from tokenA so the fence actually works
     expect(tokenB).not.toBe(tokenA);
 
-    // worker-A's late markDone with its now-stale tokenA must be a no-op
+    // worker-A's late markDone with its now-stale tokenA must be a fenced no-op: it must NOT throw,
+    // and it must return FALSE (the fenced UPDATE matched 0 rows) so the caller skips its out-of-fence
+    // projection (roborev HIGH 1).
     await expect(
       freshStore.markDone(
         "https://stale-token.example/card",
@@ -740,7 +742,7 @@ describe("PgStore — CrawlCoordinator", () => {
         },
         tokenA
       )
-    ).resolves.toBeUndefined(); // must NOT throw
+    ).resolves.toBe(false);
 
     // worker-B's state and token must be preserved — not clobbered by worker-A
     const rowAfter = await freshStore.get("https://stale-token.example/card");
@@ -849,13 +851,14 @@ describe("PgStore — CrawlCoordinator", () => {
       /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
     );
 
+    // The fenced completion matched a row → markDone returns TRUE (the caller may then project).
     await expect(
       freshStore.markDone(
         "https://correct-token.example/card",
         { state: "done", httpStatus: 200, isSolid: true },
         token
       )
-    ).resolves.toBeUndefined();
+    ).resolves.toBe(true);
 
     const doc = await freshStore.get("https://correct-token.example/card");
     expect(doc?.state).toBe("done");
@@ -1086,6 +1089,7 @@ describe("roborev fix 2 — search() non-FTS errors are not swallowed", () => {
     const mockExecutor = {
       query: vi.fn().mockRejectedValue(connectionError),
       exec: vi.fn().mockResolvedValue(undefined),
+      transaction: vi.fn(),
     };
 
     const store = new PgStore(mockExecutor);
@@ -1116,6 +1120,7 @@ describe("roborev fix 2 — search() non-FTS errors are not swallowed", () => {
         return Promise.resolve([]);
       }),
       exec: vi.fn().mockResolvedValue(undefined),
+      transaction: vi.fn(),
     };
 
     const store = new PgStore(mockExecutor);
@@ -1140,13 +1145,13 @@ describe("roborev fix 3 — markDone() throws on unknown docUrl", () => {
     const { store } = await makeTestStore();
 
     await store.enqueue("https://known.example/card");
-    // Must not throw
+    // Must not throw, and must return TRUE (the token-less completion was written).
     await expect(
       store.markDone("https://known.example/card", {
         state: "done",
         httpStatus: 200,
       })
-    ).resolves.toBeUndefined();
+    ).resolves.toBe(true);
 
     const doc = await store.get("https://known.example/card");
     expect(doc?.state).toBe("done" satisfies DocState);

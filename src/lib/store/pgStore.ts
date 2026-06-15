@@ -16,7 +16,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { neon } from "@neondatabase/serverless";
+import { Pool, neon } from "@neondatabase/serverless";
 
 import { TPF_ESTIMATE_COUNT_CAP } from "../config";
 import { slugForWebId } from "../url/slug";
@@ -28,9 +28,12 @@ import type {
   DocRecord,
   DocSource,
   DocState,
+  EraseInput,
   FailClass,
   HostState,
   InboxNotificationRecord,
+  OptoutNonce,
+  OptoutStore,
   PolitenessStore,
   PropertyPartition,
   ReadStore,
@@ -85,6 +88,22 @@ export interface SqlExecutor {
    *   for DDL-only scripts that contain no dollar-quoted function bodies.
    */
   exec(sql: string): Promise<void>;
+
+  /**
+   * Run `fn` inside a SINGLE database transaction (BEGIN … COMMIT / ROLLBACK).
+   *
+   * `fn` receives a tx-scoped {@link SqlExecutor} whose `query()` runs on the SAME connection inside
+   * the open transaction.  When `fn` resolves the transaction COMMITs; when it throws the transaction
+   * ROLLs BACK and the error propagates — so a mid-transaction failure leaves the DB consistent (the
+   * atomicity guarantee the erasure path needs — DESIGN.md §4.8 H1).
+   *
+   * Both supported drivers provide a real transaction:
+   *  - pglite — `db.transaction(tx => …)` gives a tx handle with `query()`;
+   *  - @neondatabase/serverless — the HTTP driver lacks interactive transactions, so the Neon
+   *    executor implements this by issuing BEGIN/COMMIT/ROLLBACK over a pooled connection (the
+   *    serverless transaction API), running every `fn` statement on that one connection.
+   */
+  transaction<T>(fn: (tx: SqlExecutor) => Promise<T>): Promise<T>;
 }
 
 // ─── Neon executor ────────────────────────────────────────────────────────────
@@ -125,6 +144,51 @@ export function createNeonExecutor(connectionString: string): SqlExecutor {
         await getSql().query(stmt, []);
       }
     },
+
+    async transaction<T>(fn: (tx: SqlExecutor) => Promise<T>): Promise<T> {
+      // The HTTP `neon()` tag is stateless (each call is its own implicit transaction), so an
+      // INTERACTIVE multi-statement transaction needs a real pooled connection. @neondatabase/
+      // serverless ships a node-postgres-compatible Pool/Client for exactly this — one connection,
+      // explicit BEGIN/COMMIT/ROLLBACK, every statement on that connection (DESIGN.md §4.8 H1).
+      const pool = new Pool({ connectionString });
+      const client = await pool.connect();
+      // A tx-scoped executor whose query() runs on THIS connection inside the open transaction.
+      // exec()/transaction() are unsupported within an already-open transaction (the erasure path
+      // never needs them) — guard so a misuse fails loudly rather than silently escaping the tx.
+      const txExecutor: SqlExecutor = {
+        async query<R = Record<string, unknown>>(
+          text: string,
+          params?: unknown[]
+        ): Promise<R[]> {
+          const result = await client.query(text, params ?? []);
+          return result.rows as unknown as R[];
+        },
+        async exec(): Promise<void> {
+          throw new Error("exec() is not supported inside a transaction");
+        },
+        async transaction(): Promise<never> {
+          throw new Error("nested transaction() is not supported");
+        },
+      };
+      try {
+        await client.query("BEGIN");
+        const out = await fn(txExecutor);
+        await client.query("COMMIT");
+        return out;
+      } catch (err) {
+        // Roll back on ANY failure so a partial erasure can never commit. A rollback that itself
+        // throws (e.g. the connection died) must not mask the original error.
+        try {
+          await client.query("ROLLBACK");
+        } catch {
+          // ignore — surface the original error below
+        }
+        throw err;
+      } finally {
+        client.release();
+        await pool.end().catch(() => {});
+      }
+    },
   };
 }
 
@@ -135,11 +199,16 @@ export function createNeonExecutor(connectionString: string): SqlExecutor {
  * PGlite is imported as a type to keep it dev-only; callers pass an instance.
  */
 export function createPgliteExecutor(
-  // Accept any object with .query() and .exec() methods matching the pglite shape.
+  // Accept any object with .query(), .exec(), and .transaction() methods matching the pglite shape.
   // exec() returns an array of result objects; we ignore the return value here.
   db: {
     query<T>(text: string, params?: unknown[]): Promise<{ rows: T[] }>;
     exec(sql: string): Promise<unknown>;
+    transaction<T>(
+      fn: (tx: {
+        query<R>(text: string, params?: unknown[]): Promise<{ rows: R[] }>;
+      }) => Promise<T>
+    ): Promise<T>;
   }
 ): SqlExecutor {
   return {
@@ -156,6 +225,29 @@ export function createPgliteExecutor(
       // full SQL, respecting string literals and block comments, so a `;` or `--`
       // inside a quoted value or comment body never splits the statement wrongly.
       await db.exec(sql);
+    },
+
+    async transaction<T>(fn: (tx: SqlExecutor) => Promise<T>): Promise<T> {
+      // pglite runs real Postgres (WASM) and provides db.transaction(cb) with a tx handle that
+      // commits when cb resolves and rolls back when it throws — a genuine atomic transaction.
+      return db.transaction(async (txDb) => {
+        const txExecutor: SqlExecutor = {
+          async query<R = Record<string, unknown>>(
+            text: string,
+            params?: unknown[]
+          ): Promise<R[]> {
+            const result = await txDb.query<R>(text, params ?? []);
+            return result.rows;
+          },
+          async exec(): Promise<void> {
+            throw new Error("exec() is not supported inside a transaction");
+          },
+          async transaction(): Promise<never> {
+            throw new Error("nested transaction() is not supported");
+          },
+        };
+        return fn(txExecutor);
+      });
     },
   };
 }
@@ -236,7 +328,8 @@ export class PgStore
     CrawlCoordinator,
     PolitenessStore,
     StatsStore,
-    SuggestInboxStore
+    SuggestInboxStore,
+    OptoutStore
 {
   constructor(private readonly db: SqlExecutor) {}
 
@@ -561,32 +654,46 @@ export class PgStore
 
   async tombstone(docUrl: string): Promise<void> {
     const now = Date.now();
-    // Clear this document's materialised triples + SUBTRACT its stats contribution
-    // BEFORE tombstoning the doc row (roborev): a direct tombstone() (the opt-out /
-    // erasure path, DESIGN.md §4.8) must decrement the stats counters too, otherwise
-    // a predicate-only TPF estimate (which reads the 'p:<iri>' counter directly) would
-    // keep advertising void:triples / hydra:totalItems for an erased WebID even though
-    // the data rows are tombstone-filtered out of the response.  Erase by EVERY webid
-    // currently projected from this document so no counter is left over-counting.
-    const projectedWebids = await this.db.query<{ webid: string }>(
-      "SELECT DISTINCT webid FROM triple WHERE doc_url = $1 AND webid IS NOT NULL",
-      [docUrl]
-    );
-    for (const { webid } of projectedWebids) {
-      await this.clearWebidProjection(webid);
-    }
+    // ONE transaction over the whole transition so the projection clear and the doc-row tombstone
+    // commit atomically (and share the advisory lock with enqueue/markDone/eraseWebId on this
+    // canonical doc key).
+    await this.db.transaction(async (tx) => {
+      await tx.query("SELECT pg_advisory_xact_lock(hashtext($1))", [docUrl]);
 
-    await this.db.query(
-      `INSERT INTO doc (
-         doc_url, host, state, source, enqueued_at, terminal_at
-       ) VALUES ($1, '', 'tombstone', 'seed', $2, $2)
-       ON CONFLICT (doc_url) DO UPDATE SET
-         state = 'tombstone',
-         claim_token = NULL,
-         raw_rdf = NULL,
-         terminal_at = $2`,
-      [docUrl, now]
-    );
+      // This tombstone() persists state='tombstone' on the SINGLE doc row for `docUrl` below — which
+      // suppresses inbound edges to that row's `doc.webid` (tombstoneObjectClause matches `doc.state =
+      // 'tombstone' AND doc.webid = o`). The OTHER WebIDs projected under this DOC URL (variant-key
+      // residue) are NOT persisted as tombstoned by this op (no tombstone row, the doc row carries only
+      // one webid), so TPF keeps serving THEIR inbound edges — but their stale materialised triples
+      // must still be cleared. We clear ALL projected WebIDs under the doc PLUS the doc's own
+      // `webid` (even with no materialised projection, so the upsert path leaves nothing behind).
+      const projectedWebids = await tx.query<{ webid: string }>(
+        "SELECT DISTINCT webid FROM triple WHERE doc_url = $1 AND webid IS NOT NULL",
+        [docUrl]
+      );
+      const docRow = await tx.query<{ webid: string | null }>(
+        "SELECT webid FROM doc WHERE doc_url = $1",
+        [docUrl]
+      );
+      const toClear = new Set<string>(projectedWebids.map((r) => r.webid));
+      const docWebid = docRow[0]?.webid;
+      if (docWebid) toClear.add(docWebid);
+
+      // Clear projections for all affected WebIDs BEFORE writing the doc-row tombstone state below.
+      await this.clearTombstonedProjections(toClear, tx);
+
+      await tx.query(
+        `INSERT INTO doc (
+           doc_url, host, state, source, enqueued_at, terminal_at
+         ) VALUES ($1, '', 'tombstone', 'seed', $2, $2)
+         ON CONFLICT (doc_url) DO UPDATE SET
+           state = 'tombstone',
+           claim_token = NULL,
+           raw_rdf = NULL,
+           terminal_at = $2`,
+        [docUrl, now]
+      );
+    });
   }
 
   // ─── Triple Pattern Fragments (ReadStore — DESIGN.md §4.5) ───────────────────
@@ -626,14 +733,14 @@ export class PgStore
       }
     }
 
-    // Tombstone gate: never serve a triple about a tombstoned WebID.  A triple with
-    // a NULL webid (provenance/structural) is always servable.
-    where.push(
-      `(t.webid IS NULL OR NOT EXISTS (
-         SELECT 1 FROM doc d
-          WHERE d.webid = t.webid AND d.state = 'tombstone'
-       ))`
-    );
+    // Tombstone gate: never serve a triple ABOUT a tombstoned WebID, NOR an inbound edge whose IRI
+    // OBJECT is a tombstoned WebID (DESIGN.md §4.8 H1 — drop `foaf:knows` edges TO a tombstoned
+    // person from served output). A triple with a NULL webid (provenance/structural) is servable
+    // unless its object is itself a tombstoned WebID. The gate matches on EITHER the WebID key OR the
+    // doc URL key (variant-key gate, DESIGN.md §2.2 L5), and covers BOTH the permanent `tombstone`
+    // table AND a `doc` row already in state 'tombstone' (the crawler auto-tombstone path).
+    where.push(tombstoneSubjectClause("t"));
+    where.push(tombstoneObjectClause("t"));
 
     // Keyset cursor encodes the last (s,p,o,o_is_iri) tuple emitted; the row-value
     // comparison (a,b,c,d) > ($..,$..,$..,$..) walks forward deterministically.
@@ -701,8 +808,18 @@ export class PgStore
    *  - any other pattern → a BOUNDED COUNT (capped at TPF_ESTIMATE_COUNT_CAP) so a
    *    pathological pattern can never trigger an unbounded scan.
    *
-   * Tombstoned-WebID triples are excluded from every estimate path (the bounded
-   * COUNT applies the same NOT EXISTS gate as tpf()).
+   * Tombstoned-WebID triples are excluded from the SERVED data on every path: subject-tombstoned rows
+   * are already deleted from `triple` on erasure, and the bounded COUNT applies the same NOT EXISTS
+   * gate as tpf(). INBOUND IRI-object edges TO a tombstoned WebID (e.g. Alice's `foaf:knows Bob` after
+   * Bob is erased) remain in the table keyed under the still-live subject and ARE suppressed in served
+   * TPF output (tombstoneObjectClause), but the O(1) `triples`/`p:<iri>` counters still include them —
+   * so an O(1) estimate may MARGINALLY OVER-COUNT by the number of suppressed inbound edges. This is
+   * SPEC-COMPLIANT: TPF `void:triples` / Hydra `totalItems` are defined as ESTIMATES, not exact counts
+   * (the actual served page never includes a suppressed edge — only the numeric hint is approximate).
+   * An earlier incremental `sup`/`sp:<pred>` correction counter was removed (roborev rounds 6–8): it
+   * had to stay byte-exact across erase / tombstone / markDone / re-projection (some outside the
+   * advisory lock) and kept spawning adjacent concurrency/accounting findings. Robustness + a
+   * spec-legal estimate beats an exact-but-racy counter.
    */
   async estimatePatternCardinality(pattern: TpfPattern): Promise<number> {
     const noTerms =
@@ -718,7 +835,11 @@ export class PgStore
         "SELECT v FROM stats WHERE k = $1",
         [STATS_KEY_TRIPLES]
       );
-      if (rows[0]) return Number(rows[0].v);
+      if (rows[0]) {
+        // O(1) estimate. May marginally over-count suppressed inbound edges to tombstoned WebIDs
+        // (see the method doc) — spec-legal for void:triples; served TPF never returns them.
+        return Number(rows[0].v);
+      }
     } else if (
       pattern.p !== undefined &&
       pattern.s === undefined &&
@@ -730,7 +851,12 @@ export class PgStore
       // dataset, so a bounded COUNT would also return 0 — fall through only when the
       // accessor yields a positive estimate to avoid masking a transient empty state.
       const card = await this.getPredicateCardinality(pattern.p);
-      if (card > 0) return card;
+      if (card > 0) {
+        // O(1) per-predicate estimate. May marginally over-count this predicate's suppressed
+        // inbound-object edges (e.g. `foaf:knows`→tombstoned-Bob) — spec-legal estimate; served TPF
+        // never returns them.
+        return card;
+      }
     }
 
     // Bounded COUNT fallback — never an unbounded scan.  We count over a capped
@@ -763,12 +889,8 @@ export class PgStore
         where.push(`t.o_is_iri = $${params.length}`);
       }
     }
-    where.push(
-      `(t.webid IS NULL OR NOT EXISTS (
-         SELECT 1 FROM doc d
-          WHERE d.webid = t.webid AND d.state = 'tombstone'
-       ))`
-    );
+    where.push(tombstoneSubjectClause("t"));
+    where.push(tombstoneObjectClause("t"));
 
     params.push(TPF_ESTIMATE_COUNT_CAP);
     const capParam = `$${params.length}`;
@@ -794,6 +916,34 @@ export class PgStore
     triples: TpfTriple[];
   }): Promise<void> {
     const { webid, docUrl, triples } = opts;
+
+    // ── Projection tombstone gate (gate 3 of 3 — DESIGN.md §4.8 H1) ────────────
+    // A tombstoned WebID must NEVER be (re)projected into the served `triple` table — even if a
+    // crawler somehow reaches its raw_rdf, the projection write is the enforcement point that keeps
+    // an erased person out of TPF / search / dump. Treat a non-empty projection of a tombstoned WebID
+    // as an EMPTY projection (delete-by-webid), so any residue is cleared rather than re-served. (An
+    // empty triple list — the documented delete-by-webid used on 410/noindex — is allowed through to
+    // the clear path below regardless.)
+    if (triples.length > 0) {
+      const tombstoned = await this.isTombstoned({ webid, docUrl });
+      if (tombstoned) {
+        // Clear the projection AND redact the doc row to a DURABLE tombstone (raw_rdf + generated FTS
+        // blanked, WebID redacted, slug retained) in ONE transaction so a tombstoned WebID leaves NO
+        // servable residue — neither in TPF (triples) NOR on /p/{slug} / search (the doc row). Before
+        // this, the projection was skipped but a `done` doc row with raw_rdf/webid could still serve
+        // erased PII (DESIGN.md §4.8 H1). The doc row is REDACTED, not deleted, so the durable PK gate
+        // against enqueue resurrection (roborev HIGH 2) stays in place. Both keys are handled
+        // (variant-key cleanup, DESIGN.md §2.2 L5).
+        await this.db.transaction(async (tx) => {
+          await tx.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
+            docUrl,
+          ]);
+          await this.clearWebidProjection(webid, tx);
+          await this.redactDocToTombstone({ webid, docUrl }, tx);
+        });
+        return;
+      }
+    }
 
     // ── Clear any STALE prior projection of this DOCUMENT under a DIFFERENT webid
     // (roborev): a doc_url that first resolved to W1 and later to W2 would otherwise
@@ -896,14 +1046,17 @@ export class PgStore
    * the WebID it resolves to (roborev) — the old WebID's rows must not linger.
    * Idempotent: a WebID with no rows is a no-op.
    */
-  private async clearWebidProjection(webid: string): Promise<void> {
-    const oldByPred = await this.db.query<{ p: string; n: number | string }>(
+  private async clearWebidProjection(
+    webid: string,
+    db: SqlExecutor = this.db
+  ): Promise<void> {
+    const oldByPred = await db.query<{ p: string; n: number | string }>(
       "SELECT p, COUNT(*) AS n FROM triple WHERE webid = $1 GROUP BY p",
       [webid]
     );
     if (oldByPred.length === 0) return; // nothing projected for this webid
 
-    const oldTypeRows = await this.db.query<{ s: string; o: string }>(
+    const oldTypeRows = await db.query<{ s: string; o: string }>(
       "SELECT s, o FROM triple WHERE webid = $1 AND p = $2 AND o_is_iri = TRUE",
       [webid, RDF_TYPE_IRI]
     );
@@ -919,7 +1072,7 @@ export class PgStore
       ).classes,
     };
 
-    await this.db.query("DELETE FROM triple WHERE webid = $1", [webid]);
+    await db.query("DELETE FROM triple WHERE webid = $1", [webid]);
 
     // Subtract TPF counters ('triples' + 'p:<iri>').
     const delta: Array<[string, number]> = [];
@@ -930,13 +1083,47 @@ export class PgStore
       delta.push([`p:${old.p}`, -n]);
     }
     if (total > 0) delta.push(["triples", -total]);
-    await this.adjustStatsBatch(delta);
+    await this.adjustStatsBatch(delta, db);
 
     // Subtract this bead's counters ('entities' + 'c:<iri>') — to EMPTY.
-    await this.applyClassEntityDelta(oldContribution, {
-      isEntity: 0,
-      classes: {},
-    });
+    await this.applyClassEntityDelta(
+      oldContribution,
+      {
+        isEntity: 0,
+        classes: {},
+      },
+      db
+    );
+  }
+
+  /**
+   * Clear the materialised projection of EVERY WebID a tombstone operation affects, so an erased /
+   * tombstoned person leaves NO servable triples behind. Every path that tombstones a known WebID —
+   * `eraseWebId()`, `tombstone()`, and the crawler's `markDone({ state: "tombstone" })` — routes its
+   * projection-clear through here, alongside any variant-key residue WebIDs projected under the same
+   * doc. All listed WebIDs are simply delete-by-webid'd (idempotent; a WebID with no rows is a no-op);
+   * de-duplicated so a WebID listed twice is cleared once.
+   *
+   * This used to also maintain an incremental `sup`/`sp:<pred>` suppressed-inbound-edge counter so the
+   * O(1) `void:triples` estimate could subtract suppressed inbound edges exactly. That counter was
+   * REMOVED (roborev rounds 6–8): keeping it byte-exact across erase / tombstone / markDone /
+   * re-projection (some outside the advisory lock) was fundamentally race-prone and kept spawning
+   * adjacent accounting/concurrency findings. The estimate now MARGINALLY over-counts suppressed
+   * inbound edges — spec-legal for TPF `void:triples` / Hydra `totalItems` (estimates) — while the
+   * SERVED data stays exact: `tombstoneObjectClause` suppresses every inbound edge to a tombstoned
+   * WebID in actual TPF output. So this helper no longer needs to distinguish "counted" WebIDs from
+   * "cleared-only" residue, nor observe prior tombstone state — it just clears.
+   */
+  private async clearTombstonedProjections(
+    webids: Iterable<string>,
+    db: SqlExecutor
+  ): Promise<void> {
+    const seen = new Set<string>();
+    for (const webid of webids) {
+      if (seen.has(webid)) continue;
+      seen.add(webid);
+      await this.clearWebidProjection(webid, db);
+    }
   }
 
   // ─── StatsStore (pss-0zp) — entities + class partitions + O(1) reads ──────────
@@ -949,7 +1136,8 @@ export class PgStore
    */
   private async applyClassEntityDelta(
     old: { isEntity: number; classes: Record<string, number> },
-    next: { isEntity: number; classes: Record<string, number> }
+    next: { isEntity: number; classes: Record<string, number> },
+    db: SqlExecutor = this.db
   ): Promise<void> {
     const delta = classDelta(old, next);
 
@@ -963,7 +1151,7 @@ export class PgStore
     for (const [classIri, n] of Object.entries(delta.classes)) {
       adjustments.push([`${STATS_PREFIX_CLASS}${classIri}`, n]);
     }
-    await this.adjustStatsBatch(adjustments);
+    await this.adjustStatsBatch(adjustments, db);
   }
 
   /**
@@ -972,7 +1160,8 @@ export class PgStore
    * deltas are skipped.  One round-trip regardless of how many counters change.
    */
   private async adjustStatsBatch(
-    adjustments: Array<[string, number]>
+    adjustments: Array<[string, number]>,
+    db: SqlExecutor = this.db
   ): Promise<void> {
     const nonZero = adjustments.filter(([, d]) => d !== 0);
     if (nonZero.length === 0) return;
@@ -991,7 +1180,7 @@ export class PgStore
       params.push(key, delta);
       values.push(`($${base + 1}, $${base + 2}::bigint)`);
     }
-    await this.db.query(
+    await db.query(
       `INSERT INTO stats (k, v) VALUES ${values.join(", ")}
        ON CONFLICT (k) DO UPDATE SET v = GREATEST(0, stats.v + EXCLUDED.v)`,
       params
@@ -1013,6 +1202,12 @@ export class PgStore
     const classPartitions: ClassPartition[] = [];
     const propertyPartitions: PropertyPartition[] = [];
 
+    // VoID counts are ESTIMATES (per the spec): the `triples`/`p:<iri>` counters still include inbound
+    // IRI-object edges to a tombstoned WebID (e.g. Alice's `foaf:knows Bob` after Bob is erased), which
+    // are suppressed in SERVED TPF output but not subtracted here — so the totals may MARGINALLY
+    // over-count by the number of suppressed inbound edges. The earlier incremental `sup`/`sp:<pred>`
+    // correction counter was removed as too race-prone (roborev rounds 6–8); served data stays exact
+    // (tombstoneObjectClause suppresses every such edge in tpf()).
     for (const r of rows) {
       const v = Number(r.v);
       if (r.k === STATS_KEY_TRIPLES) {
@@ -1046,7 +1241,7 @@ export class PgStore
       triples,
       entities,
       // void:classes / void:properties = number of DISTINCT classes / predicates
-      // (derived from the partition counts, all already v > 0).
+      // (derived from the partition counts, all v > 0 from the SQL filter).
       classes: classPartitions.length,
       properties: propertyPartitions.length,
       classPartitions,
@@ -1203,42 +1398,69 @@ export class PgStore
     const host = extractHost(docUrl);
     const rootSeed = opts?.rootSeed ?? null;
     const suggestBudget = opts?.suggestBudget ?? null;
-
-    // Seed the SHARED suggestion-root budget BEFORE inserting the doc. When a suggestion-rooted
-    // document is enqueued with a budget, the budget belongs to the whole subtree (keyed on
-    // root_seed), so all descendants CONSUME from this one counter (anti-amplification C2). ON
-    // CONFLICT DO NOTHING means a re-enqueue of the same root never resets a partially-spent budget.
-    if (suggestBudget != null && rootSeed != null) {
-      await this.db.query(
-        `INSERT INTO suggest_budget (root_seed, remaining)
-         VALUES ($1, $2)
-         ON CONFLICT (root_seed) DO NOTHING`,
-        [rootSeed, Math.max(0, suggestBudget)]
-      );
-    }
-
+    const webidForGate = opts?.webid ?? null;
     const webid = opts?.webid ?? null;
     const slug = webid ? slugForWebId(webid) : null;
-    await this.db.query(
-      `INSERT INTO doc (
-         doc_url, host, webid, state, depth, root_seed, suggest_budget,
-         source, discovered_from, next_eligible_at, enqueued_at, slug
-       ) VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9, $10, $11)
-       ON CONFLICT (doc_url) DO NOTHING`,
-      [
-        docUrl,
-        host,
-        webid,
-        opts?.depth ?? 0,
-        rootSeed,
-        suggestBudget,
-        opts?.source ?? "seed",
-        opts?.discoveredFrom ?? null,
-        opts?.nextEligibleAt ?? 0,
-        Date.now(),
-        slug,
-      ]
-    );
+
+    // ── Enqueue tombstone gate (gate 1 of 3 — DESIGN.md §4.8 H1) ────────────────
+    // A permanently-tombstoned WebID / doc URL must NEVER be re-enqueued, across ANY discovery path
+    // (seed / catalog / inbox / knows). Erasure DELETES the doc row (so the ON CONFLICT DO NOTHING
+    // below would otherwise happily re-insert it); the permanent `tombstone` table is the durable
+    // gate. Check by EITHER key so a fragment-variant cannot resurrect an opted-out person.
+    //
+    // The check + the INSERT run in ONE transaction so the gate is ATOMIC against a concurrent
+    // eraseWebId(). The DURABLE guarantee is the surviving tombstone DOC ROW that erase leaves behind:
+    // the doc-table PK means the `INSERT … ON CONFLICT (doc_url) DO NOTHING` below CANNOT create a
+    // competing `pending` row once the canonical doc URL has a tombstone row — so even under READ
+    // COMMITTED (where the `tombstone`-table SELECT might miss a not-yet-committed erase), a committed
+    // erase can never be resurrected (roborev HIGH 2). The advisory lock — shared with eraseWebId() /
+    // markDone() on hashtext(docUrl) — serialises the CHECK ↔ INSERT ordering as belt-and-braces.
+    await this.db.transaction(async (tx) => {
+      await tx.query("SELECT pg_advisory_xact_lock(hashtext($1))", [docUrl]);
+
+      if (
+        await this.isTombstonedOn(
+          { webid: webidForGate ?? undefined, docUrl },
+          tx
+        )
+      ) {
+        return; // silently refuse — the tombstone is permanent
+      }
+
+      // Seed the SHARED suggestion-root budget BEFORE inserting the doc. When a suggestion-rooted
+      // document is enqueued with a budget, the budget belongs to the whole subtree (keyed on
+      // root_seed), so all descendants CONSUME from this one counter (anti-amplification C2). ON
+      // CONFLICT DO NOTHING means a re-enqueue of the same root never resets a partially-spent budget.
+      if (suggestBudget != null && rootSeed != null) {
+        await tx.query(
+          `INSERT INTO suggest_budget (root_seed, remaining)
+           VALUES ($1, $2)
+           ON CONFLICT (root_seed) DO NOTHING`,
+          [rootSeed, Math.max(0, suggestBudget)]
+        );
+      }
+
+      await tx.query(
+        `INSERT INTO doc (
+           doc_url, host, webid, state, depth, root_seed, suggest_budget,
+           source, discovered_from, next_eligible_at, enqueued_at, slug
+         ) VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9, $10, $11)
+         ON CONFLICT (doc_url) DO NOTHING`,
+        [
+          docUrl,
+          host,
+          webid,
+          opts?.depth ?? 0,
+          rootSeed,
+          suggestBudget,
+          opts?.source ?? "seed",
+          opts?.discoveredFrom ?? null,
+          opts?.nextEligibleAt ?? 0,
+          Date.now(),
+          slug,
+        ]
+      );
+    });
   }
 
   async tryConsumeSuggestBudget(rootSeed: string): Promise<boolean> {
@@ -1352,7 +1574,7 @@ export class PgStore
     docUrl: string,
     result: CrawlResult,
     claimToken?: string | null
-  ): Promise<void> {
+  ): Promise<boolean> {
     // When a claimToken is provided, fence the UPDATE so only the owning worker
     // can write back results.  If the lease expired and another worker reclaimed
     // the row, our token no longer matches — 0 rows updated is a STALE completion
@@ -1379,8 +1601,127 @@ export class PgStore
     const terminalAt = TERMINAL_STATES.includes(result.state)
       ? Date.now()
       : null;
-    if (claimToken != null) {
-      await this.db.query<{ doc_url: string }>(
+
+    // ── markDone tombstone gate — close the erasure resurrection RACE (DESIGN.md §4.8 H1) ─────────
+    // The completion write below sets state='done' + raw_rdf + webid + slug on the doc row, so a
+    // crawl that finishes AFTER an opt-out/erasure tombstoned this WebID would RESURRECT servable PII
+    // on /p/{slug} + search even though the triple projection is skipped. To make the gate airtight
+    // against a concurrent eraseWebId() we run the tombstone CHECK and the write in ONE transaction:
+    //  - erase commits FIRST → this tx's tombstone SELECT sees it (READ COMMITTED) → we refuse + purge
+    //    any residual doc row instead of writing 'done'.
+    //  - this markDone commits FIRST → eraseWebId redacts the just-written row to a tombstone doc
+    //    row (raw_rdf=NULL, webid redacted), so it is still erased.
+    // Either interleaving leaves the WebID erased — no servable raw_rdf/webid row survives.
+    //
+    // RETURN VALUE: this method resolves to `true` only when a fenced completion was actually written
+    // (the UPDATE matched a row). A stale-token no-op OR a tombstone refusal returns `false`, so the
+    // crawler gates its out-of-fence projection (upsertTriples) on this result — a stale lease can
+    // neither complete nor project (DESIGN.md §3.4 / §4.8 H1 — roborev HIGH).
+    return this.db.transaction(async (tx) => {
+      // Serialise this completion against a concurrent eraseWebId() on the SAME canonical doc key, so
+      // the tombstone CHECK below + the write commit atomically relative to the erase (belt-and-braces
+      // alongside the durable tombstone doc row + PK that erase leaves behind).
+      await tx.query("SELECT pg_advisory_xact_lock(hashtext($1))", [docUrl]);
+
+      const tombstoned = await this.isTombstonedOn(
+        { webid: result.webid ?? undefined, docUrl },
+        tx
+      );
+      if (tombstoned) {
+        // Redact any doc row a concurrent enqueue/crawl may have (re)created for this URL/WebID to a
+        // durable tombstone row (raw_rdf=NULL, webid redacted) so the tombstoned entry can never be
+        // served, then refuse the completion write entirely. Both keys are matched (variant-key
+        // cleanup, DESIGN.md §2.2 L5).
+        await this.redactDocToTombstone(
+          { webid: result.webid ?? null, docUrl },
+          tx
+        );
+        return false; // refused: tombstoned — no fenced completion written
+      }
+
+      if (claimToken != null) {
+        // SERIALIZE the ownership check + projection-clear + final state UPDATE under the SAME ROW LOCK
+        // (roborev HIGH — TOCTOU). `claim()` reclaims an expired lease with `FOR UPDATE SKIP LOCKED`,
+        // and it does NOT take this op's advisory lock — so the advisory lock alone does NOT stop a
+        // concurrent reclaim between a plain ownership pre-check and the fenced UPDATE. Without a row
+        // lock, claim() could reclaim the row in that window: the fenced UPDATE would then match 0 rows,
+        // yet `handleMarkDoneTombstoneTransition()` would ALREADY have cleared this WebID's projection
+        // outside the winning lease. Taking `SELECT … FOR UPDATE` on the doc row pins it: claim()'s
+        // `SKIP LOCKED` skips a row we hold, so no reclaim can interleave. Ownership is re-verified
+        // UNDER that lock, and NO side effect runs until ownership is confirmed.
+        const locked = await tx.query<{ claim_token: string | null }>(
+          "SELECT claim_token FROM doc WHERE doc_url = $1 FOR UPDATE",
+          [docUrl]
+        );
+        // Row gone or token mismatch = STALE completion (reclaimed/removed). Fenced no-op: do NOT
+        // throw, do NOT mutate any projection/counter, do NOT clobber the new owner's state.
+        if (locked.length === 0 || locked[0].claim_token !== claimToken) {
+          return false;
+        }
+        // Ownership confirmed under the row lock. A tombstone completion now clears the projection
+        // BEFORE the doc row flips to 'tombstone' — safe to mutate because the lock guarantees this
+        // lease still wins and the fenced UPDATE below cannot find 0 rows for a row we hold locked.
+        if (result.state === "tombstone" && result.webid) {
+          await this.handleMarkDoneTombstoneTransition(result, docUrl, tx);
+        }
+        const fenced = await tx.query<{ doc_url: string }>(
+          `UPDATE doc SET
+             state            = $2,
+             http_status      = $3,
+             etag             = COALESCE($4, etag),
+             last_modified    = COALESCE($5, last_modified),
+             content_hash     = COALESCE($6, content_hash),
+             raw_rdf          = COALESCE($7, raw_rdf),
+             is_solid         = COALESCE($8, is_solid),
+             webid            = COALESCE($9, webid),
+             slug             = COALESCE($15, slug),
+             fail_class       = $10,
+             error            = $11,
+             next_eligible_at = $12,
+             last_crawled     = $13,
+             terminal_at      = COALESCE($16, terminal_at),
+             claim_token      = NULL,
+             claimed_at       = NULL
+           WHERE doc_url = $1
+             AND claim_token = $14
+           RETURNING doc_url`,
+          [
+            docUrl,
+            result.state,
+            result.httpStatus ?? null,
+            result.etag ?? null,
+            result.lastModified ?? null,
+            result.contentHash ?? null,
+            result.rawRdf ?? null,
+            result.isSolid ?? null,
+            result.webid ?? null,
+            result.failClass ?? null,
+            result.error ?? null,
+            result.nextEligibleAt ?? Date.now() + 14 * 24 * 60 * 60 * 1000,
+            Date.now(),
+            claimToken,
+            slug,
+            terminalAt,
+          ]
+        );
+        // 0 rows updated = stale completion (token mismatch — row reclaimed by another worker). Safe
+        // no-op: do NOT throw, do NOT clobber the new owner's state. Return `false` so the caller skips
+        // the out-of-fence projection (roborev HIGH). For a tombstone completion this is unreachable —
+        // the `FOR UPDATE` lock above pins the row (claim's `SKIP LOCKED` cannot reclaim it) and we
+        // re-verified ownership under that lock before any projection mutation, so the fenced UPDATE
+        // can never find 0 rows after the accounting ran.
+        if (fenced.length === 0) return false;
+        return true;
+      }
+
+      // No claimToken: traditional path (enqueue→markDone without claim — no lease to fence). A
+      // token-less completion that lands a 'tombstone' state clears the WebID's (and any variant-key
+      // residue's) projection BEFORE flipping the row to 'tombstone', so nothing servable lingers.
+      if (result.state === "tombstone" && result.webid) {
+        await this.handleMarkDoneTombstoneTransition(result, docUrl, tx);
+      }
+      // RETURNING doc_url lets us detect a no-op UPDATE (0 rows matched).
+      const updated = await tx.query<{ doc_url: string }>(
         `UPDATE doc SET
            state            = $2,
            http_status      = $3,
@@ -1390,16 +1731,15 @@ export class PgStore
            raw_rdf          = COALESCE($7, raw_rdf),
            is_solid         = COALESCE($8, is_solid),
            webid            = COALESCE($9, webid),
-           slug             = COALESCE($15, slug),
+           slug             = COALESCE($14, slug),
            fail_class       = $10,
            error            = $11,
            next_eligible_at = $12,
            last_crawled     = $13,
-           terminal_at      = COALESCE($16, terminal_at),
+           terminal_at      = COALESCE($15, terminal_at),
            claim_token      = NULL,
            claimed_at       = NULL
          WHERE doc_url = $1
-           AND claim_token = $14
          RETURNING doc_url`,
         [
           docUrl,
@@ -1415,62 +1755,101 @@ export class PgStore
           result.error ?? null,
           result.nextEligibleAt ?? Date.now() + 14 * 24 * 60 * 60 * 1000,
           Date.now(),
-          claimToken,
           slug,
           terminalAt,
         ]
       );
-      // 0 rows updated = stale completion (token mismatch — row reclaimed by another
-      // worker).  Safe no-op: do NOT throw, do NOT clobber the new owner's state.
-      return;
-    }
 
-    // No claimToken: traditional path (enqueue→markDone without claim).
-    // RETURNING doc_url lets us detect a no-op UPDATE (0 rows matched).
-    const updated = await this.db.query<{ doc_url: string }>(
-      `UPDATE doc SET
-         state            = $2,
-         http_status      = $3,
-         etag             = COALESCE($4, etag),
-         last_modified    = COALESCE($5, last_modified),
-         content_hash     = COALESCE($6, content_hash),
-         raw_rdf          = COALESCE($7, raw_rdf),
-         is_solid         = COALESCE($8, is_solid),
-         webid            = COALESCE($9, webid),
-         slug             = COALESCE($14, slug),
-         fail_class       = $10,
-         error            = $11,
-         next_eligible_at = $12,
-         last_crawled     = $13,
-         terminal_at      = COALESCE($15, terminal_at),
-         claim_token      = NULL,
-         claimed_at       = NULL
-       WHERE doc_url = $1
-       RETURNING doc_url`,
-      [
-        docUrl,
-        result.state,
-        result.httpStatus ?? null,
-        result.etag ?? null,
-        result.lastModified ?? null,
-        result.contentHash ?? null,
-        result.rawRdf ?? null,
-        result.isSolid ?? null,
-        result.webid ?? null,
-        result.failClass ?? null,
-        result.error ?? null,
-        result.nextEligibleAt ?? Date.now() + 14 * 24 * 60 * 60 * 1000,
-        Date.now(),
-        slug,
-        terminalAt,
-      ]
+      if (updated.length === 0) {
+        throw new Error(
+          `markDone: no row found for docUrl="${docUrl}" — must call enqueue() before markDone()`
+        );
+      }
+      return true; // token-less completion written
+    });
+  }
+
+  /**
+   * Shared tombstone-transition tail for {@link markDone}: when a completion lands `state='tombstone'`
+   * with a known WebID (the crawler's noindex / 410 paths), clear the materialised projection of the
+   * tombstoned WebID AND of any variant-key residue WebID projected under the same DOC URL. Runs INSIDE
+   * the caller's markDone transaction, AFTER ownership is confirmed under the row lock and BEFORE the
+   * doc row flips to 'tombstone'. A no-op for non-tombstone states or when no WebID is known (e.g. a
+   * noindex doc whose body was never parsed).
+   *
+   * markDone persists a tombstone for `result.webid` ONLY (the doc row's `state='tombstone'` + that
+   * single canonical WebID). The OTHER WebIDs projected from the same document (variant-key residue)
+   * are NOT tombstoned — TPF keeps serving their inbound edges — but their stale triples are still
+   * cleared here so nothing servable lingers under the now-tombstoned doc URL.
+   */
+  private async handleMarkDoneTombstoneTransition(
+    result: CrawlResult,
+    docUrl: string,
+    tx: SqlExecutor
+  ): Promise<void> {
+    if (result.state !== "tombstone" || !result.webid) return;
+    const webid = result.webid;
+    // Variant-key residue: WebIDs projected from the same DOC URL under a different/legacy key.
+    const docWebids = await tx.query<{ webid: string }>(
+      "SELECT DISTINCT webid FROM triple WHERE doc_url = $1 AND webid IS NOT NULL AND webid != $2",
+      [docUrl, webid]
     );
+    await this.clearTombstonedProjections(
+      [webid, ...docWebids.map((r) => r.webid)],
+      tx
+    );
+  }
 
-    if (updated.length === 0) {
-      throw new Error(
-        `markDone: no row found for docUrl="${docUrl}" — must call enqueue() before markDone()`
-      );
-    }
+  /**
+   * Replace any `doc` row for this WebID / doc URL with a DURABLE redacted tombstone row instead of
+   * deleting it (DESIGN.md §4.8 H1 — roborev HIGH 2). Keeping a permanent `state='tombstone'` row
+   * (raw_rdf=NULL, webid redacted to NULL, but the slug retained for the /p/{slug} 410 distinction)
+   * means a concurrent enqueue's `INSERT … ON CONFLICT (doc_url) DO NOTHING` CANNOT create a competing
+   * `pending` row for the canonical doc key — the PK + the surviving tombstone row are the durable
+   * serialization guarantee against the enqueue/erase resurrection race, independent of transaction
+   * isolation level. Both the WebID key and the doc URL key are redacted (variant-key cleanup,
+   * DESIGN.md §2.2 L5).
+   *
+   * The slug is recomputed from the (now-deleted) WebID where known so /p/{slug} still resolves to a
+   * 410 tombstone; when the doc row is keyed only by doc_url with no WebID, the existing slug column is
+   * preserved via COALESCE.
+   */
+  private async redactDocToTombstone(
+    opts: { webid: string | null; docUrl: string },
+    db: SqlExecutor = this.db
+  ): Promise<void> {
+    const { webid, docUrl } = opts;
+    const now = Date.now();
+    const slug = webid ? slugForWebId(webid) : null;
+    // Redact every matching live row (by doc URL OR by WebID — variant-key cleanup) to a tombstone:
+    // strip raw_rdf + webid (so search/getEntryByWebid never serve PII), keep the slug for the 410
+    // distinction, and clear the lease. The fts/label_fts generated columns recompute to empty once
+    // raw_rdf/label are NULL, so search drops the row too.
+    await db.query(
+      `UPDATE doc SET
+         state         = 'tombstone',
+         webid         = NULL,
+         raw_rdf       = NULL,
+         label         = NULL,
+         content_hash  = NULL,
+         etag          = NULL,
+         last_modified = NULL,
+         is_solid      = FALSE,
+         claim_token   = NULL,
+         claimed_at    = NULL,
+         slug          = COALESCE($3, slug),
+         terminal_at   = $2
+       WHERE doc_url = $1 OR ($4::text IS NOT NULL AND webid = $4)`,
+      [docUrl, now, slug, webid]
+    );
+    // Ensure a tombstone row EXISTS for the canonical doc URL even if no live row was present (so the
+    // durable PK gate is in place for enqueue). ON CONFLICT keeps the row already redacted above.
+    await db.query(
+      `INSERT INTO doc (doc_url, host, state, source, enqueued_at, terminal_at, slug)
+         VALUES ($1, '', 'tombstone', 'seed', $2, $2, $3)
+       ON CONFLICT (doc_url) DO NOTHING`,
+      [docUrl, now, slug]
+    );
   }
 
   async needsRecrawl(docUrl: string, currentEtag?: string): Promise<boolean> {
@@ -1555,6 +1934,12 @@ export class PgStore
     cooldownMs: number;
   }): Promise<SuggestionStatus> {
     const { webid, docUrl, nowMs, cooldownMs } = opts;
+
+    // PERMANENT tombstone first (DESIGN.md §4.8 H1): erasure DELETES the doc row, so the durable
+    // refusal lives in the `tombstone` table. A re-suggest of an erased WebID must be 409 — check it
+    // BEFORE the doc lookup (by EITHER key — variant-key gate, DESIGN.md §2.2 L5).
+    if (await this.isTombstoned({ webid, docUrl })) return "tombstoned";
+
     // Match on EITHER the canonical WebID (with #fragment) OR the canonical doc URL (stripped) so a
     // variant key cannot dodge a tombstone/cooldown (DESIGN.md §2.2 L5). Order the result so the most
     // restrictive matching row wins: tombstone first, then a within-cooldown terminal row.
@@ -1725,6 +2110,209 @@ export class PgStore
         : null;
 
     return { rows: records, nextCursor, total };
+  }
+
+  // ─── OptoutStore (pss-1ez — DESIGN.md §4.8) ───────────────────────────────────
+
+  async issueOptoutNonce(opts: {
+    webid: string;
+    docUrl: string;
+    nonce: string;
+    nowMs: number;
+    ttlMs: number;
+  }): Promise<OptoutNonce> {
+    const { webid, docUrl, nonce, nowMs, ttlMs } = opts;
+    const expiresAt = nowMs + ttlMs;
+    // REPLACE any prior nonce for this WebID so only the most recent challenge is live, and reset
+    // used_at to NULL (a fresh challenge is unused) — ON CONFLICT DO UPDATE on the WebID PK.
+    await this.db.query(
+      `INSERT INTO optout_nonce (webid, doc_url, nonce, issued_at, expires_at, used_at)
+         VALUES ($1, $2, $3, $4, $5, NULL)
+       ON CONFLICT (webid) DO UPDATE SET
+         doc_url    = EXCLUDED.doc_url,
+         nonce      = EXCLUDED.nonce,
+         issued_at  = EXCLUDED.issued_at,
+         expires_at = EXCLUDED.expires_at,
+         used_at    = NULL`,
+      [webid, docUrl, nonce, nowMs, expiresAt]
+    );
+    return {
+      webid,
+      docUrl,
+      nonce,
+      issuedAt: nowMs,
+      expiresAt,
+      usedAt: null,
+    };
+  }
+
+  async getLiveOptoutNonce(
+    webid: string,
+    nowMs: number
+  ): Promise<OptoutNonce | null> {
+    const rows = await this.db.query<{
+      webid: string;
+      doc_url: string;
+      nonce: string;
+      issued_at: string;
+      expires_at: string;
+      used_at: string | null;
+    }>(
+      `SELECT webid, doc_url, nonce, issued_at, expires_at, used_at
+         FROM optout_nonce
+        WHERE webid = $1 AND used_at IS NULL AND expires_at > $2
+        LIMIT 1`,
+      [webid, nowMs]
+    );
+    const r = rows[0];
+    if (!r) return null;
+    return {
+      webid: r.webid,
+      docUrl: r.doc_url,
+      nonce: r.nonce,
+      issuedAt: Number(r.issued_at),
+      expiresAt: Number(r.expires_at),
+      usedAt: r.used_at != null ? Number(r.used_at) : null,
+    };
+  }
+
+  async consumeOptoutNonce(webid: string, nowMs: number): Promise<boolean> {
+    // Atomic single-use consume: stamp used_at iff the nonce is present, UNUSED, and UNEXPIRED.
+    // RETURNING webid tells us whether THIS call won the race — a concurrent double-confirm grants
+    // at most one erasure (the second UPDATE matches 0 rows because used_at is now set).
+    const rows = await this.db.query<{ webid: string }>(
+      `UPDATE optout_nonce
+          SET used_at = $2
+        WHERE webid = $1 AND used_at IS NULL AND expires_at > $2
+        RETURNING webid`,
+      [webid, nowMs]
+    );
+    return rows.length > 0;
+  }
+
+  async isTombstoned(opts: {
+    webid?: string;
+    docUrl?: string;
+  }): Promise<boolean> {
+    return this.isTombstonedOn(opts, this.db);
+  }
+
+  /**
+   * Tombstone check against an INJECTED executor — same predicate as {@link isTombstoned} but runnable
+   * on a tx-scoped executor so the check + a subsequent write commit/serialise atomically against a
+   * concurrent erase (DESIGN.md §4.8 H1 — the markDone resurrection race). When `db` is a tx executor
+   * a tombstone committed by a concurrent {@link eraseWebId} is visible (READ COMMITTED), so a crawl
+   * that finishes AFTER the erase commits sees the tombstone and refuses to write.
+   */
+  private async isTombstonedOn(
+    opts: { webid?: string; docUrl?: string },
+    db: SqlExecutor
+  ): Promise<boolean> {
+    const { webid, docUrl } = opts;
+    if (webid === undefined && docUrl === undefined) return false;
+    // Match on EITHER key (WebID with #fragment OR fragment-stripped doc URL) so a variant cannot
+    // dodge the tombstone (DESIGN.md §2.2 L5). Also treat a `doc` row whose state is already
+    // 'tombstone' as tombstoned (the crawler's 410/noindex auto-tombstone path) so the gate is
+    // consistent whether the tombstone came from /optout or from the crawler.
+    const rows = await db.query<{ exists: boolean }>(
+      `SELECT EXISTS(
+         SELECT 1 FROM tombstone t
+          WHERE ($1::text IS NOT NULL AND t.webid = $1)
+             OR ($2::text IS NOT NULL AND t.doc_url = $2)
+         UNION ALL
+         SELECT 1 FROM doc d
+          WHERE d.state = 'tombstone'
+            AND (($1::text IS NOT NULL AND d.webid = $1)
+              OR ($2::text IS NOT NULL AND d.doc_url = $2))
+       ) AS exists`,
+      [webid ?? null, docUrl ?? null]
+    );
+    return Boolean(rows[0]?.exists);
+  }
+
+  async tombstonedWebids(webids: string[]): Promise<Set<string>> {
+    if (webids.length === 0) return new Set();
+    // De-dup the input so the bound-param list is minimal.
+    const unique = [...new Set(webids)];
+    // ONE placeholder list, reused by BOTH halves of the UNION — so the bound params are exactly
+    // `unique` (NOT doubled): both subqueries reference the same $1..$N placeholders.
+    const placeholders = unique.map((_, i) => `$${i + 1}`).join(", ");
+    // A WebID is tombstoned if it is in the permanent `tombstone` table OR has a `doc` row already in
+    // state 'tombstone' (the crawler auto-tombstone path) — consistent with isTombstoned().
+    const rows = await this.db.query<{ webid: string }>(
+      `SELECT webid FROM tombstone WHERE webid IN (${placeholders})
+       UNION
+       SELECT webid FROM doc WHERE state = 'tombstone' AND webid IN (${placeholders})`,
+      unique
+    );
+    return new Set(rows.map((r) => r.webid));
+  }
+
+  async eraseWebId(input: EraseInput): Promise<void> {
+    const { webid, docUrl, reason, proof } = input;
+    const now = Date.now();
+
+    // ONE real DB transaction over EVERY served surface (DESIGN.md §4.8 H1). A mid-transaction
+    // failure ROLLs BACK the whole erase — the DB can never be left half-erased / stats-skewed.
+    await this.db.transaction(async (tx) => {
+      // 0. Serialise against a concurrent enqueue() / markDone() on the SAME canonical doc key. The
+      //    durable guarantee is the surviving tombstone doc row + its PK (step 2 below), but the
+      //    advisory lock (shared with enqueue + markDone) makes the tombstone CHECK ↔ INSERT ordering
+      //    explicit too — belt-and-braces against the enqueue/erase resurrection race (roborev HIGH 2).
+      await tx.query("SELECT pg_advisory_xact_lock(hashtext($1))", [docUrl]);
+
+      // 1. Clear the WebID's materialised triples — and any variant-key residue projected under the
+      //    same DOC URL — through the shared projection-clear (matches tombstone()/markDone()).
+      //    eraseWebId persists a PERMANENT tombstone for `webid` (step 4); the variant-key WebIDs under
+      //    this DOC URL are NOT tombstoned by this erase, but their stale projections are still cleared
+      //    so nothing servable lingers. Idempotent: a repeat erase of an already-cleared WebID is a
+      //    no-op (delete-by-webid over zero rows).
+      const docWebids = await tx.query<{ webid: string }>(
+        "SELECT DISTINCT webid FROM triple WHERE doc_url = $1 AND webid IS NOT NULL AND webid != $2",
+        [docUrl, webid]
+      );
+      await this.clearTombstonedProjections(
+        [webid, ...docWebids.map((r) => r.webid)],
+        tx
+      );
+
+      // 2. REPLACE the doc row(s) — by WebID and by doc URL — with a DURABLE redacted tombstone row
+      //    rather than DELETING them (roborev HIGH 2). raw_rdf + the generated FTS vectors are blanked
+      //    (so search/getEntryByWebid never serve PII) and the WebID is redacted, but the row SURVIVES
+      //    in state='tombstone' with its slug retained. Keeping the row + its PK is the durable
+      //    serialization guarantee: a concurrent enqueue's `INSERT … ON CONFLICT (doc_url) DO NOTHING`
+      //    can no longer create a competing `pending` row for this canonical doc key after the erase
+      //    commits — so the WebID can never be resurrected under READ COMMITTED. Both keys are redacted
+      //    so a variant row cannot survive servable (DESIGN.md §2.2 L5). The /p/{slug} route serves the
+      //    surviving tombstone row as 410 (getEntryBySlug → 'tombstoned').
+      await this.redactDocToTombstone({ webid, docUrl }, tx);
+
+      // 3. REDACT the body of any inbox notification that referenced this WebID / doc URL (its
+      //    candidate object rows point at the IRI) so the suggestion that named the person no longer
+      //    echoes their PII. The notification row is kept (append-only audit) but its body is blanked
+      //    and flagged redacted; the child object rows that named the IRI are removed.
+      await tx.query(
+        `UPDATE inbox SET body = '', redacted = TRUE
+          WHERE id IN (
+            SELECT notif_id FROM inbox_object WHERE object_iri = $1 OR object_iri = $2
+          )`,
+        [webid, docUrl]
+      );
+      await tx.query(
+        "DELETE FROM inbox_object WHERE object_iri = $1 OR object_iri = $2",
+        [webid, docUrl]
+      );
+
+      // 4. Insert the PERMANENT tombstone (canonical WebID key + doc URL) so the three gates refuse
+      //    the WebID forever, across all discovery paths. ON CONFLICT keeps the FIRST reason/proof
+      //    but refreshes the doc URL (idempotent re-erase is a safe no-op).
+      await tx.query(
+        `INSERT INTO tombstone (webid, doc_url, reason, created_at, proof)
+           VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (webid) DO UPDATE SET doc_url = EXCLUDED.doc_url`,
+        [webid, docUrl, reason, now, proof ?? null]
+      );
+    });
   }
 }
 
@@ -1932,6 +2520,37 @@ function decodeTpfCursor(cursor: string): TpfCursorTuple {
   return JSON.parse(
     Buffer.from(cursor, "base64url").toString("utf-8")
   ) as TpfCursorTuple;
+}
+
+// ─── Tombstone-gate SQL fragments (shared by tpf + boundedPatternCount) ─────────
+
+/**
+ * A WHERE fragment that PASSES a triple unless its SUBJECT-side WebID (`<alias>.webid`) is
+ * tombstoned. A triple with a NULL webid (provenance/structural) always passes this clause (its
+ * object is gated separately). Covers BOTH the permanent `tombstone` table and a `doc` row already
+ * in state 'tombstone' (the crawler 410/noindex auto-tombstone path). No bound params — the clause
+ * is self-contained, correlated against the triple alias.
+ */
+function tombstoneSubjectClause(alias: string): string {
+  return `(${alias}.webid IS NULL OR NOT EXISTS (
+     SELECT 1 FROM tombstone ts WHERE ts.webid = ${alias}.webid
+     UNION ALL
+     SELECT 1 FROM doc d WHERE d.state = 'tombstone' AND d.webid = ${alias}.webid
+   ))`;
+}
+
+/**
+ * A WHERE fragment that PASSES a triple unless its IRI OBJECT (`<alias>.o` when `o_is_iri`) is a
+ * tombstoned WebID — i.e. it DROPS an inbound `foaf:knows` (or any) edge pointing AT an erased
+ * person from served output (DESIGN.md §4.8 H1). A literal object (`o_is_iri = FALSE`) always passes
+ * (a literal is never a WebID). Matches the object against the tombstone WebID key.
+ */
+function tombstoneObjectClause(alias: string): string {
+  return `(${alias}.o_is_iri = FALSE OR NOT EXISTS (
+     SELECT 1 FROM tombstone ts WHERE ts.webid = ${alias}.o
+     UNION ALL
+     SELECT 1 FROM doc d WHERE d.state = 'tombstone' AND d.webid = ${alias}.o
+   ))`;
 }
 
 // ─── URL helpers ──────────────────────────────────────────────────────────────

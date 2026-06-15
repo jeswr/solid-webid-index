@@ -133,6 +133,13 @@ export function classDelta(
 //   'c:<classIri>'  -- per-class entity count      (THIS bead owns; void:classPartition)
 // The distinct-class / distinct-property counts are DERIVED at read time (count of
 // c:/p: keys with v > 0), avoiding a second counter to keep consistent.
+//
+// NOTE: a `sup` / `sp:<predicate>` suppressed-inbound-edge counter pair (object = a tombstoned
+// WebID) used to live here to make the VoID `void:triples` / Hydra estimate subtract suppressed
+// inbound edges exactly. It was REMOVED (roborev rounds 6–8): keeping it byte-exact across erase /
+// tombstone / markDone / re-projection was too race-prone. The estimate now marginally over-counts
+// suppressed inbound edges — spec-legal for TPF (estimates) — while SERVED TPF output still
+// suppresses every such edge at read time (pgStore tombstoneObjectClause).
 
 /** Scalar counter key for the total triple count (TPF bead owns; read here for VoID). */
 export const STATS_KEY_TRIPLES = "triples";
