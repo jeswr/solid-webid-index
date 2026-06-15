@@ -48,15 +48,12 @@ import type {
 } from "./ports.js";
 import {
   STATS_KEY_ENTITIES,
-  STATS_KEY_SUPPRESSED,
   STATS_KEY_TRIPLES,
   STATS_PREFIX_CLASS,
   STATS_PREFIX_PROPERTY,
-  STATS_PREFIX_SUPPRESSED,
   type StatTriple,
   classDelta,
   classEntityContribution,
-  suppressedKey,
 } from "./stats";
 
 /** The rdf:type predicate IRI — class partitions count its IRI objects. */
@@ -657,18 +654,19 @@ export class PgStore
 
   async tombstone(docUrl: string): Promise<void> {
     const now = Date.now();
-    // ONE transaction over the whole transition so the projection clears, the inbound-suppressed
-    // increment, and the doc-row tombstone commit atomically (and share the advisory lock with
-    // enqueue/markDone/eraseWebId on this canonical doc key).
+    // ONE transaction over the whole transition so the projection clear and the doc-row tombstone
+    // commit atomically (and share the advisory lock with enqueue/markDone/eraseWebId on this
+    // canonical doc key).
     await this.db.transaction(async (tx) => {
       await tx.query("SELECT pg_advisory_xact_lock(hashtext($1))", [docUrl]);
 
-      // The set of WebIDs this tombstone() PERSISTS as tombstoned: every WebID currently projected
-      // from this document PLUS the doc row's own known `webid` even when it has NO materialised
-      // projection (roborev MEDIUM 1 — the doc row gets state='tombstone' below, so TPF will suppress
-      // that WebID's inbound edges; without including it here its inbound edges were suppressed at read
-      // but never subtracted from the counters → over-report). The doc-URL gate also suppresses, but
-      // the canonical webid key is what TPF matches inbound edges (`o = webid`) against.
+      // This tombstone() persists state='tombstone' on the SINGLE doc row for `docUrl` below — which
+      // suppresses inbound edges to that row's `doc.webid` (tombstoneObjectClause matches `doc.state =
+      // 'tombstone' AND doc.webid = o`). The OTHER WebIDs projected under this DOC URL (variant-key
+      // residue) are NOT persisted as tombstoned by this op (no tombstone row, the doc row carries only
+      // one webid), so TPF keeps serving THEIR inbound edges — but their stale materialised triples
+      // must still be cleared. We clear ALL projected WebIDs under the doc PLUS the doc's own
+      // `webid` (even with no materialised projection, so the upsert path leaves nothing behind).
       const projectedWebids = await tx.query<{ webid: string }>(
         "SELECT DISTINCT webid FROM triple WHERE doc_url = $1 AND webid IS NOT NULL",
         [docUrl]
@@ -677,20 +675,12 @@ export class PgStore
         "SELECT webid FROM doc WHERE doc_url = $1",
         [docUrl]
       );
-      const tombstonedSet = new Set<string>(
-        projectedWebids.map((r) => r.webid)
-      );
+      const toClear = new Set<string>(projectedWebids.map((r) => r.webid));
       const docWebid = docRow[0]?.webid;
-      if (docWebid) tombstonedSet.add(docWebid);
+      if (docWebid) toClear.add(docWebid);
 
-      // Clear projections + maintain the incremental stats counters for EXACTLY the WebIDs being
-      // tombstoned, BEFORE writing the doc-row tombstone state below (the unifying helper's ordering
-      // contract — roborev MEDIUM 2). A direct tombstone() (the opt-out / erasure path, DESIGN.md
-      // §4.8) must also subtract the cleared WebIDs' stats contribution, otherwise a predicate-only
-      // TPF estimate (which reads the 'p:<iri>' counter directly) would keep advertising void:triples /
-      // hydra:totalItems for an erased WebID even though the data rows are tombstone-filtered out of
-      // the response. No residue-only WebIDs here: every WebID under this doc is itself tombstoned.
-      await this.tombstoneTransitionAccounting(tombstonedSet, [], tx);
+      // Clear projections for all affected WebIDs BEFORE writing the doc-row tombstone state below.
+      await this.clearTombstonedProjections(toClear, tx);
 
       await tx.query(
         `INSERT INTO doc (
@@ -818,13 +808,18 @@ export class PgStore
    *  - any other pattern → a BOUNDED COUNT (capped at TPF_ESTIMATE_COUNT_CAP) so a
    *    pathological pattern can never trigger an unbounded scan.
    *
-   * Tombstoned-WebID triples are excluded from every estimate path: subject-tombstoned rows are
-   * already deleted from `triple` on erasure (so the O(1) counters never count them), and the bounded
-   * COUNT applies the same NOT EXISTS gate as tpf().  INBOUND IRI-object edges TO a tombstoned WebID
-   * (e.g. Alice's `foaf:knows Bob` after Bob is erased) remain in the table keyed under the still-live
-   * subject, so they are SUPPRESSED at read but the raw O(1) counters still include them — the O(1)
-   * paths SUBTRACT that suppressed count so the estimate matches the triples TPF actually serves
-   * (roborev MEDIUM).
+   * Tombstoned-WebID triples are excluded from the SERVED data on every path: subject-tombstoned rows
+   * are already deleted from `triple` on erasure, and the bounded COUNT applies the same NOT EXISTS
+   * gate as tpf(). INBOUND IRI-object edges TO a tombstoned WebID (e.g. Alice's `foaf:knows Bob` after
+   * Bob is erased) remain in the table keyed under the still-live subject and ARE suppressed in served
+   * TPF output (tombstoneObjectClause), but the O(1) `triples`/`p:<iri>` counters still include them —
+   * so an O(1) estimate may MARGINALLY OVER-COUNT by the number of suppressed inbound edges. This is
+   * SPEC-COMPLIANT: TPF `void:triples` / Hydra `totalItems` are defined as ESTIMATES, not exact counts
+   * (the actual served page never includes a suppressed edge — only the numeric hint is approximate).
+   * An earlier incremental `sup`/`sp:<pred>` correction counter was removed (roborev rounds 6–8): it
+   * had to stay byte-exact across erase / tombstone / markDone / re-projection (some outside the
+   * advisory lock) and kept spawning adjacent concurrency/accounting findings. Robustness + a
+   * spec-legal estimate beats an exact-but-racy counter.
    */
   async estimatePatternCardinality(pattern: TpfPattern): Promise<number> {
     const noTerms =
@@ -841,13 +836,9 @@ export class PgStore
         [STATS_KEY_TRIPLES]
       );
       if (rows[0]) {
-        const counter = Number(rows[0].v);
-        // Subtract inbound IRI-object edges to tombstoned WebIDs that the counter still includes but
-        // the served TPF suppresses (clamp at 0). The suppressed count is read from the INCREMENTAL
-        // `sup` counter — O(1), NO cap — so a dataset with more suppressed edges than
-        // TPF_ESTIMATE_COUNT_CAP no longer over-reports (roborev MEDIUM).
-        const suppressed = await this.getSuppressedCount(STATS_KEY_SUPPRESSED);
-        return Math.max(0, counter - suppressed);
+        // O(1) estimate. May marginally over-count suppressed inbound edges to tombstoned WebIDs
+        // (see the method doc) — spec-legal for void:triples; served TPF never returns them.
+        return Number(rows[0].v);
       }
     } else if (
       pattern.p !== undefined &&
@@ -861,35 +852,16 @@ export class PgStore
       // accessor yields a positive estimate to avoid masking a transient empty state.
       const card = await this.getPredicateCardinality(pattern.p);
       if (card > 0) {
-        // Same correction as the empty pattern, but scoped to this predicate: subtract the suppressed
-        // inbound-object edges under THIS predicate from the INCREMENTAL `sp:<pred>` counter (O(1), no
-        // cap — e.g. the `foaf:knows`→tombstoned-Bob edges).
-        const suppressed = await this.getSuppressedCount(
-          suppressedKey(pattern.p)
-        );
-        return Math.max(0, card - suppressed);
+        // O(1) per-predicate estimate. May marginally over-count this predicate's suppressed
+        // inbound-object edges (e.g. `foaf:knows`→tombstoned-Bob) — spec-legal estimate; served TPF
+        // never returns them.
+        return card;
       }
     }
 
     // Bounded COUNT fallback — never an unbounded scan.  We count over a capped
     // subquery so the planner stops after at most the cap rows.
     return this.boundedPatternCount(pattern);
-  }
-
-  /**
-   * Read a SUPPRESSED-edge counter (`sup` total OR `sp:<pred>` per-predicate) — the INCREMENTAL count
-   * of inbound IRI-object edges whose object is a tombstoned WebID. These are maintained additively by
-   * the store on EVERY projection mutation + erasure (see {@link adjustSuppressedCounters}), so the
-   * empty-pattern + predicate-only estimates subtract the FULL hidden count in O(1) with NO cap — a
-   * dataset with more suppressed edges than TPF_ESTIMATE_COUNT_CAP no longer over-reports (roborev
-   * MEDIUM). Returns 0 for an absent counter (no suppression).
-   */
-  private async getSuppressedCount(key: string): Promise<number> {
-    const rows = await this.db.query<{ v: number | string }>(
-      "SELECT v FROM stats WHERE k = $1",
-      [key]
-    );
-    return rows[0] ? Number(rows[0].v) : 0;
   }
 
   /**
@@ -1019,11 +991,6 @@ export class PgStore
       ).classes,
     };
 
-    // OLD SUPPRESSED contribution for this webid — its existing rows whose IRI object is a tombstoned
-    // WebID (inbound edges to an erased person). Read BEFORE the DELETE so the incremental
-    // suppressed-edge counters drop by exactly what is being removed (roborev MEDIUM, no cap).
-    const oldSuppressed = await this.suppressedContributionForWebid(webid);
-
     await this.db.query("DELETE FROM triple WHERE webid = $1", [webid]);
 
     // Subtract the OLD per-predicate counts (TPF bead's 'triples' + 'p:<iri>'
@@ -1041,14 +1008,6 @@ export class PgStore
     // NEW entity + class-partition contribution (this bead's owned counters).
     const newContribution = classEntityContribution(triples as StatTriple[]);
     await this.applyClassEntityDelta(oldContribution, newContribution);
-
-    // Maintain the incremental SUPPRESSED-edge counters across this re-projection: subtract the OLD
-    // suppressed contribution, then add the NEW one (the new triples whose IRI object is currently a
-    // tombstoned WebID). Net delta keeps `sup` / `sp:<pred>` exact so the O(1) VoID/TPF correction
-    // never relies on a capped scan (roborev MEDIUM).
-    await this.adjustSuppressedCounters(oldSuppressed, "subtract");
-    const newSuppressed = await this.suppressedContributionInTriples(triples);
-    await this.adjustSuppressedCounters(newSuppressed, "add");
 
     if (triples.length > 0) {
       // Build a single multi-row INSERT (bounded by MAX_QUADS upstream).
@@ -1113,11 +1072,6 @@ export class PgStore
       ).classes,
     };
 
-    // This WebID's OLD SUPPRESSED contribution: its rows whose IRI object is a tombstoned WebID
-    // (inbound edges, e.g. knows→erased-person). They are about to be deleted, so the incremental
-    // suppressed counters must drop by them (roborev MEDIUM — keeps the O(1) correction exact, no cap).
-    const oldSuppressed = await this.suppressedContributionForWebid(webid, db);
-
     await db.query("DELETE FROM triple WHERE webid = $1", [webid]);
 
     // Subtract TPF counters ('triples' + 'p:<iri>').
@@ -1140,178 +1094,34 @@ export class PgStore
       },
       db
     );
-
-    // Subtract the suppressed inbound-edge counters this WebID contributed.
-    await this.adjustSuppressedCounters(oldSuppressed, "subtract", db);
   }
 
   /**
-   * Count this WebID's rows whose IRI object is a tombstoned WebID, GROUPED BY predicate — i.e. the
-   * inbound edges projected UNDER this WebID that TPF/VoID SUPPRESS (object = an erased person). Used
-   * to keep the INCREMENTAL suppressed-edge counters (`sup` / `sp:<pred>`) exact when this WebID's
-   * projection changes or is cleared (roborev MEDIUM). Returns an EMPTY map when no tombstone exists
-   * (a single cheap EXISTS short-circuit), so the common no-erasure path adds no work.
-   */
-  private async suppressedContributionForWebid(
-    webid: string,
-    db: SqlExecutor = this.db
-  ): Promise<Map<string, number>> {
-    const anyTomb = await db.query<{ exists: boolean }>(
-      `SELECT EXISTS(
-         SELECT 1 FROM tombstone
-         UNION ALL
-         SELECT 1 FROM doc WHERE state = 'tombstone'
-       ) AS exists`
-    );
-    if (!anyTomb[0]?.exists) return new Map();
-
-    const rows = await db.query<{ p: string; n: number | string }>(
-      `SELECT t.p AS p, COUNT(*) AS n
-         FROM triple t
-        WHERE t.webid = $1
-          AND t.o_is_iri = TRUE
-          AND t.o <> t.webid
-          AND EXISTS (
-            SELECT 1 FROM tombstone ts WHERE ts.webid = t.o
-            UNION ALL
-            SELECT 1 FROM doc d WHERE d.state = 'tombstone' AND d.webid = t.o
-          )
-        GROUP BY t.p`,
-      [webid]
-    );
-    return new Map(rows.map((r) => [r.p, Number(r.n)]));
-  }
-
-  /**
-   * Given the NEW triple set being projected for a WebID, return the per-predicate count of those
-   * triples whose IRI object is CURRENTLY a tombstoned WebID — i.e. the inbound edges that will be
-   * SUPPRESSED at read the moment they are inserted (e.g. re-crawling Alice's `knows`→already-erased
-   * Bob). Used to keep the incremental suppressed-edge counters exact on re-projection (roborev
-   * MEDIUM). Returns an EMPTY map when no triple has an IRI object OR no tombstone exists (one cheap
-   * batched lookup of only the distinct IRI objects, never an unbounded scan).
-   */
-  private async suppressedContributionInTriples(
-    triples: TpfTriple[]
-  ): Promise<Map<string, number>> {
-    // Distinct IRI objects appearing in the new triple set — the only candidates for object-suppression.
-    const iriObjects = new Set<string>();
-    for (const t of triples) {
-      if (t.oIsIri) iriObjects.add(t.o);
-    }
-    if (iriObjects.size === 0) return new Map();
-
-    // Which of those distinct IRI objects are tombstoned WebIDs (one batched query bounded by the
-    // distinct-object count, not the dataset). tombstonedWebids() covers both the permanent table and
-    // a `doc` row in state 'tombstone'.
-    const tombstonedObjects = await this.tombstonedWebids([...iriObjects]);
-    if (tombstonedObjects.size === 0) return new Map();
-
-    const byPredicate = new Map<string, number>();
-    for (const t of triples) {
-      if (t.oIsIri && tombstonedObjects.has(t.o)) {
-        byPredicate.set(t.p, (byPredicate.get(t.p) ?? 0) + 1);
-      }
-    }
-    return byPredicate;
-  }
-
-  /**
-   * Apply a per-predicate suppressed-edge delta to the incremental counters (`sup` total +
-   * `sp:<pred>` per-predicate), either adding (newly suppressed edges) or subtracting (edges removed /
-   * re-projected away). One batched, GREATEST(0,…)-clamped upsert — the same O(1) path the other
-   * counters use. A zero/empty map is a no-op (no query). Maintained on EVERY projection mutation +
-   * erasure so `getStats` / `estimatePatternCardinality` subtract the FULL hidden count with NO cap
-   * (roborev MEDIUM).
-   */
-  private async adjustSuppressedCounters(
-    byPredicate: Map<string, number>,
-    op: "add" | "subtract",
-    db: SqlExecutor = this.db
-  ): Promise<void> {
-    if (byPredicate.size === 0) return;
-    const sign = op === "add" ? 1 : -1;
-    const adjustments: Array<[string, number]> = [];
-    let total = 0;
-    for (const [pred, n] of byPredicate) {
-      if (n === 0) continue;
-      total += n;
-      adjustments.push([suppressedKey(pred), sign * n]);
-    }
-    if (total !== 0) adjustments.push([STATS_KEY_SUPPRESSED, sign * total]);
-    await this.adjustStatsBatch(adjustments, db);
-  }
-
-  /**
-   * THE single unifying tombstone-transition helper (roborev MEDIUM ×3). It owns the ONE invariant
-   * that the three findings all violated in different ways: the `sup`/`sp:<pred>` suppressed-inbound
-   * counters are incremented for a WebID **if and only if**
-   *   (a) it genuinely transitions NON-tombstoned → tombstoned in THIS operation, AND
-   *   (b) a tombstone (row/state) is ACTUALLY persisted for it so TPF/read in fact suppress its
-   *       inbound edges,
-   * with the inbound count taken BEFORE that WebID's own projection is cleared and EXCLUDING
-   * self-referential edges (Bob→Bob).
+   * Clear the materialised projection of EVERY WebID a tombstone operation affects, so an erased /
+   * tombstoned person leaves NO servable triples behind. Every path that tombstones a known WebID —
+   * `eraseWebId()`, `tombstone()`, and the crawler's `markDone({ state: "tombstone" })` — routes its
+   * projection-clear through here, alongside any variant-key residue WebIDs projected under the same
+   * doc. All listed WebIDs are simply delete-by-webid'd (idempotent; a WebID with no rows is a no-op);
+   * de-duplicated so a WebID listed twice is cleared once.
    *
-   * To make "counted set == persisted-tombstone set" structurally true, this helper is called with
-   * EXACTLY the set of WebIDs the operation persists as tombstoned (`tombstonedWebids`). For each:
-   *   1. Observe its prior tombstone state INSIDE the tx (per-WebID `alreadyTombstoned`) so the
-   *      increment fires only on a genuine transition — a repeat erase / re-tombstone is a no-op
-   *      (roborev MEDIUM: double-count on repeat erase).
-   *   2. Clear its projection FIRST (removes self-loops), then COUNT its surviving inbound IRI-object
-   *      edges per-predicate and INCREMENT the counters by that exact amount (no cap).
-   *
-   * ORDERING CONTRACT (roborev MEDIUM 2): this MUST run BEFORE the operation writes the
-   * tombstone state/row for these WebIDs. Run before the write, the inbound COUNT sees edges that are
-   * not yet suppressed (a clean increment), and clearWebidProjection's own "old suppressed"
-   * subtraction does NOT see a Bob→Bob self-edge as already-suppressed — so no spurious subtract /
-   * negative counter. EVERY path that persists a tombstone for a known WebID — `eraseWebId()`,
-   * `tombstone()`, and the crawler's `markDone({ state: "tombstone" })` — routes through here, passing
-   * only WebIDs it will actually tombstone, so the counted set never diverges from the persisted set
-   * (roborev MEDIUM 3: alternates counted-but-not-tombstoned).
-   *
-   * `extraToClear` are WebIDs whose projection must also be cleared (variant-key residue under the
-   * same doc) but which this operation does NOT persist as tombstoned — so they are cleared but NOT
-   * counted (roborev MEDIUM 3).
+   * This used to also maintain an incremental `sup`/`sp:<pred>` suppressed-inbound-edge counter so the
+   * O(1) `void:triples` estimate could subtract suppressed inbound edges exactly. That counter was
+   * REMOVED (roborev rounds 6–8): keeping it byte-exact across erase / tombstone / markDone /
+   * re-projection (some outside the advisory lock) was fundamentally race-prone and kept spawning
+   * adjacent accounting/concurrency findings. The estimate now MARGINALLY over-counts suppressed
+   * inbound edges — spec-legal for TPF `void:triples` / Hydra `totalItems` (estimates) — while the
+   * SERVED data stays exact: `tombstoneObjectClause` suppresses every inbound edge to a tombstoned
+   * WebID in actual TPF output. So this helper no longer needs to distinguish "counted" WebIDs from
+   * "cleared-only" residue, nor observe prior tombstone state — it just clears.
    */
-  private async tombstoneTransitionAccounting(
-    tombstonedWebids: Iterable<string>,
-    extraToClear: Iterable<string>,
+  private async clearTombstonedProjections(
+    webids: Iterable<string>,
     db: SqlExecutor
   ): Promise<void> {
-    // De-dup so a WebID present in both sets is handled once (as a tombstoned WebID — the stronger
-    // case), and a WebID listed twice is not double-cleared.
-    const tombstoned = new Set(tombstonedWebids);
-
-    // Persisted-as-tombstoned WebIDs: clear projection + count inbound, guarded per-WebID.
-    for (const webid of tombstoned) {
-      // (a) genuine-transition guard — observed BEFORE any write in this op (callers must invoke this
-      // helper before persisting the tombstone state/row).
-      const alreadyTombstoned = await this.isTombstonedOn({ webid }, db);
-      // Clear self-loops first so they are never counted as inbound to the WebID itself, and so
-      // clearWebidProjection's own old-suppressed subtraction is computed against the pre-tombstone
-      // world (roborev MEDIUM 2 — no spurious self-edge subtract).
-      await this.clearWebidProjection(webid, db);
-      if (alreadyTombstoned) continue; // not a genuine transition → no increment (no double-count)
-
-      // (b) count surviving inbound IRI-object edges TO this WebID per-predicate and increment.
-      // Self-edges were removed by the clear above, so this is purely Alice→Bob, never Bob→Bob.
-      const inboundEdges = await db.query<{ p: string; n: number | string }>(
-        `SELECT p, COUNT(*) AS n
-           FROM triple
-          WHERE o = $1 AND o_is_iri = TRUE
-          GROUP BY p`,
-        [webid]
-      );
-      const newlySuppressed = new Map<string, number>(
-        inboundEdges.map((r) => [r.p, Number(r.n)])
-      );
-      await this.adjustSuppressedCounters(newlySuppressed, "add", db);
-    }
-
-    // Residue WebIDs: clear their projection (variant-key cleanup) but do NOT count them — this op
-    // does not persist a tombstone for them, so TPF keeps serving their inbound edges; counting them
-    // would under-report (roborev MEDIUM 3).
-    for (const webid of extraToClear) {
-      if (tombstoned.has(webid)) continue;
+    const seen = new Set<string>();
+    for (const webid of webids) {
+      if (seen.has(webid)) continue;
+      seen.add(webid);
       await this.clearWebidProjection(webid, db);
     }
   }
@@ -1389,23 +1199,21 @@ export class PgStore
 
     let triples = 0;
     let entities = 0;
-    let suppressedTotal = 0;
     const classPartitions: ClassPartition[] = [];
     const propertyPartitions: PropertyPartition[] = [];
-    // Per-predicate SUPPRESSED inbound-edge counts, read from the INCREMENTAL `sp:<pred>` counters in
-    // the SAME single stats read (no extra scan) — roborev MEDIUM.
-    const suppressedByPred = new Map<string, number>();
 
+    // VoID counts are ESTIMATES (per the spec): the `triples`/`p:<iri>` counters still include inbound
+    // IRI-object edges to a tombstoned WebID (e.g. Alice's `foaf:knows Bob` after Bob is erased), which
+    // are suppressed in SERVED TPF output but not subtracted here — so the totals may MARGINALLY
+    // over-count by the number of suppressed inbound edges. The earlier incremental `sup`/`sp:<pred>`
+    // correction counter was removed as too race-prone (roborev rounds 6–8); served data stays exact
+    // (tombstoneObjectClause suppresses every such edge in tpf()).
     for (const r of rows) {
       const v = Number(r.v);
       if (r.k === STATS_KEY_TRIPLES) {
         triples = v;
       } else if (r.k === STATS_KEY_ENTITIES) {
         entities = v;
-      } else if (r.k === STATS_KEY_SUPPRESSED) {
-        suppressedTotal = v;
-      } else if (r.k.startsWith(STATS_PREFIX_SUPPRESSED)) {
-        suppressedByPred.set(r.k.slice(STATS_PREFIX_SUPPRESSED.length), v);
       } else if (r.k.startsWith(STATS_PREFIX_CLASS)) {
         classPartitions.push({
           classIri: r.k.slice(STATS_PREFIX_CLASS.length),
@@ -1419,32 +1227,12 @@ export class PgStore
       }
     }
 
-    // Correct for SUPPRESSED inbound IRI-object edges to tombstoned WebIDs (roborev MEDIUM): an edge
-    // like Alice's `foaf:knows Bob` survives in `triple` (keyed under live Alice) after Bob is erased,
-    // so the raw `triples`/`p:` counters still include it, but TPF/served output suppresses it. The
-    // suppressed counts are maintained INCREMENTALLY (`sup` / `sp:<pred>`, on every projection +
-    // erasure), so the correction subtracts the FULL hidden count with NO cap — a dataset with more
-    // suppressed inbound edges than TPF_ESTIMATE_COUNT_CAP no longer over-reports. Subtract from the
-    // total `triples` AND from each affected property partition so VoID matches served data.
-    if (suppressedTotal > 0 || suppressedByPred.size > 0) {
-      triples = Math.max(0, triples - suppressedTotal);
-      for (const part of propertyPartitions) {
-        const sub = suppressedByPred.get(part.propertyIri);
-        if (sub) part.triples = Math.max(0, part.triples - sub);
-      }
-    }
-    // Drop any property partition whose served count is now 0 so void:properties + the partition list
-    // reflect only predicates with at least one SERVED triple.
-    const servedPropertyPartitions = propertyPartitions.filter(
-      (p) => p.triples > 0
-    );
-
     // Sort partitions deterministically: descending count, then IRI for stable
     // ordering (so the VoID graph + its ETag are stable across reads).
     classPartitions.sort(
       (a, b) => b.entities - a.entities || a.classIri.localeCompare(b.classIri)
     );
-    servedPropertyPartitions.sort(
+    propertyPartitions.sort(
       (a, b) =>
         b.triples - a.triples || a.propertyIri.localeCompare(b.propertyIri)
     );
@@ -1453,11 +1241,11 @@ export class PgStore
       triples,
       entities,
       // void:classes / void:properties = number of DISTINCT classes / predicates
-      // (derived from the partition counts, all already v > 0 / served > 0).
+      // (derived from the partition counts, all v > 0 from the SQL filter).
       classes: classPartitions.length,
-      properties: servedPropertyPartitions.length,
+      properties: propertyPartitions.length,
       classPartitions,
-      propertyPartitions: servedPropertyPartitions,
+      propertyPartitions,
     };
   }
 
@@ -1852,18 +1640,28 @@ export class PgStore
       }
 
       if (claimToken != null) {
-        // ORDERING (roborev MEDIUM 2): when this completion lands `state='tombstone'`, the
-        // suppressed-inbound-edge accounting MUST run BEFORE the doc row flips to 'tombstone', so the
-        // per-WebID genuine-transition guard sees the PRE-tombstone world (alreadyTombstoned=false) and
-        // the inbound COUNT sees edges not yet suppressed. But it must not mutate counters for a STALE
-        // completion, so first confirm THIS worker still owns the lease (claim_token match) before
-        // touching any counter. Then the UPDATE below cannot find 0 rows for a tombstone completion.
+        // SERIALIZE the ownership check + projection-clear + final state UPDATE under the SAME ROW LOCK
+        // (roborev HIGH — TOCTOU). `claim()` reclaims an expired lease with `FOR UPDATE SKIP LOCKED`,
+        // and it does NOT take this op's advisory lock — so the advisory lock alone does NOT stop a
+        // concurrent reclaim between a plain ownership pre-check and the fenced UPDATE. Without a row
+        // lock, claim() could reclaim the row in that window: the fenced UPDATE would then match 0 rows,
+        // yet `handleMarkDoneTombstoneTransition()` would ALREADY have cleared this WebID's projection
+        // outside the winning lease. Taking `SELECT … FOR UPDATE` on the doc row pins it: claim()'s
+        // `SKIP LOCKED` skips a row we hold, so no reclaim can interleave. Ownership is re-verified
+        // UNDER that lock, and NO side effect runs until ownership is confirmed.
+        const locked = await tx.query<{ claim_token: string | null }>(
+          "SELECT claim_token FROM doc WHERE doc_url = $1 FOR UPDATE",
+          [docUrl]
+        );
+        // Row gone or token mismatch = STALE completion (reclaimed/removed). Fenced no-op: do NOT
+        // throw, do NOT mutate any projection/counter, do NOT clobber the new owner's state.
+        if (locked.length === 0 || locked[0].claim_token !== claimToken) {
+          return false;
+        }
+        // Ownership confirmed under the row lock. A tombstone completion now clears the projection
+        // BEFORE the doc row flips to 'tombstone' — safe to mutate because the lock guarantees this
+        // lease still wins and the fenced UPDATE below cannot find 0 rows for a row we hold locked.
         if (result.state === "tombstone" && result.webid) {
-          const owned = await tx.query<{ doc_url: string }>(
-            "SELECT doc_url FROM doc WHERE doc_url = $1 AND claim_token = $2",
-            [docUrl, claimToken]
-          );
-          if (owned.length === 0) return false; // stale lease — no-op, no counter mutation
           await this.handleMarkDoneTombstoneTransition(result, docUrl, tx);
         }
         const fenced = await tx.query<{ doc_url: string }>(
@@ -1906,20 +1704,19 @@ export class PgStore
             terminalAt,
           ]
         );
-        // 0 rows updated = stale completion (token mismatch — row reclaimed by another
-        // worker).  Safe no-op: do NOT throw, do NOT clobber the new owner's state.  Return
-        // `false` so the caller skips the out-of-fence projection (roborev HIGH 1). For a tombstone
-        // completion this cannot happen — the owner pre-check above already returned false on a stale
-        // lease, before any counter mutation, so the accounting never runs for a row we don't own.
+        // 0 rows updated = stale completion (token mismatch — row reclaimed by another worker). Safe
+        // no-op: do NOT throw, do NOT clobber the new owner's state. Return `false` so the caller skips
+        // the out-of-fence projection (roborev HIGH). For a tombstone completion this is unreachable —
+        // the `FOR UPDATE` lock above pins the row (claim's `SKIP LOCKED` cannot reclaim it) and we
+        // re-verified ownership under that lock before any projection mutation, so the fenced UPDATE
+        // can never find 0 rows after the accounting ran.
         if (fenced.length === 0) return false;
         return true;
       }
 
-      // No claimToken: traditional path (enqueue→markDone without claim).
-      // A token-less completion that lands a 'tombstone' state is a genuine non-tombstoned →
-      // tombstoned transition (the tombstone gate above proved the row was NOT tombstoned). Run the
-      // suppressed-inbound accounting BEFORE flipping the row to 'tombstone' (roborev MEDIUM 2 — same
-      // ordering as the fenced path) so the genuine-transition guard sees the pre-tombstone world.
+      // No claimToken: traditional path (enqueue→markDone without claim — no lease to fence). A
+      // token-less completion that lands a 'tombstone' state clears the WebID's (and any variant-key
+      // residue's) projection BEFORE flipping the row to 'tombstone', so nothing servable lingers.
       if (result.state === "tombstone" && result.webid) {
         await this.handleMarkDoneTombstoneTransition(result, docUrl, tx);
       }
@@ -1974,17 +1771,16 @@ export class PgStore
 
   /**
    * Shared tombstone-transition tail for {@link markDone}: when a completion lands `state='tombstone'`
-   * with a known WebID (the crawler's noindex / 410 paths), route the projection-clear + suppressed-
-   * inbound accounting through the ONE unifying helper. Runs INSIDE the caller's markDone transaction,
-   * BEFORE the doc row flips to 'tombstone' (the helper's ordering contract — roborev MEDIUM 2).
+   * with a known WebID (the crawler's noindex / 410 paths), clear the materialised projection of the
+   * tombstoned WebID AND of any variant-key residue WebID projected under the same DOC URL. Runs INSIDE
+   * the caller's markDone transaction, AFTER ownership is confirmed under the row lock and BEFORE the
+   * doc row flips to 'tombstone'. A no-op for non-tombstone states or when no WebID is known (e.g. a
+   * noindex doc whose body was never parsed).
    *
-   * CRITICAL (roborev MEDIUM 3): markDone persists a tombstone for `result.webid` ONLY (the doc row's
-   * `state='tombstone'` + that single canonical WebID). The OTHER WebIDs projected from the same
-   * document (variant-key residue) are NOT tombstoned — TPF keeps serving their inbound edges — so they
-   * must be CLEARED but NOT counted as suppressed (counting them while still serving them would
-   * under-report). So `result.webid` is the only WebID in the tombstoned (counted) set; the alternates
-   * go into `extraToClear`. This keeps "counted set == persisted-tombstone set". A no-op for
-   * non-tombstone states or when no WebID is known (e.g. a noindex doc whose body was never parsed).
+   * markDone persists a tombstone for `result.webid` ONLY (the doc row's `state='tombstone'` + that
+   * single canonical WebID). The OTHER WebIDs projected from the same document (variant-key residue)
+   * are NOT tombstoned — TPF keeps serving their inbound edges — but their stale triples are still
+   * cleared here so nothing servable lingers under the now-tombstoned doc URL.
    */
   private async handleMarkDoneTombstoneTransition(
     result: CrawlResult,
@@ -1993,15 +1789,13 @@ export class PgStore
   ): Promise<void> {
     if (result.state !== "tombstone" || !result.webid) return;
     const webid = result.webid;
-    // Variant-key residue: WebIDs projected from the same DOC URL under a different/legacy key. These
-    // are NOT tombstoned by this markDone (only `webid` is), so clear-only — do NOT count them.
+    // Variant-key residue: WebIDs projected from the same DOC URL under a different/legacy key.
     const docWebids = await tx.query<{ webid: string }>(
       "SELECT DISTINCT webid FROM triple WHERE doc_url = $1 AND webid IS NOT NULL AND webid != $2",
       [docUrl, webid]
     );
-    await this.tombstoneTransitionAccounting(
-      [webid],
-      docWebids.map((r) => r.webid),
+    await this.clearTombstonedProjections(
+      [webid, ...docWebids.map((r) => r.webid)],
       tx
     );
   }
@@ -2467,21 +2261,18 @@ export class PgStore
       //    explicit too — belt-and-braces against the enqueue/erase resurrection race (roborev HIGH 2).
       await tx.query("SELECT pg_advisory_xact_lock(hashtext($1))", [docUrl]);
 
-      // 1. Clear the WebID's materialised triples + maintain the stats/suppressed counters, and clear
-      //    any variant-key residue, through the ONE unifying helper (matches tombstone()/markDone()).
-      //    eraseWebId persists a PERMANENT tombstone for `webid` ONLY (step 4, keyed by webid), so
-      //    `webid` is the only WebID in the tombstoned (counted) set; the variant-key WebIDs under this
-      //    DOC URL are NOT tombstoned by this erase, so they are clear-only (NOT counted — roborev
-      //    MEDIUM 3). The helper observes each WebID's PRIOR tombstone state itself (BEFORE any write
-      //    here), so a repeat erase of an already-tombstoned WebID is a no-op for the suppressed
-      //    counters (roborev MEDIUM — double-count on repeat erase), and self-loops are excluded.
+      // 1. Clear the WebID's materialised triples — and any variant-key residue projected under the
+      //    same DOC URL — through the shared projection-clear (matches tombstone()/markDone()).
+      //    eraseWebId persists a PERMANENT tombstone for `webid` (step 4); the variant-key WebIDs under
+      //    this DOC URL are NOT tombstoned by this erase, but their stale projections are still cleared
+      //    so nothing servable lingers. Idempotent: a repeat erase of an already-cleared WebID is a
+      //    no-op (delete-by-webid over zero rows).
       const docWebids = await tx.query<{ webid: string }>(
         "SELECT DISTINCT webid FROM triple WHERE doc_url = $1 AND webid IS NOT NULL AND webid != $2",
         [docUrl, webid]
       );
-      await this.tombstoneTransitionAccounting(
-        [webid],
-        docWebids.map((r) => r.webid),
+      await this.clearTombstonedProjections(
+        [webid, ...docWebids.map((r) => r.webid)],
         tx
       );
 

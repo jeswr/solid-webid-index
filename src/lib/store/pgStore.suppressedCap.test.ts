@@ -1,16 +1,15 @@
 // AUTHORED-BY Claude Opus 4.8 (Fable unavailable) — re-review/upgrade candidate
 /**
- * pgStore.suppressedCap.test.ts — the capped-stats-correction regression (roborev MEDIUM).
+ * pgStore.suppressedCap.test.ts — the SERVED-DATA suppression guarantee under a low estimate cap.
  *
- * The earlier correction subtracted suppressed inbound tombstone edges only up to
- * TPF_ESTIMATE_COUNT_CAP, so a dataset with MORE suppressed inbound edges than the cap still
- * over-reported void:triples / hydra:totalItems for the empty + predicate-only estimates. The fix
- * maintains the suppressed-edge count INCREMENTALLY (`sup` total + `sp:<pred>` per-predicate) so the
- * O(1) stats path subtracts the FULL hidden count with NO cap.
+ * The incremental `sup`/`sp:<pred>` suppressed-edge correction counter was REMOVED (roborev rounds
+ * 6–8) as too race-prone. TPF `void:triples` / Hydra `totalItems` are SPEC'd as ESTIMATES, so the
+ * O(1) estimate is now allowed to MARGINALLY over-count inbound edges to an erased WebID. The HARD,
+ * non-negotiable guarantee that this test pins: the actual SERVED TPF output MUST suppress EVERY
+ * inbound edge to a tombstoned WebID — even when the dataset (and the number of suppressed edges)
+ * comfortably exceeds TPF_ESTIMATE_COUNT_CAP, so a capped scan could never have covered them all.
  *
- * This test sets TPF_ESTIMATE_COUNT_CAP DELIBERATELY LOW and then erases a WebID with MANY MORE
- * inbound foaf:knows edges than the cap, asserting getStats() + the empty/predicate-only estimates
- * exclude EVERY suppressed edge (not just the first `cap`). Uses pglite — no network.
+ * Uses pglite — no network.
  */
 
 import { PGlite } from "@electric-sql/pglite";
@@ -26,12 +25,12 @@ const FOAF_NAME = "http://xmlns.com/foaf/0.1/name";
 const BOB = "https://bob.example/card#me";
 const BOB_DOC = "https://bob.example/card";
 
-// A small cap so the dataset comfortably EXCEEDS it; the suppressed-edge correction must still be
-// exact (it reads the incremental `sup`/`sp:` counters, not a capped scan).
+// A small cap so the dataset (and the suppressed-edge set) comfortably EXCEEDS it — proving the
+// SERVED-data suppression is enforced at read by the SQL gate, not by a capped scan.
 const CAP = 5;
-const SUPPRESSED_EDGES = 17; // > CAP — a capped scan would under-correct by (SUPPRESSED_EDGES - CAP).
+const SUPPRESSED_EDGES = 17; // > CAP
 
-describe("suppressed-edge stats correction is exact when the dataset EXCEEDS the cap (roborev MEDIUM)", () => {
+describe("served TPF suppresses ALL inbound edges to an erased WebID, even past the estimate cap", () => {
   let store: import("./pgStore.js").PgStore;
   let db: PGlite;
 
@@ -54,7 +53,7 @@ describe("suppressed-edge stats correction is exact when the dataset EXCEEDS the
     vi.resetModules();
   });
 
-  it("getStats() + empty/predicate estimates subtract ALL suppressed inbound edges, not just `cap`", async () => {
+  it("erasing a WebID drops EVERY inbound foaf:knows edge from served TPF (no cap on the read gate)", async () => {
     // Index Bob (the erase target) plus SUPPRESSED_EDGES distinct people who each foaf:knows Bob.
     const bobTriples: TpfTriple[] = [
       { s: BOB, p: RDF_TYPE, o: FOAF_PERSON, oIsIri: true },
@@ -92,40 +91,47 @@ describe("suppressed-edge stats correction is exact when the dataset EXCEEDS the
       await store.upsertTriples({ webid, docUrl, triples });
     }
 
-    const before = await store.getStats();
-    // Bob: 1 (type). Each person: 3 (type + name + knows). Total = 1 + 3*N.
-    const totalBefore = 1 + 3 * SUPPRESSED_EDGES;
-    expect(before.triples).toBe(totalBefore);
-    const knowsBefore = before.propertyPartitions.find(
-      (p) => p.propertyIri === FOAF_KNOWS
-    );
-    expect(knowsBefore?.triples).toBe(SUPPRESSED_EDGES);
+    // Before erase: every inbound knows→Bob edge is served.
+    const knowsBefore = await store.tpf({
+      pattern: { p: FOAF_KNOWS },
+      limit: 1000,
+    });
+    expect(knowsBefore.triples.length).toBe(SUPPRESSED_EDGES);
 
-    // Erase Bob. His own 1 triple is deleted; the SUPPRESSED_EDGES inbound foaf:knows→Bob edges
-    // survive in `triple` (under live subjects) but are SUPPRESSED at read.
+    // Erase Bob. His own triple is deleted; the SUPPRESSED_EDGES inbound foaf:knows→Bob edges survive
+    // in `triple` (under live subjects) but MUST be suppressed at read by tombstoneObjectClause.
     await store.eraseWebId({ webid: BOB, docUrl: BOB_DOC, reason: "opt-out" });
 
-    const after = await store.getStats();
-    // Served total = (1 + 3N) - 1 (Bob's own) - N (suppressed inbound knows) = 2N.
-    // CRUCIAL: the suppressed subtraction is the FULL N (= SUPPRESSED_EDGES, which is > CAP), proving
-    // the correction is NOT capped. A capped correction would leave (N - CAP) edges over-reported.
-    expect(after.triples).toBe(2 * SUPPRESSED_EDGES);
-    // The foaf:knows partition drops to 0 served (all N inbound edges suppressed) → not advertised.
-    expect(
-      after.propertyPartitions.find((p) => p.propertyIri === FOAF_KNOWS)
-    ).toBeUndefined();
-
-    // The TPF empty-pattern estimate matches the served triple count (full subtraction, no cap).
-    expect(await store.estimatePatternCardinality({})).toBe(
-      2 * SUPPRESSED_EDGES
-    );
-    // The predicate-only estimate for foaf:knows is 0 (every edge suppressed) — NOT (N - CAP).
-    expect(await store.estimatePatternCardinality({ p: FOAF_KNOWS })).toBe(0);
-    // Sanity: the served TPF for foaf:knows is indeed empty (estimate matches reality).
+    // HARD GUARANTEE: the SERVED TPF for foaf:knows is EMPTY — EVERY inbound edge is suppressed, not
+    // just the first `cap`. The read gate is a correlated NOT EXISTS, never a capped scan.
     const knowsTpf = await store.tpf({
       pattern: { p: FOAF_KNOWS },
       limit: 1000,
     });
     expect(knowsTpf.triples.length).toBe(0);
+
+    // And no served triple anywhere has Bob as an IRI object (full inbound suppression).
+    const objTpf = await store.tpf({
+      pattern: { o: BOB, oIsIri: true },
+      limit: 1000,
+    });
+    expect(objTpf.triples.length).toBe(0);
+
+    // Bob himself is gone from served TPF (subject-tombstoned + rows deleted).
+    const bobTpf = await store.tpf({ pattern: { s: BOB }, limit: 1000 });
+    expect(bobTpf.triples.length).toBe(0);
+
+    // The numeric estimate is a SPEC-LEGAL approximation: it may over-count the suppressed inbound
+    // edges (it no longer subtracts them), but it must never be NEGATIVE and must remain ≥ the truly
+    // served count. The empty-pattern estimate counts each live person's surviving 2 served triples
+    // PLUS the (now suppressed-but-still-counted) N inbound knows edges.
+    const estimate = await store.estimatePatternCardinality({});
+    expect(estimate).toBeGreaterThanOrEqual(2 * SUPPRESSED_EDGES);
+    // The per-predicate estimate for foaf:knows reads the O(1) counter (still N) — a legal over-count
+    // versus the 0 actually served. The contract is "estimate ≥ served, never negative".
+    const knowsEstimate = await store.estimatePatternCardinality({
+      p: FOAF_KNOWS,
+    });
+    expect(knowsEstimate).toBeGreaterThanOrEqual(0);
   });
 });
