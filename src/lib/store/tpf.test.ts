@@ -8,11 +8,11 @@
  * network, no Neon account.
  */
 
-import { PGlite } from "@electric-sql/pglite";
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { PgStore, createPgliteExecutor } from "./pgStore.js";
-import type { DocRecord, TpfTriple } from "./ports.js";
+import type { PgStore } from "./pgStore";
+import type { DocRecord, TpfTriple } from "./ports";
+import { freshTestStore } from "./testStore";
 
 const RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const FOAF_PERSON = "http://xmlns.com/foaf/0.1/Person";
@@ -20,9 +20,7 @@ const FOAF_NAME = "http://xmlns.com/foaf/0.1/name";
 const SOLID_ISSUER = "http://www.w3.org/ns/solid/terms#oidcIssuer";
 
 async function makeTestStore(): Promise<{ store: PgStore }> {
-  const db = new PGlite();
-  const store = new PgStore(createPgliteExecutor(db));
-  await store.migrate();
+  const { store } = await freshTestStore();
   return { store };
 }
 

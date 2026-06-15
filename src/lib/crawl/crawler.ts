@@ -49,32 +49,32 @@ import {
   TIME_BUDGET_MS,
   TRANSIENT_BACKOFF_BASE_MS,
   TRANSIENT_BACKOFF_MAX_MS,
-} from "../config.js";
+} from "../config";
 import {
   ParseLimitError,
   RdfFetchError,
   extractWebIdProfile,
   isSolidWebId,
   parseProfile,
-} from "../rdf/profile.js";
-import { type FragmentTriple, datasetToTriples } from "../rdf/tpf.js";
+} from "../rdf/profile";
+import { type FragmentTriple, datasetToTriples } from "../rdf/tpf";
 import {
   BodyTooLargeError,
   GuardedFetchError,
   SsrfError,
   guardedFetch,
-} from "../security/guardedFetch.js";
+} from "../security/guardedFetch";
 import type {
   CrawlCoordinator,
   DocRecord,
   PolitenessStore,
   ReadStore,
-} from "../store/ports.js";
+} from "../store/ports";
 import {
   CanonicalError,
   canonicalDocUrl,
   canonicalWebId,
-} from "../url/canonical.js";
+} from "../url/canonical";
 
 // ─── Public surface ─────────────────────────────────────────────────────────
 

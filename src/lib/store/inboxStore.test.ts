@@ -7,19 +7,17 @@
  * over-cap), recordNotification + getNotification + listNotifications (keyset paging), and that
  * markDone stamps terminal_at (driving the cooldown).
  */
-import { PGlite } from "@electric-sql/pglite";
 import { describe, expect, it } from "vitest";
 
-import { PgStore, createPgliteExecutor } from "./pgStore.js";
+import type { PgStore } from "./pgStore";
+import { freshTestStore } from "./testStore";
 
 const HOUR = 60 * 60 * 1000;
 const DAY = 24 * HOUR;
 const WEEK = 7 * DAY;
 
 async function makeTestStore(): Promise<PgStore> {
-  const db = new PGlite();
-  const store = new PgStore(createPgliteExecutor(db));
-  await store.migrate();
+  const { store } = await freshTestStore();
   return store;
 }
 

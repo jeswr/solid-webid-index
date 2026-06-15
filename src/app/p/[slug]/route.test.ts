@@ -7,12 +7,12 @@
  * exercises every status + HEAD/OPTIONS + the describe-only invariant on the body.
  */
 
-import { PGlite } from "@electric-sql/pglite";
 import { Store as N3Store, Parser } from "n3";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { INDEX_BASE_URL } from "@/lib/config";
-import { PgStore, createPgliteExecutor } from "@/lib/store/pgStore";
+import type { PgStore } from "@/lib/store/pgStore";
+import { freshTestStore } from "@/lib/store/testStore";
 import { slugForWebId } from "@/lib/url/slug";
 
 const FOAF = "http://xmlns.com/foaf/0.1/";
@@ -49,9 +49,7 @@ const PROFILE_TTL = `@prefix foaf: <http://xmlns.com/foaf/0.1/> .
   foaf:knows <https://bob.pod/card#me> .`;
 
 async function makeStore(): Promise<PgStore> {
-  const db = new PGlite();
-  const store = new PgStore(createPgliteExecutor(db));
-  await store.migrate();
+  const { store } = await freshTestStore();
   return store;
 }
 

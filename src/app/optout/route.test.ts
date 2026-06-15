@@ -10,12 +10,12 @@
  *  - rate-limit → 429.
  */
 
-import { PGlite } from "@electric-sql/pglite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { INDEX_BASE_URL } from "@/lib/config";
-import { PgStore, createPgliteExecutor } from "@/lib/store/pgStore";
+import type { PgStore } from "@/lib/store/pgStore";
 import type { TpfTriple } from "@/lib/store/ports";
+import { freshTestStore } from "@/lib/store/testStore";
 
 // ─── Mocks (hoisted) ───────────────────────────────────────────────────────────
 
@@ -75,12 +75,8 @@ const aliceTriples: TpfTriple[] = [
   { s: ALICE, p: FOAF_NAME, o: "Alice", oIsIri: false },
 ];
 
-let db: PGlite;
-
 beforeEach(async () => {
-  db = new PGlite();
-  _store = new PgStore(createPgliteExecutor(db));
-  await _store.migrate();
+  ({ store: _store } = await freshTestStore());
   verifyDpopMock.mockReset();
   guardedFetchMock.mockReset();
   // Default Path A: no valid token.
@@ -94,8 +90,9 @@ beforeEach(async () => {
   });
 });
 
-afterEach(async () => {
-  await db.close();
+afterEach(() => {
+  // No db.close() — the shared per-worker engine is reset (schema-dropped) on the next
+  // freshTestStore() call, so there is nothing to tear down here.
   _store = null;
 });
 

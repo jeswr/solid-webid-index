@@ -19,8 +19,8 @@ import {
   DATASET_DESCRIPTION_IRIS,
   buildRootCatalogQuads,
   buildVoidQuads,
-} from "./datasetDescription.js";
-import { DATASET_IRI } from "./vocab.js";
+} from "./datasetDescription";
+import { DATASET_IRI } from "./vocab";
 
 const RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const VOID = "http://rdfs.org/ns/void#";

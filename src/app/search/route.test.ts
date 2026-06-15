@@ -15,14 +15,14 @@
  * module-level variable patching so no actual DATABASE_URL is needed in tests.
  */
 
-import { PGlite } from "@electric-sql/pglite";
 import { Store as N3Store, Parser } from "n3";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { INDEX_BASE_URL } from "@/lib/config";
 import { sanitiseFtsQuery } from "@/lib/search/sanitise";
-import { PgStore, createPgliteExecutor } from "@/lib/store/pgStore";
+import type { PgStore } from "@/lib/store/pgStore";
 import type { DocRecord } from "@/lib/store/ports";
+import { freshTestStore } from "@/lib/store/testStore";
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -31,10 +31,7 @@ const RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const FOAF = "http://xmlns.com/foaf/0.1/";
 
 async function makeTestStore(): Promise<{ store: PgStore }> {
-  const db = new PGlite();
-  const executor = createPgliteExecutor(db);
-  const store = new PgStore(executor);
-  await store.migrate();
+  const { store } = await freshTestStore();
   return { store };
 }
 

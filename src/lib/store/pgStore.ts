@@ -45,7 +45,7 @@ import type {
   SuggestionStatus,
   TpfPattern,
   TpfTriple,
-} from "./ports.js";
+} from "./ports";
 import {
   STATS_KEY_ENTITIES,
   STATS_KEY_TRIPLES,

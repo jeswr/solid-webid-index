@@ -11,13 +11,13 @@
  * hydra:first/next).  Tombstoned WebIDs' triples must be filtered out.
  */
 
-import { PGlite } from "@electric-sql/pglite";
 import { Store as N3Store, Parser } from "n3";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { INDEX_BASE_URL } from "@/lib/config";
-import { PgStore, createPgliteExecutor } from "@/lib/store/pgStore";
+import type { PgStore } from "@/lib/store/pgStore";
 import type { DocRecord, TpfTriple } from "@/lib/store/ports";
+import { freshTestStore } from "@/lib/store/testStore";
 
 // ─── Namespaces ─────────────────────────────────────────────────────────────
 
@@ -31,10 +31,7 @@ const DATASET_IRI = `${INDEX_BASE_URL}/#dataset`;
 // ─── Test helpers ───────────────────────────────────────────────────────────
 
 async function makeTestStore(): Promise<{ store: PgStore }> {
-  const db = new PGlite();
-  const executor = createPgliteExecutor(db);
-  const store = new PgStore(executor);
-  await store.migrate();
+  const { store } = await freshTestStore();
   return { store };
 }
 

@@ -120,46 +120,71 @@ table + ranking change).
 
 ### 2.1 Schema (single-row-per-doc model — corrects C2/M2)
 
-The frontier, the per-doc crawl metadata, and the raw bytes are **one row per document** keyed by the
-canonical document URL. State mutates **in place**; re-crawl is a `next_eligible_at` reset, never a new
-row. (The earlier "separate `crawl_queue` + `UNIQUE(webid,state)`" model is **rejected** — it broke
-dedup and threw on lease transitions.)
+The frontier, the per-doc crawl metadata, the extracted projection fields (`webid`, `label`, `slug`),
+and the reserialised RDF are **one row per document** in the `doc` table, keyed by the canonical
+document URL. There is **no separate `webid`/projection table**: the served entity IS the `doc` row
+(`/p/{slug}` and `/lookup?webid=` resolve straight to it via the `slug` / `webid` indexes). State
+mutates **in place**; re-crawl is a `next_eligible_at` reset, never a new row. (The earlier "separate
+`crawl_queue` + `UNIQUE(webid,state)`" model — and the earlier separate projected-`webid` table with
+a `crawl_state` column and normalised `label_row` / `oidc_issuer` / `storage_row` / `knows_edge`
+children — are **rejected**: dedup broke, lease transitions threw, and the projection is cheaper to
+re-derive from `doc.raw_rdf` on the read path than to maintain as N normalised tables.)
+
+This is the **Postgres / pglite** schema as shipped (`src/lib/store/schema.sql` — the authoritative
+DDL; `src/lib/store/ports.ts` carries the matching `DocRecord` shape). It runs on Neon in production
+and pglite (in-process WASM Postgres) in tests; FTS is native Postgres `tsvector` (generated columns +
+GIN), not SQLite FTS5.
 
 ```sql
--- 2.1.a  Frontier + per-doc crawl metadata + raw bytes (ONE row per document)
+-- 2.1.a  Frontier + per-doc crawl metadata + raw bytes + projection (ONE row per document)
 CREATE TABLE doc (
   doc_url          TEXT PRIMARY KEY,          -- canonical, post-redirect, fragment-stripped (§2.2)
   host             TEXT NOT NULL,             -- registrable host (per-host politeness)
   webid            TEXT,                      -- canonical WebID (with #fragment) once known
   state            TEXT NOT NULL DEFAULT 'pending'
-                     CHECK (state IN ('pending','claimed','done','error','skipped','blocked','tombstoned')),
+                     CHECK (state IN ('pending','claimed','done','failed','tombstone','skipped','blocked')),
   depth            INTEGER NOT NULL DEFAULT 0,
   root_seed        TEXT,                      -- the trusted-seed doc this excursion descends from (C2)
   suggest_budget   INTEGER,                   -- informational copy of the subtree budget; the AUTHORITATIVE
                                               -- shared budget is a CONSUMED counter in suggest_budget(root_seed) (C2)
-  source           TEXT NOT NULL,             -- seed|catalog|inbox|knows|seeAlso|sameAs|recheck
+  source           TEXT NOT NULL DEFAULT 'seed', -- seed|catalog|inbox|knows|seeAlso|sameAs|recheck
   discovered_from  TEXT,
   -- lease / fencing (atomic claim, crash-safe)
   claim_token      TEXT,
-  claimed_at       INTEGER,                   -- epoch ms
+  claimed_at       BIGINT,                    -- epoch ms
   attempts         INTEGER NOT NULL DEFAULT 0,
-  -- conditional re-crawl
+  -- conditional re-crawl validators
   etag             TEXT,
   last_modified    TEXT,                      -- verbatim HTTP Last-Modified
-  content_hash     TEXT,                      -- sha-256 of reserialised canonical body (change-detect)
-  last_crawled     INTEGER,                   -- epoch ms
-  next_eligible_at INTEGER NOT NULL DEFAULT 0,
+  content_hash     TEXT,                      -- sha-256 of reserialised canonical body (change-detect; M5)
+  -- timing (epoch ms throughout)
+  last_crawled     BIGINT,
+  next_eligible_at BIGINT NOT NULL DEFAULT 0,
+  enqueued_at      BIGINT NOT NULL,
+  -- per-doc result metadata
   http_status      INTEGER,
-  is_solid         INTEGER NOT NULL DEFAULT 0,-- 1 once a solid:oidcIssuer on the subject was seen
-  fail_class       TEXT,                      -- deterministic|transient (drives retry policy, H7)
+  is_solid         BOOLEAN NOT NULL DEFAULT FALSE, -- TRUE once a solid:oidcIssuer on the subject was seen
+  fail_class       TEXT CHECK (fail_class IN ('deterministic','transient')), -- drives retry policy (H7)
   error            TEXT,                      -- truncated last failure reason (never empty-catch)
-  noindex          INTEGER NOT NULL DEFAULT 0,
+  noindex          BOOLEAN NOT NULL DEFAULT FALSE,
   raw_rdf          TEXT,                      -- reserialised canonical Turtle (NOT verbatim bytes; M5)
-  enqueued_at      INTEGER NOT NULL
+  -- projection (folded into the doc row — no separate entity table)
+  label            TEXT,                      -- best-of foaf:name/vcard:fn/schema:name (FTS 'A' weight)
+  slug             TEXT,                      -- base32(sha256(webid))[0..24], our /p/{slug} (NULL until webid known)
+  terminal_at      BIGINT,                    -- epoch ms last entered a terminal/tombstone state (re-suggest cooldown; C2)
+  -- FTS (Postgres native; GENERATED STORED tsvector columns — no separate FTS table):
+  fts_vector       TSVECTOR GENERATED ALWAYS AS (to_tsvector('english', coalesce(raw_rdf,''))) STORED,
+  label_fts        TSVECTOR GENERATED ALWAYS AS (                 -- label weighted 'A', raw_rdf 'D'
+                     setweight(to_tsvector('english', coalesce(label,'')), 'A')
+                     || setweight(to_tsvector('english', coalesce(raw_rdf,'')), 'D')) STORED
 );
-CREATE INDEX idx_doc_ready ON doc(state, next_eligible_at);
-CREATE INDEX idx_doc_host  ON doc(host, state, next_eligible_at);
-CREATE INDEX idx_doc_recrawl ON doc(state, last_crawled);
+CREATE INDEX idx_doc_ready      ON doc(state, next_eligible_at);
+CREATE INDEX idx_doc_host       ON doc(host, state, next_eligible_at);
+CREATE INDEX idx_doc_recrawl    ON doc(state, last_crawled);
+CREATE INDEX idx_doc_fts        ON doc USING GIN (fts_vector);
+CREATE INDEX idx_doc_label_fts  ON doc USING GIN (label_fts);  -- ts_rank: name matches above URI hits
+CREATE INDEX idx_doc_slug       ON doc(slug)  WHERE slug  IS NOT NULL;  -- /p/{slug} reverse lookup
+CREATE INDEX idx_doc_webid      ON doc(webid) WHERE webid IS NOT NULL;  -- /lookup?webid= forward lookup
 
 -- 2.1.a′  Shared suggestion-root budget (anti-amplification C2). ONE row per suggestion-rooted
 -- subtree, keyed on root_seed, holding the REMAINING node budget. enqueue CONSUMES it atomically
@@ -172,78 +197,90 @@ CREATE TABLE suggest_budget (
 );
 
 -- 2.1.b  Per-host politeness (state must be in the DB — invocations are stateless)
-CREATE TABLE host_state (
+CREATE TABLE host_politeness (
   host               TEXT PRIMARY KEY,
-  next_allowed_at    INTEGER NOT NULL DEFAULT 0,
-  in_flight          INTEGER NOT NULL DEFAULT 0,  -- (derived from COUNT at claim; see H2)
-  robots_fetched_at  INTEGER,
-  robots_allow       INTEGER NOT NULL DEFAULT 1,
+  next_allowed_at    BIGINT NOT NULL DEFAULT 0,    -- epoch ms; advance on 429/503/Retry-After
+  robots_fetched_at  BIGINT,
+  robots_allow       BOOLEAN NOT NULL DEFAULT TRUE,
   crawl_delay_ms     INTEGER,
-  consecutive_errors INTEGER NOT NULL DEFAULT 0
+  consecutive_errors INTEGER NOT NULL DEFAULT 0    -- drives exponential host backoff
 );
 
--- 2.1.c  Projected, served entity (one per indexed WebID)
-CREATE TABLE webid (
-  id            INTEGER PRIMARY KEY,            -- FTS rowid (NEVER make this table WITHOUT ROWID — L2)
-  webid         TEXT NOT NULL UNIQUE,           -- canonical WebID = the agent thing-URI
-  doc_url       TEXT NOT NULL REFERENCES doc(doc_url),
-  slug          TEXT NOT NULL UNIQUE,           -- base32(sha256(webid))[0..24], our /p/{slug}
-  label         TEXT,                           -- best-of foaf:name/vcard:fn/schema:name
-  img           TEXT,                           -- validated https avatar IRI
-  crawl_state   TEXT NOT NULL DEFAULT 'live',   -- live|unreachable|stale (rendered as skos:Concept; C3)
-  first_seen    INTEGER NOT NULL,
-  last_modified INTEGER NOT NULL,               -- our dcterms:modified
-  -- precomputed serialisations (read path does string fetch, no N3/jsonld on hot path — arch H2)
-  ttl_cache     TEXT,
-  jsonld_cache  TEXT,
-  nt_cache      TEXT
-);
+-- 2.1.c  Served entity = the `doc` row (NO separate projection table).
+-- The columns a served entry needs — `webid`, `label`, `slug`, `raw_rdf`, `is_solid`, `state` — live
+-- ON the `doc` row above (2.1.a). `/p/{slug}` resolves slug → doc via idx_doc_slug; `/lookup?webid=`
+-- resolves webid → doc via idx_doc_webid. There is no `crawl_state` column: a doc's served liveness IS
+-- its `state` (`done` = live/served, `tombstone` = erased/410, others hidden from reads). Multi-valued
+-- projected fields (issuers, storages, foaf:knows edges) are NOT normalised into child tables — they
+-- are re-derived on read from `doc.raw_rdf` via the sanctioned RDF parse path, and materialised for
+-- query in the `triple` table (2.1.e). The read path serialises straight from `raw_rdf`/`triple`.
 
--- 2.1.d  Multi-valued projected fields (normalised; re-derivable from doc.raw_rdf)
-CREATE TABLE label_row    (webid_id INTEGER REFERENCES webid(id) ON DELETE CASCADE, value TEXT, lang TEXT, prop TEXT,
-                            PRIMARY KEY (webid_id, value, lang, prop)) WITHOUT ROWID;
-CREATE TABLE oidc_issuer  (webid_id INTEGER REFERENCES webid(id) ON DELETE CASCADE, issuer TEXT,
-                            PRIMARY KEY (webid_id, issuer)) WITHOUT ROWID;
-CREATE TABLE storage_row  (webid_id INTEGER REFERENCES webid(id) ON DELETE CASCADE, storage TEXT,
-                            PRIMARY KEY (webid_id, storage)) WITHOUT ROWID;
-CREATE TABLE knows_edge   (src_id INTEGER REFERENCES webid(id) ON DELETE CASCADE, dst_webid TEXT,
-                            PRIMARY KEY (src_id, dst_webid)) WITHOUT ROWID;
-CREATE INDEX idx_knows_dst ON knows_edge(dst_webid);
+-- 2.1.d  (REMOVED.) The normalised projected-field tables (label_row / oidc_issuer / storage_row /
+-- knows_edge) are not used; those fields are re-derived from `doc.raw_rdf` and served from `triple`.
 
 -- 2.1.e  Materialised triples table for TPF (indexed lookups, not derived scans — arch M1)
-CREATE TABLE triple (s TEXT NOT NULL, p TEXT NOT NULL, o TEXT NOT NULL, o_is_iri INTEGER NOT NULL);
-CREATE INDEX idx_triple_po ON triple(p, o);
-CREATE INDEX idx_triple_ps ON triple(p, s);
-CREATE INDEX idx_triple_s  ON triple(s);
+-- REPLACED wholesale per WebID on each (re)projection (delete-by-webid then insert). `webid`/`doc_url`
+-- record provenance so the TPF read can filter out triples ABOUT a tombstoned WebID (H1).
+CREATE TABLE triple (
+  s        TEXT NOT NULL, p TEXT NOT NULL, o TEXT NOT NULL,
+  o_is_iri BOOLEAN NOT NULL,                  -- TRUE → object is an IRI (NamedNode); FALSE → literal
+  webid    TEXT,                              -- the indexed WebID this triple describes (tombstone gate)
+  doc_url  TEXT                               -- the source doc the triple was projected from
+);
+CREATE INDEX idx_triple_po    ON triple(p, o);
+CREATE INDEX idx_triple_ps    ON triple(p, s);
+CREATE INDEX idx_triple_s     ON triple(s);
+CREATE INDEX idx_triple_webid ON triple(webid) WHERE webid IS NOT NULL;  -- tombstone filter + delete-by-webid
 
--- 2.1.f  FTS5 over label + WebID string + issuer host (contentless; synced in the upsert tx)
-CREATE VIRTUAL TABLE webid_fts USING fts5(
-  label, webid, issuer, content='', tokenize = "unicode61 remove_diacritics 2");
+-- 2.1.f  FTS is the GENERATED tsvector columns ON `doc` (2.1.a: fts_vector + weighted label_fts) with
+-- GIN indexes — Postgres native, contentless, maintained automatically by the generated expression.
+-- There is NO separate FTS virtual table (SQLite FTS5 was the earlier substrate; this is `tsvector` +
+-- `ts_rank`). Search ranks name matches (label, weight 'A') above raw-RDF URI/predicate hits (weight 'D').
 
--- 2.1.g  LDN inbox notifications (append-only) + extracted objects (child table — sw M1)
-CREATE TABLE inbox_notification (
-  id TEXT PRIMARY KEY, received_at INTEGER NOT NULL, actor TEXT, activity TEXT NOT NULL,
-  body TEXT NOT NULL, redacted INTEGER NOT NULL DEFAULT 0, processed INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE inbox_object (notif_id TEXT REFERENCES inbox_notification(id) ON DELETE CASCADE, object_iri TEXT,
-  PRIMARY KEY (notif_id, object_iri)) WITHOUT ROWID;
-CREATE INDEX idx_inbox_recent ON inbox_notification(received_at DESC);
+-- 2.1.g  LDN inbox notifications (append-only) + extracted candidate objects (child table — sw M1)
+CREATE TABLE inbox (
+  id TEXT PRIMARY KEY, received_at BIGINT NOT NULL, actor TEXT, activity TEXT NOT NULL,  -- ULID id; epoch ms
+  body TEXT NOT NULL, redacted BOOLEAN NOT NULL DEFAULT FALSE, processed BOOLEAN NOT NULL DEFAULT FALSE);
+CREATE TABLE inbox_object (notif_id TEXT NOT NULL REFERENCES inbox(id) ON DELETE CASCADE, object_iri TEXT NOT NULL,
+  PRIMARY KEY (notif_id, object_iri));
+CREATE INDEX idx_inbox_recent ON inbox(received_at DESC);
 
--- 2.1.h  Tombstones (permanent opt-out/erasure — blocks re-crawl across ALL paths; H1)
+-- 2.1.h  Tombstones (permanent opt-out/erasure — blocks re-crawl across ALL paths; H1). A PERMANENT
+-- row keyed on the canonical WebID, inserted in the SAME atomic tx that deletes the served data, so the
+-- three gates (enqueue, fetch/crawl, projection) refuse the WebID forever even if no `doc` row survives.
+-- `doc_url` lets the enqueue gate also refuse by the fragment-stripped key (variant-key gate; §2.2 L5).
 CREATE TABLE tombstone (
   webid TEXT PRIMARY KEY, doc_url TEXT, reason TEXT NOT NULL CHECK (reason IN ('opt-out','erasure','abuse','noindex')),
-  created_at INTEGER NOT NULL, proof TEXT);
+  created_at BIGINT NOT NULL, proof TEXT);
+CREATE INDEX idx_tombstone_doc ON tombstone(doc_url) WHERE doc_url IS NOT NULL;
 
--- 2.1.i  Rate-limit buckets (serverless; per-IP and per-candidate-host) + daily budget counters (M4)
-CREATE TABLE rate_bucket (key TEXT PRIMARY KEY, window_start INTEGER NOT NULL, count INTEGER NOT NULL);
-CREATE TABLE daily_counter (day TEXT PRIMARY KEY, qstash_msgs INTEGER NOT NULL DEFAULT 0,
-  crawl_fetches INTEGER NOT NULL DEFAULT 0, queue_inserts INTEGER NOT NULL DEFAULT 0);
+-- 2.1.h′  Challenge-response opt-out nonces (Path B — DESIGN.md §4.8). Transient, single-use,
+-- time-boxed proof-of-control tokens; holds NO indexed PII (independent of doc/tombstone).
+CREATE TABLE optout_nonce (
+  webid TEXT PRIMARY KEY, doc_url TEXT NOT NULL, nonce TEXT NOT NULL,  -- keyed on canonical WebID (with #fragment)
+  issued_at BIGINT NOT NULL, expires_at BIGINT NOT NULL, used_at BIGINT);  -- epoch ms; used_at NULL = unused
 
--- 2.1.j  Dataset stats (incremental; VoID/DCAT/health read these — never live COUNT on hot path)
-CREATE TABLE stats (k TEXT PRIMARY KEY, v INTEGER NOT NULL);  -- entities, triples, per-class, per-prop
+-- 2.1.i  Rate-limit buckets (serverless): per-IP token bucket AND the global daily admission budget,
+-- both as keyed fixed-window counters in ONE table (key = 'ip:<addr>:<windowMs>' or 'admit:<YYYY-MM-DD>')
+-- — consumed atomically before any inbox write. (No separate `daily_counter` table — the daily budget
+-- IS an `admit:<day>` row here.)
+CREATE TABLE rate_bucket (key TEXT PRIMARY KEY, window_start BIGINT NOT NULL, count INTEGER NOT NULL DEFAULT 0);
+
+-- 2.1.j  Dataset stats (incremental; VoID/DCAT/health + the TPF cardinality estimate read these —
+-- never a live COUNT on the hot path). Keyed counters maintained by DELTAS in the projection/erasure tx:
+-- 'triples', 'entities', 'p:<predicate-iri>', 'c:<class-iri>'.
+CREATE TABLE stats (k TEXT PRIMARY KEY, v BIGINT NOT NULL DEFAULT 0);
 ```
 
-**Time representation (L1):** every time column is **epoch milliseconds (INTEGER)** — no ISO-8601
+**Time representation (L1):** every time column is **epoch milliseconds** (`BIGINT`) — no ISO-8601
 strings in comparison columns (a `TEXT` ISO compared with `<= :nowMs` silently never/always matches).
+
+**Durable erasure (tombstone-row model):** opt-out / erasure runs in ONE atomic transaction that
+deletes the WebID's `doc` row(s) (and therefore its generated FTS vectors) and `triple` rows, decrements
+the `stats` counters by that WebID's exact contribution, redacts any `inbox` body that named the WebID,
+and inserts the permanent `tombstone` row. The tombstone — not a surviving `doc` row — is the durable
+record that makes the three gates refuse the WebID forever, independent of whether any `doc` row remains
+(DESIGN.md §4.8 H1).
 
 ### 2.2 WebID / URI canonicalisation — the dedup key (corrects C4/H1)
 
@@ -338,7 +375,7 @@ instance before anything builds on it (bead, launch-gate). The robust, driver-ag
 UPDATE doc SET state='claimed', claim_token=:token, claimed_at=:now, attempts=attempts+1
 WHERE state='pending' AND next_eligible_at <= :now
   AND doc_url IN (
-    SELECT d.doc_url FROM doc d JOIN host_state h ON h.host = d.host
+    SELECT d.doc_url FROM doc d JOIN host_politeness h ON h.host = d.host
     WHERE d.state='pending' AND d.next_eligible_at <= :now AND d.depth <= :maxDepth AND d.noindex=0
       AND h.next_allowed_at <= :now
       AND (SELECT COUNT(*) FROM doc c WHERE c.host=d.host AND c.state='claimed') < :perHost
@@ -582,9 +619,11 @@ Two proof paths, no account system: **Path A** Solid-OIDC DPoP token whose `webi
 to an entry (verified via the issuer-agnostic DPoP verifier) → immediate erasure. **Path B**
 challenge-response: `POST {webid}` → `202` + one-time `idx:optOutToken` nonce to publish in the
 upstream profile (or `.well-known/solid-index-optout`); follow-up `POST` → guarded fetch confirms nonce
-→ erase. **Erasure is one transaction over EVERY surface** (H1): delete `webid` + all child tables +
-FTS + `triple` + caches + the `doc` row (incl. `raw_rdf`) + redact `inbox_notification.body`; insert a
-permanent `tombstone` (canonical key) checked at **enqueue, fetch, and projection** (three gates); drop
+→ erase. **Erasure is one transaction over EVERY surface** (H1): delete the `doc` row(s) — which
+removes `raw_rdf` and the generated FTS vectors with it — and the `triple` rows; decrement the `stats`
+counters by that WebID's exact contribution; redact any `inbox` notification body that named the
+WebID/doc URL; insert a permanent `tombstone` (canonical key + doc URL) checked at **enqueue, fetch,
+and projection** (three gates). The tombstone row — not a surviving `doc` row — is the durable record. Drop
 `foaf:knows` edges *to* the tombstoned WebID from served output (projection is the enforcement point);
 serve `/p/{slug}` as `410` + `no-store`; regenerate the (paged) dump tombstone-filtered. Also honour
 **`noindex` at crawl time**: `idx:noIndex true` OR `X-Robots-Tag: noindex` on the profile doc OR
@@ -641,7 +680,7 @@ forever). Per-suggestion subtree node budget (`suggest_budget`). Global **daily 
 gets the rest). Re-suggest of a `done`/`failed`/tombstoned WebID blocked for a 7d cooldown
 (`last_terminal_at`, not just `INSERT OR IGNORE`).
 
-**Politeness race fix (security H3):** the `host_state` row + robots verdict is created/gated at
+**Politeness race fix (security H3):** the `host_politeness` row + robots verdict is created/gated at
 **enqueue** (one per distinct host); per-host concurrency = 1 for the first (robots) fetch then ≤2,
 derived from `COUNT(state='claimed')` (H2); honour `Retry-After`/`429`/`503` by advancing
 `next_allowed_at` (tested invariant); negative-cache SSRF refusals via long backoff (L6).

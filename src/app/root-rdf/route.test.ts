@@ -7,13 +7,13 @@
  * headers, conneg, and HEAD/OPTIONS.
  */
 
-import { PGlite } from "@electric-sql/pglite";
 import { Store as N3Store, Parser } from "n3";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { INDEX_BASE_URL } from "@/lib/config";
 import { DATASET_DESCRIPTION_IRIS } from "@/lib/rdf/datasetDescription";
-import { PgStore, createPgliteExecutor } from "@/lib/store/pgStore";
+import type { PgStore } from "@/lib/store/pgStore";
+import { freshTestStore } from "@/lib/store/testStore";
 
 const RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const DCAT = "http://www.w3.org/ns/dcat#";
@@ -32,9 +32,7 @@ function parseTurtle(ttl: string): Promise<N3Store> {
 }
 
 async function makeTestStore(): Promise<PgStore> {
-  const db = new PGlite();
-  const store = new PgStore(createPgliteExecutor(db));
-  await store.migrate();
+  const { store } = await freshTestStore();
   return store;
 }
 
