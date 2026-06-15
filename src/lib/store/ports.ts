@@ -100,6 +100,13 @@ export interface DocRecord {
   noindex: boolean;
   /** Reserialised canonical Turtle — NOT verbatim bytes (M5). */
   rawRdf: string | null;
+  /**
+   * Extracted display label for the WebID agent (foaf:name / vcard:fn / schema:name),
+   * populated by the crawler projection step.  Null until first crawl or when no
+   * name is present in the profile.  Used as the 'A'-weight FTS input so name
+   * matches rank above raw-RDF URI/predicate hits.
+   */
+  label: string | null;
 }
 
 /**
@@ -120,6 +127,11 @@ export interface SearchResult {
   lastCrawled: number | null;
   /** ts_rank score — higher is better. */
   rank: number;
+  /**
+   * Extracted display label (foaf:name / vcard:fn / schema:name), or null when
+   * the profile carries no name or has not yet been crawled.
+   */
+  label: string | null;
 }
 
 // ─── CrawlCoordinator supporting types ────────────────────────────────────────
