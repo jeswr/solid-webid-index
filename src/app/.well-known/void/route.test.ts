@@ -8,14 +8,14 @@
  * /p/{slug} that the entry route resolves.
  */
 
-import { PGlite } from "@electric-sql/pglite";
 import { Store as N3Store, Parser } from "n3";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { INDEX_BASE_URL } from "@/lib/config";
 import { DATASET_IRI } from "@/lib/rdf/vocab";
-import { PgStore, createPgliteExecutor } from "@/lib/store/pgStore";
+import type { PgStore } from "@/lib/store/pgStore";
 import type { TpfTriple } from "@/lib/store/ports";
+import { freshTestStore } from "@/lib/store/testStore";
 
 const RDF = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const VOID = "http://rdfs.org/ns/void#";
@@ -44,9 +44,7 @@ function trip(s: string, p: string, o: string, oIsIri = true): TpfTriple {
 }
 
 async function makeTestStore(): Promise<PgStore> {
-  const db = new PGlite();
-  const store = new PgStore(createPgliteExecutor(db));
-  await store.migrate();
+  const { store } = await freshTestStore();
   return store;
 }
 

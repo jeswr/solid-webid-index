@@ -9,7 +9,7 @@
 import { NextRequest } from "next/server";
 import { describe, expect, it } from "vitest";
 
-import { middleware } from "./middleware.js";
+import { middleware } from "./middleware";
 
 function reqWithAccept(accept: string | null): NextRequest {
   const headers = new Headers();

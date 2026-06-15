@@ -6,26 +6,24 @@
  * Postgres WASM instance via @electric-sql/pglite.
  */
 
-import { PGlite } from "@electric-sql/pglite";
+import type { PGlite } from "@electric-sql/pglite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { slugForWebId } from "../url/slug.js";
-import {
-  PgStore,
-  createPgliteExecutor,
-  splitSqlStatements,
-} from "./pgStore.js";
-import type { DocRecord, DocState } from "./ports.js";
+import { slugForWebId } from "../url/slug";
+import { PgStore, createPgliteExecutor, splitSqlStatements } from "./pgStore";
+import type { DocRecord, DocState } from "./ports";
+import { freshPgliteDb, freshTestStore } from "./testStore";
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
-/** Create a fresh in-memory PGlite instance and a migrated PgStore for each test. */
+/**
+ * A fresh, fully-migrated PgStore backed by the shared per-worker pglite engine
+ * (schema reset between tests — see testStore.ts).  The migrate()-shape tests
+ * below drive migrate() themselves on a BLANK shared engine via freshPgliteDb()
+ * (no per-test WASM boot).
+ */
 async function makeTestStore(): Promise<{ store: PgStore; db: PGlite }> {
-  const db = new PGlite();
-  const executor = createPgliteExecutor(db);
-  const store = new PgStore(executor);
-  await store.migrate();
-  return { store, db };
+  return freshTestStore();
 }
 
 /** Minimal valid DocRecord factory — callers override only the fields they care about. */
@@ -66,7 +64,7 @@ function makeDoc(
 
 describe("PgStore — migration", () => {
   it("applies schema cleanly on a blank database", async () => {
-    const db = new PGlite();
+    const db = await freshPgliteDb();
     const executor = createPgliteExecutor(db);
     const store = new PgStore(executor);
     // Should not throw
@@ -85,7 +83,7 @@ describe("PgStore — migration", () => {
   // database created before label / label_fts shipped those columns are absent and
   // the CREATE INDEX … (label_fts) would FAIL.  migrate() must ALTER them in first.
   it("migrates label + label_fts onto an OLD-shape doc table (no columns) and creates the index", async () => {
-    const db = new PGlite();
+    const db = await freshPgliteDb();
 
     // Simulate a pre-existing database: a `doc` table WITHOUT label / label_fts.
     // (Minimal old shape — only the columns the new generated expression reads.)
@@ -148,7 +146,7 @@ describe("PgStore — migration", () => {
   });
 
   it("migrate() is idempotent on an OLD-shape table (re-run after ALTER does not error)", async () => {
-    const db = new PGlite();
+    const db = await freshPgliteDb();
     // The pre-label `doc` shape: every column the OTHER indexes reference
     // (host, state, next_eligible_at, last_crawled) plus raw_rdf/fts_vector,
     // but NOT label / label_fts (those shipped later).
@@ -186,7 +184,7 @@ describe("PgStore — migration", () => {
   // because getEntryBySlug reads the empty slug column — a misleading 303→404 chain.
   // migrate() must backfill slug = slugForWebId(webid) so the 303 target 200s.
   it("backfills slug for pre-slug rows (webid set, slug NULL) so /p/{slug} resolves", async () => {
-    const db = new PGlite();
+    const db = await freshPgliteDb();
     const store = new PgStore(createPgliteExecutor(db));
     // First migrate to create the table with the slug column.
     await store.migrate();
@@ -225,7 +223,7 @@ describe("PgStore — migration", () => {
   });
 
   it("slug backfill is idempotent — a third migrate() leaves the slug unchanged", async () => {
-    const db = new PGlite();
+    const db = await freshPgliteDb();
     const store = new PgStore(createPgliteExecutor(db));
     await store.migrate();
 
@@ -642,7 +640,7 @@ describe("PgStore — CrawlCoordinator", () => {
   });
 
   it("claim() — an expired lease row IS reclaimable after LEASE_MS", async () => {
-    const { LEASE_MS } = await import("../config.js");
+    const { LEASE_MS } = await import("../config");
 
     // Use a fresh store+db pair so we can directly backdate claimed_at.
     const { store: freshStore, db: freshDb } = await makeTestStore();
@@ -698,7 +696,7 @@ describe("PgStore — CrawlCoordinator", () => {
     // Scenario: worker-A claims the row (gets a unique UUID tokenA), its lease expires,
     // worker-B reclaims it (gets a DIFFERENT unique UUID tokenB).
     // worker-A's late markDone(tokenA) must NOT clobber worker-B's in-progress state.
-    const { LEASE_MS } = await import("../config.js");
+    const { LEASE_MS } = await import("../config");
     const { store: freshStore, db: freshDb } = await makeTestStore();
 
     await freshStore.enqueue("https://stale-token.example/card");
@@ -754,7 +752,7 @@ describe("PgStore — CrawlCoordinator", () => {
   it("two sequential claims of the same row (after expiry) yield DIFFERENT claim tokens", async () => {
     // This directly tests the uniqueness invariant: even re-claiming the same row
     // with the same workerId must produce a fresh token each time.
-    const { LEASE_MS } = await import("../config.js");
+    const { LEASE_MS } = await import("../config");
     const { store: freshStore, db: freshDb } = await makeTestStore();
 
     await freshStore.enqueue("https://token-uniqueness.example/card");
@@ -788,7 +786,7 @@ describe("PgStore — CrawlCoordinator", () => {
   it("worker-B's markDone(tokenB) succeeds after worker-A's stale markDone(tokenA) no-ops", async () => {
     // Full lifecycle: A claims → lease expires → B reclaims → A's markDone is no-op
     //                → B's markDone succeeds and is visible.
-    const { LEASE_MS } = await import("../config.js");
+    const { LEASE_MS } = await import("../config");
     const { store: freshStore, db: freshDb } = await makeTestStore();
 
     await freshStore.enqueue("https://full-lifecycle.example/card");
@@ -1050,9 +1048,7 @@ describe("roborev fix 1 — no require() in ESM (createNeonExecutor)", () => {
     // Verify the fix: createNeonExecutor must be importable without a ReferenceError
     // on require — if require() were present, the dynamic import would throw in an
     // ESM context.  The factory itself (before any query) must not throw.
-    const { createNeonExecutor: importedFactory } = await import(
-      "./pgStore.js"
-    );
+    const { createNeonExecutor: importedFactory } = await import("./pgStore");
     // Constructing an executor must not invoke require() — it only calls neon()
     // lazily on first query.  We never make a query here, so this is safe.
     expect(() =>
@@ -1160,7 +1156,7 @@ describe("roborev fix 3 — markDone() throws on unknown docUrl", () => {
 
 describe("roborev fix 4 — migrate() multi-statement and idempotency", () => {
   it("migrate() applies schema cleanly via exec() (no manual splitting)", async () => {
-    const db = new PGlite();
+    const db = await freshPgliteDb();
     const executor = createPgliteExecutor(db);
     const store = new PgStore(executor);
     await expect(store.migrate()).resolves.toBeUndefined();
@@ -1172,7 +1168,7 @@ describe("roborev fix 4 — migrate() multi-statement and idempotency", () => {
   });
 
   it("migrate() is idempotent — running it three times does not error", async () => {
-    const db = new PGlite();
+    const db = await freshPgliteDb();
     const executor = createPgliteExecutor(db);
     const store = new PgStore(executor);
     await store.migrate();

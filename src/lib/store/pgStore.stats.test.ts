@@ -11,11 +11,11 @@
  *   - getPredicateCardinality is the O(1) accessor the TPF sibling reads.
  */
 
-import { PGlite } from "@electric-sql/pglite";
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { PgStore, createPgliteExecutor } from "./pgStore.js";
-import type { TpfTriple } from "./ports.js";
+import type { PgStore } from "./pgStore";
+import type { TpfTriple } from "./ports";
+import { freshTestStore } from "./testStore";
 
 const RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const FOAF_PERSON = "http://xmlns.com/foaf/0.1/Person";
@@ -39,9 +39,7 @@ function profileTriples(webid: string, name: string): TpfTriple[] {
 let store: PgStore;
 
 beforeEach(async () => {
-  const db = new PGlite();
-  store = new PgStore(createPgliteExecutor(db));
-  await store.migrate();
+  ({ store } = await freshTestStore());
 });
 
 describe("PgStore stats — incremental maintenance", () => {
@@ -288,9 +286,7 @@ describe("PgStore stats — backfill on migrate (roborev)", () => {
   it("re-projects existing served rows lacking triples into triple + stats", async () => {
     // Simulate a pre-triple-table database: a served `done` row with raw_rdf but NO
     // materialised triples (as if it was crawled before the triple/stats tables shipped).
-    const db = new PGlite();
-    const s = new PgStore(createPgliteExecutor(db));
-    await s.migrate();
+    const { store: s, db } = await freshTestStore();
 
     const webid = "https://carol.example/card#me";
     const docUrl = "https://carol.example/card";

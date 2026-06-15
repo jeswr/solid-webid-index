@@ -14,13 +14,14 @@
  *  - the Path B nonce is single-use + has a 24h TTL.
  */
 
-import { PGlite } from "@electric-sql/pglite";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type { PGlite } from "@electric-sql/pglite";
+import { beforeEach, describe, expect, it } from "vitest";
 
-import { slugForWebId } from "../url/slug.js";
-import { PgStore, createPgliteExecutor } from "./pgStore.js";
-import type { SqlExecutor } from "./pgStore.js";
-import type { TpfTriple } from "./ports.js";
+import { slugForWebId } from "../url/slug";
+import { PgStore, createPgliteExecutor } from "./pgStore";
+import type { SqlExecutor } from "./pgStore";
+import type { TpfTriple } from "./ports";
+import { freshTestStore } from "./testStore";
 
 const RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const FOAF_KNOWS = "http://xmlns.com/foaf/0.1/knows";
@@ -33,10 +34,7 @@ const BOB = "https://bob.example/card#me";
 const BOB_DOC = "https://bob.example/card";
 
 async function makeTestStore(): Promise<{ store: PgStore; db: PGlite }> {
-  const db = new PGlite();
-  const store = new PgStore(createPgliteExecutor(db));
-  await store.migrate();
-  return { store, db };
+  return freshTestStore();
 }
 
 /** Project a profile into the served surfaces (doc row + triple table + stats) like the crawler. */
@@ -75,9 +73,8 @@ let db: PGlite;
 beforeEach(async () => {
   ({ store, db } = await makeTestStore());
 });
-afterEach(async () => {
-  await db.close();
-});
+// No afterEach db.close(): the shared per-worker pglite engine is reset (schema-dropped) on the next
+// makeTestStore() call (testStore.ts), so closing it here would break every subsequent test.
 
 // ─── Erasure completeness ────────────────────────────────────────────────────
 

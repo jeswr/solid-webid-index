@@ -13,12 +13,12 @@
  *  - a fan-out bomb is BOUNDED (the suggestion seeds a SHARED suggest_budget, not per-child);
  *  - tombstoned → 409; rate-limit → 429; body-too-large → 413; bad type → 415; no object → 422.
  */
-import { PGlite } from "@electric-sql/pglite";
 import { Store as N3Store, Parser } from "n3";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { INDEX_BASE_URL } from "@/lib/config";
-import { PgStore, createPgliteExecutor } from "@/lib/store/pgStore";
+import type { PgStore } from "@/lib/store/pgStore";
+import { freshTestStore } from "@/lib/store/testStore";
 
 // ─── Mocks (hoisted) ───────────────────────────────────────────────────────────
 
@@ -92,10 +92,8 @@ function postReq(
 }
 
 async function freshStore(): Promise<PgStore> {
-  const db = new PGlite();
-  const s = new PgStore(createPgliteExecutor(db));
-  await s.migrate();
-  return s;
+  const { store } = await freshTestStore();
+  return store;
 }
 
 // ─── Suite ──────────────────────────────────────────────────────────────────────

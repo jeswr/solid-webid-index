@@ -3,11 +3,11 @@
  * route.test.ts — /lookup?webid= → 303 to /p/{slug} (DESIGN.md §4.1).
  */
 
-import { PGlite } from "@electric-sql/pglite";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { INDEX_BASE_URL } from "@/lib/config";
-import { PgStore, createPgliteExecutor } from "@/lib/store/pgStore";
+import type { PgStore } from "@/lib/store/pgStore";
+import { freshTestStore } from "@/lib/store/testStore";
 import { slugForWebId } from "@/lib/url/slug";
 
 let _mockStore: PgStore | null = null;
@@ -28,9 +28,7 @@ const WEBID = "https://alice.pod/card#me";
 const DOC_URL = "https://alice.pod/card";
 
 async function makeStore(): Promise<PgStore> {
-  const db = new PGlite();
-  const store = new PgStore(createPgliteExecutor(db));
-  await store.migrate();
+  const { store } = await freshTestStore();
   return store;
 }
 

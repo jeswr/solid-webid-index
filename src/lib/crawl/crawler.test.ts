@@ -11,11 +11,12 @@
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { PGlite } from "@electric-sql/pglite";
+import type { PGlite } from "@electric-sql/pglite";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
-import { PgStore, createPgliteExecutor } from "../store/pgStore.js";
-import { type CrawlStore, runCrawlBatch } from "./crawler.js";
+import type { PgStore } from "../store/pgStore";
+import { freshTestStore } from "../store/testStore";
+import { type CrawlStore, runCrawlBatch } from "./crawler";
 
 // ───────────────────────── Fixture WebID server (127.0.0.1) ─────────────────────────
 
@@ -141,10 +142,7 @@ function webIdOf(path: string): string {
 // ───────────────────────── Store helper ─────────────────────────
 
 async function makeStore(): Promise<{ store: PgStore; db: PGlite }> {
-  const db = new PGlite();
-  const store = new PgStore(createPgliteExecutor(db));
-  await store.migrate();
-  return { store, db };
+  return freshTestStore();
 }
 
 /** Drive runCrawlBatch repeatedly until the frontier drains (or a safety cap), accumulating totals.

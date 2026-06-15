@@ -15,7 +15,7 @@ import {
   classEntityContribution,
   classKey,
   propertyKey,
-} from "./stats.js";
+} from "./stats";
 
 const RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const FOAF_PERSON = "http://xmlns.com/foaf/0.1/Person";

@@ -12,10 +12,10 @@
  * Uses pglite — no network.
  */
 
-import { PGlite } from "@electric-sql/pglite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { TpfTriple } from "./ports.js";
+import type { TpfTriple } from "./ports";
+import { freshPgliteDb } from "./testStore";
 
 const RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const FOAF_KNOWS = "http://xmlns.com/foaf/0.1/knows";
@@ -31,24 +31,24 @@ const CAP = 5;
 const SUPPRESSED_EDGES = 17; // > CAP
 
 describe("served TPF suppresses ALL inbound edges to an erased WebID, even past the estimate cap", () => {
-  let store: import("./pgStore.js").PgStore;
-  let db: PGlite;
+  let store: import("./pgStore").PgStore;
 
   beforeEach(async () => {
     // Force a LOW cap, then (re)import config + the store so the module-load const picks it up.
+    // freshPgliteDb is bound at top-of-file (before resetModules), so it keeps using the shared engine.
     vi.resetModules();
     vi.stubEnv("TPF_ESTIMATE_COUNT_CAP", String(CAP));
-    const { TPF_ESTIMATE_COUNT_CAP } = await import("../config.js");
+    const { TPF_ESTIMATE_COUNT_CAP } = await import("../config");
     expect(TPF_ESTIMATE_COUNT_CAP).toBe(CAP); // guard: the low cap is actually in effect
 
-    const { PgStore, createPgliteExecutor } = await import("./pgStore.js");
-    db = new PGlite();
+    const { PgStore, createPgliteExecutor } = await import("./pgStore");
+    const db = await freshPgliteDb();
     store = new PgStore(createPgliteExecutor(db));
     await store.migrate();
   });
 
-  afterEach(async () => {
-    await db.close();
+  afterEach(() => {
+    // No db.close() — the shared per-worker engine is reset on the next freshPgliteDb() call.
     vi.unstubAllEnvs();
     vi.resetModules();
   });
