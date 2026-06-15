@@ -10,17 +10,22 @@
  *  - Internal self-chain bearer accepted (same CRON_SECRET bearer for self-chain)
  *  - timingSafeEqual is used (constant-time comparison is enforced)
  *  - runCrawlBatch is invoked and its summary is returned
- *  - Self-chain triggers when remaining = true AND depth < CRAWL_JOB_MAX_CHAIN_DEPTH
- *  - Self-chain does NOT trigger when remaining = false
+ *  - Self-chain triggers when remaining = true AND depth < CRAWL_JOB_MAX_CHAIN_DEPTH:
+ *      - after() is invoked (not a bare void promise) so the platform keeps the function alive
+ *      - the scheduled promise is a fetch to /api/_jobs/crawl with depth+1
+ *  - Self-chain does NOT trigger (after() not called) when remaining = false
  *  - Self-chain does NOT trigger when depth >= CRAWL_JOB_MAX_CHAIN_DEPTH (loop guard)
  *  - Chain cap halts further self-chaining
  *
- * All tests run without a real database or network: runCrawlBatch and fetch are mocked.
+ * All tests run without a real database or network: runCrawlBatch, fetch, and after() are mocked.
  *
  * VITEST NOTE: vi.mock() factories are hoisted to the top of the file.
  * To avoid closure timing issues, the factory functions below use `vi.fn(impl)` (not
  * `vi.fn().mockImplementation(impl)`), and the crawlSummary object is mutated in-place
  * between tests (the function closes over the reference, not a snapshot).
+ *
+ * after() mock strategy: we mock `next/server` to capture the task passed to `after()`.
+ * The mock immediately awaits it so we can synchronously verify the downstream fetch.
  */
 import { timingSafeEqual } from "node:crypto";
 import { NextRequest } from "next/server";
@@ -38,8 +43,6 @@ import { CRAWL_JOB_MAX_CHAIN_DEPTH } from "@/lib/config";
 
 // ─── Module mocks ─────────────────────────────────────────────────────────────
 // vi.mock() is hoisted by vitest's transform — these run before any imports.
-// The crawler mock closes over `crawlSummary` by reference so per-test mutations
-// to crawlSummary.remaining are reflected in each call.
 
 // Crawl summary — mutated per-test by setting `.remaining`.
 const crawlSummary = {
@@ -53,8 +56,6 @@ const crawlSummary = {
 
 // Mock pgStore so no Neon connection is attempted.
 vi.mock("@/lib/store/pgStore", () => ({
-  // Use vi.fn(function...) (not mockImplementation) so vitest does not emit the
-  // "did not use function or class" constructor warning.
   PgStore: vi.fn(function PgStoreMock() {
     return {};
   }),
@@ -65,6 +66,25 @@ vi.mock("@/lib/store/pgStore", () => ({
 vi.mock("@/lib/crawl/crawler", () => ({
   runCrawlBatch: vi.fn(async () => ({ ...crawlSummary })),
 }));
+
+// Mock next/server — preserve NextRequest/NextResponse and capture after() calls.
+// afterMock is declared via vi.hoisted() so it is available inside the vi.mock() factory
+// (which is hoisted to before any import statements by vitest's transform).
+// The after() mock immediately invokes the task (a Promise) so we can assert on the
+// downstream fetch without asynchronous timing tricks.
+const { afterMock } = vi.hoisted(() => ({
+  afterMock: vi.fn(async (task: Promise<unknown>) => {
+    await task;
+  }),
+}));
+
+vi.mock("next/server", async (importOriginal) => {
+  const original = await importOriginal<typeof import("next/server")>();
+  return {
+    ...original,
+    after: afterMock,
+  };
+});
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -110,6 +130,8 @@ describe("/api/_jobs/crawl route", () => {
         headers: { "content-type": "application/json" },
       })
     );
+    // Reset after() mock call history.
+    afterMock.mockClear();
   });
 
   afterEach(() => {
@@ -172,14 +194,15 @@ describe("/api/_jobs/crawl route", () => {
     expect(body.summary.claimed).toBe(8);
   });
 
-  // ── Self-chain: triggers when remaining = true AND depth < max ─────────────
+  // ── Self-chain: after() is called (not a bare void) when remaining = true ──
 
-  it("triggers self-chain when remaining=true and depth < max", async () => {
+  it("schedules self-chain via after() when remaining=true and depth < max", async () => {
     crawlSummary.remaining = true;
     const { POST } = await import("./route");
     await POST(makeReq({ secret: GOOD_SECRET, depth: 0 }));
-    // Give the fire-and-forget void-promise a tick to execute.
-    await new Promise((r) => setImmediate(r));
+    // after() should have been called once with the self-chain promise.
+    expect(afterMock).toHaveBeenCalledOnce();
+    // The afterMock immediately awaits the task, so fetch should already have been called.
     expect(fetchMock).toHaveBeenCalledOnce();
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toMatch(/\/api\/_jobs\/crawl$/);
@@ -189,13 +212,42 @@ describe("/api/_jobs/crawl route", () => {
     );
   });
 
+  it("after() receives a Promise (the crawl is deferred to after(), not fetched inline)", async () => {
+    // The route must schedule the self-chain via after(promise), not by calling fetch directly
+    // and discarding the result.  We verify this by making after() NOT await the task and
+    // confirming the route can still return even if the task is never resolved.
+    crawlSummary.remaining = true;
+
+    // Override after() so it does NOT await the task — simulates the platform keeping the
+    // function alive after the HTTP response is sent.
+    afterMock.mockImplementation(async (_task: Promise<unknown>) => {
+      // Deliberately do not await — the task runs asynchronously.
+    });
+
+    // Fetch never resolves (simulates a long-running follow-on crawl).
+    fetchMock.mockReturnValue(new Promise<Response>(() => {}));
+
+    const { POST } = await import("./route");
+    // POST must resolve even though the crawl promise never resolves, because the route
+    // hands the promise to after() and returns immediately without awaiting it.
+    const res = await POST(makeReq({ secret: GOOD_SECRET, depth: 0 }));
+
+    expect(res.status).toBe(200);
+    // after() was invoked with the chain promise.
+    expect(afterMock).toHaveBeenCalledOnce();
+    // fetch was NOT directly awaited by the route (it was deferred via after()).
+    // The fetch mock was called because after() received the promise (which started fetch),
+    // but the route did not block on it.
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
   // ── Self-chain: does NOT trigger when remaining = false ────────────────────
 
-  it("does NOT trigger self-chain when remaining=false", async () => {
+  it("does NOT trigger self-chain (after not called) when remaining=false", async () => {
     crawlSummary.remaining = false;
     const { POST } = await import("./route");
     await POST(makeReq({ secret: GOOD_SECRET }));
-    await new Promise((r) => setImmediate(r));
+    expect(afterMock).not.toHaveBeenCalled();
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -208,7 +260,7 @@ describe("/api/_jobs/crawl route", () => {
     await POST(
       makeReq({ secret: GOOD_SECRET, depth: CRAWL_JOB_MAX_CHAIN_DEPTH })
     );
-    await new Promise((r) => setImmediate(r));
+    expect(afterMock).not.toHaveBeenCalled();
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -218,7 +270,7 @@ describe("/api/_jobs/crawl route", () => {
     await POST(
       makeReq({ secret: GOOD_SECRET, depth: CRAWL_JOB_MAX_CHAIN_DEPTH + 1 })
     );
-    await new Promise((r) => setImmediate(r));
+    expect(afterMock).not.toHaveBeenCalled();
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -233,8 +285,8 @@ describe("/api/_jobs/crawl route", () => {
         makeReq({ secret: GOOD_SECRET, depth: CRAWL_JOB_MAX_CHAIN_DEPTH })
       );
     }
-    await new Promise((r) => setImmediate(r));
     // No self-chain should have been attempted at the max depth.
+    expect(afterMock).not.toHaveBeenCalled();
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });

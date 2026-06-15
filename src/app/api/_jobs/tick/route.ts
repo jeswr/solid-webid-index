@@ -10,9 +10,18 @@
  * (Vercel Cron Authentication — the secret is injected into the deployment at build time).
  * We verify it here with constant-time compare; an invalid or missing secret → 401.
  *
- * After auth, this handler triggers a crawl batch by POSTing to /api/_jobs/crawl on the
- * same deployment.  The crawl route handles self-chaining from there.  This tick is the
+ * After auth, this handler schedules a crawl batch via Next.js `after()` and returns 202
+ * Accepted immediately.  The crawl route handles self-chaining from there.  This tick is the
  * daily floor (DESIGN.md §3.5 "Vercel Cron (Hobby = once/day floor)").
+ *
+ * IMPORTANT — prompt return via `after()`.
+ *   The previous design awaited the full crawl-batch response before returning, which meant
+ *   the cron HTTP request could time out if the crawl budget ran long.  Instead we now:
+ *   1. Verify auth.
+ *   2. Schedule the crawl POST via `after()` so the platform keeps the function alive.
+ *   3. Return 202 Accepted immediately — the cron caller gets a fast, reliable response.
+ *   `after()` is the platform-correct mechanism: Vercel honours it via waitUntil, so the
+ *   crawl fires reliably even though the HTTP response has already been sent.
  *
  * Runtime: nodejs (load-bearing — uses Node crypto for constant-time compare; boot assertion
  * enforces this so the route fails closed on misconfiguration).
@@ -32,7 +41,7 @@ if (
 }
 
 import { timingSafeEqual } from "node:crypto";
-import { type NextRequest, NextResponse } from "next/server";
+import { type NextRequest, NextResponse, after } from "next/server";
 
 import { CRON_SECRET_ENV, INDEX_BASE_URL, getCronSecret } from "@/lib/config";
 
@@ -58,6 +67,34 @@ function verifyBearer(req: NextRequest, secret: string): boolean {
   }
 }
 
+// ─── Crawl trigger ────────────────────────────────────────────────────────────
+
+/**
+ * POST to /api/_jobs/crawl on the same deployment to kick off a crawl batch.
+ *
+ * This is an internal trusted call (own deployment URL over HTTPS — not attacker-influenced).
+ * The allowlist in scripts/check-no-raw-fetch.mjs permits this file to call `fetch(` for
+ * exactly this internal tick→crawl relay use.
+ */
+async function fireCrawl(secret: string, baseUrl: string): Promise<void> {
+  const crawlUrl = `${baseUrl}/api/_jobs/crawl`;
+  try {
+    // internal tick→crawl relay: trusted call to own deployment URL
+    await fetch(crawlUrl, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${secret}`,
+        "x-chain-depth": "0",
+        "content-type": "application/json",
+      },
+      body: "{}",
+    });
+  } catch {
+    // after() is fire-and-forget relative to the cron caller; the daily cron is the
+    // fallback if this invocation fails (DESIGN.md §3.5).
+  }
+}
+
 // ─── Route handler ────────────────────────────────────────────────────────────
 
 export async function GET(req: NextRequest): Promise<NextResponse> {
@@ -76,42 +113,19 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     return new NextResponse(null, { status: 401 });
   }
 
-  // ── Trigger a crawl batch by calling the crawl route ──
+  // ── Schedule crawl via after() and return promptly ──
+  //
+  // We do NOT await the crawl here.  Awaiting the full crawl-batch response would block
+  // the cron HTTP connection for the entire crawl budget and risk a timeout.  Instead:
+  //  - `after()` registers the crawl POST with the platform's waitUntil mechanism so the
+  //    function is kept alive until the crawl completes even after the HTTP response is sent.
+  //  - We return 202 Accepted immediately so the Vercel Cron scheduler gets a fast response.
   const baseUrl =
     process.env.VERCEL_URL != null
       ? `https://${process.env.VERCEL_URL}`
       : INDEX_BASE_URL;
-  const crawlUrl = `${baseUrl}/api/_jobs/crawl`;
 
-  let crawlStatus: number;
-  let crawlBody: unknown;
-  try {
-    // internal tick→crawl relay: trusted call to own deployment URL
-    const res = await fetch(crawlUrl, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${secret}`,
-        "x-chain-depth": "0",
-        "content-type": "application/json",
-      },
-      body: "{}",
-    });
-    crawlStatus = res.status;
-    crawlBody = await res.json().catch(() => null);
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    return NextResponse.json(
-      { ok: false, error: `crawl relay failed: ${message}` },
-      { status: 502 }
-    );
-  }
+  after(fireCrawl(secret, baseUrl));
 
-  if (crawlStatus !== 200) {
-    return NextResponse.json(
-      { ok: false, crawlStatus, crawlBody },
-      { status: 502 }
-    );
-  }
-
-  return NextResponse.json({ ok: true, crawlStatus, crawlBody });
+  return NextResponse.json({ ok: true, scheduled: true }, { status: 202 });
 }

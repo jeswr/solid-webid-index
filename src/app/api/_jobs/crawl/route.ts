@@ -16,11 +16,17 @@
  *
  * Self-chaining (DESIGN.md §3.5):
  *   When the batch summary signals `remaining === true` AND the current chain depth is below
- *   `CRAWL_JOB_MAX_CHAIN_DEPTH`, this handler fires a fire-and-forget fetch to itself before
- *   returning, passing `X-Chain-Depth: N+1`.  This drains the frontier across invocations
- *   without requiring QStash (which is the simplified scheduling model — see DECISION ADDENDUM
- *   2026-06-14 in docs/DESIGN.md).  The daily Vercel Cron (→ /api/_jobs/tick) resets the
- *   chain.
+ *   `CRAWL_JOB_MAX_CHAIN_DEPTH`, this handler schedules a follow-on fetch to itself via
+ *   Next.js `after()` before returning, passing `X-Chain-Depth: N+1`.  This drains the
+ *   frontier across invocations without requiring QStash (which is the simplified scheduling
+ *   model — see DECISION ADDENDUM 2026-06-14 in docs/DESIGN.md).  The daily Vercel Cron
+ *   (→ /api/_jobs/tick) resets the chain.
+ *
+ *   IMPORTANT — `after()` is the platform-correct mechanism here (not a bare `void` call).
+ *   Vercel (and compatible runtimes) honour `after()` / `waitUntil` so the serverless
+ *   function is kept alive until the scheduled callback completes.  A bare `void` promise
+ *   would be eligible for cancellation the moment the HTTP response is flushed, meaning the
+ *   frontier could silently stall after the first batch.
  *
  * Runtime: nodejs (load-bearing — guardedFetch requires Node DNS; boot assertion enforces this).
  */
@@ -39,7 +45,7 @@ if (
 }
 
 import { timingSafeEqual } from "node:crypto";
-import { type NextRequest, NextResponse } from "next/server";
+import { type NextRequest, NextResponse, after } from "next/server";
 
 import {
   CRAWL_JOB_MAX_CHAIN_DEPTH,
@@ -176,9 +182,12 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
       process.env.VERCEL_URL != null
         ? `https://${process.env.VERCEL_URL}`
         : INDEX_BASE_URL;
-    // Fire-and-forget: do not await — return the summary to the caller without waiting for the
-    // next invocation to start.
-    void triggerSelfChain(secret, depth + 1, baseUrl);
+    // Schedule the follow-on crawl via next/server `after()`.
+    // `after()` registers work with the platform's waitUntil mechanism so the serverless
+    // function is kept alive until the callback completes even after the HTTP response is
+    // sent.  A bare `void` promise would be eligible for cancellation the moment the
+    // response is flushed, causing the frontier to stall silently after the first batch.
+    after(triggerSelfChain(secret, depth + 1, baseUrl));
   }
 
   return NextResponse.json({ ok: true, chainDepth: depth, summary });
