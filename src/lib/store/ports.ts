@@ -366,6 +366,118 @@ export interface HostState {
   consecutiveErrors: number;
 }
 
+// ─── SuggestInboxStore ──────────────────────────────────────────────────────
+
+/**
+ * The dedup/cooldown status of a suggestion candidate, decided WITHOUT any network I/O
+ * (DESIGN.md §4.3 step 5):
+ *  - `unknown`     — never seen → admit + enqueue (→ 201).
+ *  - `live`        — already indexed & non-tombstoned (state='done') → 200 (no re-enqueue).
+ *  - `tombstoned`  — opted-out / erased → 409 (never re-crawl).
+ *  - `cooldown`    — terminal (done/failed/skipped/blocked) within RESUGGEST_COOLDOWN_MS → 200/skip
+ *                    (a freshly-terminal WebID cannot be re-suggested to drive churn).
+ */
+export type SuggestionStatus = "unknown" | "live" | "tombstoned" | "cooldown";
+
+/** One stored inbox notification (the served `as:Activity` member). */
+export interface InboxNotificationRecord {
+  /** ULID id — `$ORIGIN/inbox/{id}`. */
+  id: string;
+  /** epoch ms received. */
+  receivedAt: number;
+  /** The actor IRI (provenance), or null. */
+  actor: string | null;
+  /** The AS2 activity type IRI (as:Announce / as:Offer / as:Add). */
+  activity: string;
+  /** The canonical re-serialised body (Turtle). Redacted to '' on erasure. */
+  body: string;
+  /** True once the notification's candidate was enqueued/processed. */
+  processed: boolean;
+}
+
+/** Input to {@link SuggestInboxStore.recordNotification}. */
+export interface RecordNotificationInput {
+  id: string;
+  receivedAt: number;
+  actor: string | null;
+  activity: string;
+  body: string;
+  /** The extracted `as:object` candidate IRIs (≥1, ≤10) — persisted to the child table. */
+  objectIris: string[];
+  /**
+   * Whether this notification's candidates were enqueued at receipt time.
+   *  - `true`  (default) — at least one candidate was admitted + enqueued immediately.
+   *  - `false`           — admission was DEFERRED (daily admission budget exhausted): the candidates
+   *                        are persisted but NOT enqueued, so the daily drain (the cron) can pick the
+   *                        notification up later. Matches the `processed` column semantics.
+   */
+  processed?: boolean;
+}
+
+/**
+ * SuggestInboxStore — the LDN suggest-inbox persistence + anti-amplification budgets.
+ *
+ * OWNED by the suggest-inbox bead (pss-917): additive to schema.sql / pgStore.ts so a union-merge
+ * with the concurrent VoID/TPF beads is clean. Never touches the stats table or the TPF surfaces.
+ *
+ * Every admission control here is consumed ATOMICALLY (a single SQL statement) so concurrent
+ * serverless invocations cannot over-admit — the route calls them BEFORE any write.
+ */
+export interface SuggestInboxStore {
+  /**
+   * Classify a CANONICAL suggestion candidate without network I/O (DESIGN.md §4.3 step 5):
+   * unknown / live / tombstoned / cooldown. `nowMs` + `cooldownMs` decide the cooldown window.
+   *
+   * Both the WebID (with #fragment) and the doc URL (fragment-stripped) are checked so an opted-out
+   * person cannot reappear under a variant key (DESIGN.md §2.2 L5).
+   */
+  suggestionStatus(opts: {
+    webid: string;
+    docUrl: string;
+    nowMs: number;
+    cooldownMs: number;
+  }): Promise<SuggestionStatus>;
+
+  /**
+   * Atomically consume one slot from a fixed-window rate bucket.
+   *
+   * Resets the window (count→1) when `nowMs` is past `window_start + windowMs`, else increments. The
+   * UPSERT is one statement so concurrent callers cannot exceed `limit`. Returns true when a slot
+   * was granted (count ≤ limit after the increment), false when the limit is already reached.
+   *
+   * @param key      Bucket key (e.g. `ip:<addr>` or `admit:<day>`).
+   * @param limit    Max slots per window.
+   * @param windowMs Window length in ms.
+   * @param nowMs    Current epoch ms.
+   */
+  consumeRateBucket(opts: {
+    key: string;
+    limit: number;
+    windowMs: number;
+    nowMs: number;
+  }): Promise<boolean>;
+
+  /** Persist a notification + its extracted candidate objects (one transaction). */
+  recordNotification(input: RecordNotificationInput): Promise<void>;
+
+  /** Fetch a single notification by id (for `GET /inbox/{id}`); null when unknown. */
+  getNotification(id: string): Promise<InboxNotificationRecord | null>;
+
+  /**
+   * List notifications newest-first, keyset-paginated by `(received_at DESC, id DESC)`.
+   * Returns one extra row internally to compute `hasMore`. `cursor` is opaque (encodes the last
+   * `(received_at, id)` of the previous page).
+   */
+  listNotifications(opts: {
+    limit: number;
+    cursor?: string;
+  }): Promise<{
+    rows: InboxNotificationRecord[];
+    nextCursor: string | null;
+    total: number;
+  }>;
+}
+
 /**
  * PolitenessStore — per-host rate limiting for the crawler.
  *

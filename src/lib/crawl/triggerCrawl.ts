@@ -17,7 +17,7 @@
  * for exactly this internal use (not an attacker-influenced URL).
  */
 
-import { INDEX_BASE_URL, getCronSecret } from "../config.js";
+import { INDEX_BASE_URL, getCronSecret } from "@/lib/config";
 
 /**
  * Fire a bounded immediate crawl against the current deployment.

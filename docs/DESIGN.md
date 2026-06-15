@@ -512,8 +512,9 @@ existing WebID"); `as:Offer`/`as:Add` accepted leniently (sw L1). Algorithm:
 5. Canonicalise + dedup: known&live → `200` + `Link rel="related"`; tombstoned → `409`; rate-limit
    exceeded → `429` + `Retry-After`.
 6. New&valid: persist notification at `/inbox/{ulid}` (honour `Slug`), `enqueue` (budget-gated — C2/M4),
-   publish **one** QStash kick (fire-and-forget; **no inline `waitUntil` crawl** — arch M2). Respond
-   `201` + `Location` (LDN MUST) — or `202` in async mode.
+   schedule **one** crawl kick via Next.js `after(() => triggerCrawl())` (fire-and-forget; NOT QStash
+   per the DECISION ADDENDUM — `after()` keeps the function alive until the kick fires after the
+   response; **no blocking inline crawl** — arch M2). Respond `201` + `Location` (LDN MUST).
 
 | Outcome | Status |
 |---|---|

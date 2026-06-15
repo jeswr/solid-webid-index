@@ -27,10 +27,14 @@ import type {
   DocState,
   FailClass,
   HostState,
+  InboxNotificationRecord,
   PolitenessStore,
   ReadStore,
+  RecordNotificationInput,
   SearchIndex,
   SearchResult,
+  SuggestInboxStore,
+  SuggestionStatus,
 } from "./ports.js";
 
 // ─── SqlExecutor interface ────────────────────────────────────────────────────
@@ -207,7 +211,12 @@ function rowToRecord(r: DocRow): DocRecord {
  * Instantiate via makeStore() in production or directly with a pglite executor in tests.
  */
 export class PgStore
-  implements ReadStore, SearchIndex, CrawlCoordinator, PolitenessStore
+  implements
+    ReadStore,
+    SearchIndex,
+    CrawlCoordinator,
+    PolitenessStore,
+    SuggestInboxStore
 {
   constructor(private readonly db: SqlExecutor) {}
 
@@ -458,15 +467,17 @@ export class PgStore
   }
 
   async tombstone(docUrl: string): Promise<void> {
+    const now = Date.now();
     await this.db.query(
       `INSERT INTO doc (
-         doc_url, host, state, source, enqueued_at
-       ) VALUES ($1, '', 'tombstone', 'seed', $2)
+         doc_url, host, state, source, enqueued_at, terminal_at
+       ) VALUES ($1, '', 'tombstone', 'seed', $2, $2)
        ON CONFLICT (doc_url) DO UPDATE SET
          state = 'tombstone',
          claim_token = NULL,
-         raw_rdf = NULL`,
-      [docUrl, Date.now()]
+         raw_rdf = NULL,
+         terminal_at = $2`,
+      [docUrl, now]
     );
   }
 
@@ -773,6 +784,20 @@ export class PgStore
     // existing slug when no webid is supplied — the slug is set the first time the
     // webid is known and never silently cleared on a validator-only re-crawl.
     const slug = result.webid ? slugForWebId(result.webid) : null;
+    // Stamp terminal_at when the row enters a terminal/tombstoned state — this drives the suggest-
+    // inbox 7-day re-suggest cooldown (DESIGN.md §4.3/§5). Non-terminal states (e.g. a re-pend back
+    // to 'pending') leave the prior terminal_at intact via COALESCE. The crawler does not need to
+    // know about this column — markDone derives it from the target state.
+    const TERMINAL_STATES = [
+      "done",
+      "failed",
+      "skipped",
+      "blocked",
+      "tombstone",
+    ];
+    const terminalAt = TERMINAL_STATES.includes(result.state)
+      ? Date.now()
+      : null;
     if (claimToken != null) {
       await this.db.query<{ doc_url: string }>(
         `UPDATE doc SET
@@ -789,6 +814,7 @@ export class PgStore
            error            = $11,
            next_eligible_at = $12,
            last_crawled     = $13,
+           terminal_at      = COALESCE($16, terminal_at),
            claim_token      = NULL,
            claimed_at       = NULL
          WHERE doc_url = $1
@@ -810,6 +836,7 @@ export class PgStore
           Date.now(),
           claimToken,
           slug,
+          terminalAt,
         ]
       );
       // 0 rows updated = stale completion (token mismatch — row reclaimed by another
@@ -834,6 +861,7 @@ export class PgStore
          error            = $11,
          next_eligible_at = $12,
          last_crawled     = $13,
+         terminal_at      = COALESCE($15, terminal_at),
          claim_token      = NULL,
          claimed_at       = NULL
        WHERE doc_url = $1
@@ -853,6 +881,7 @@ export class PgStore
         result.nextEligibleAt ?? Date.now() + 14 * 24 * 60 * 60 * 1000,
         Date.now(),
         slug,
+        terminalAt,
       ]
     );
 
@@ -934,6 +963,187 @@ export class PgStore
          consecutive_errors = EXCLUDED.consecutive_errors`,
       [host, nextAllowedAt, consecutiveErrors]
     );
+  }
+
+  // ─── SuggestInboxStore ───────────────────────────────────────────────────────
+
+  async suggestionStatus(opts: {
+    webid: string;
+    docUrl: string;
+    nowMs: number;
+    cooldownMs: number;
+  }): Promise<SuggestionStatus> {
+    const { webid, docUrl, nowMs, cooldownMs } = opts;
+    // Match on EITHER the canonical WebID (with #fragment) OR the canonical doc URL (stripped) so a
+    // variant key cannot dodge a tombstone/cooldown (DESIGN.md §2.2 L5). Order the result so the most
+    // restrictive matching row wins: tombstone first, then a within-cooldown terminal row.
+    const rows = await this.db.query<{
+      state: string;
+      terminal_at: string | null;
+    }>(
+      `SELECT state, terminal_at FROM doc
+        WHERE doc_url = $1 OR webid = $2`,
+      [docUrl, webid]
+    );
+    if (rows.length === 0) return "unknown";
+
+    let sawLive = false;
+    for (const r of rows) {
+      if (r.state === "tombstone") return "tombstoned"; // most restrictive — short-circuit
+      if (r.state === "done") sawLive = true;
+      const terminalStates = ["done", "failed", "skipped", "blocked"];
+      if (
+        terminalStates.includes(r.state) &&
+        r.terminal_at != null &&
+        nowMs - Number(r.terminal_at) < cooldownMs
+      ) {
+        // A freshly-terminal WebID: still within the re-suggest cooldown.
+        return "cooldown";
+      }
+    }
+    if (sawLive) return "live";
+    // Known but pending/claimed (in-flight) → treat as live for dedup (don't re-enqueue).
+    return "live";
+  }
+
+  async consumeRateBucket(opts: {
+    key: string;
+    limit: number;
+    windowMs: number;
+    nowMs: number;
+  }): Promise<boolean> {
+    const { key, limit, windowMs, nowMs } = opts;
+    // Atomic fixed-window UPSERT:
+    //  - insert a fresh bucket (count=1) when the key is new;
+    //  - on conflict, RESET (window_start→now, count→1) when the stored window has expired, else
+    //    INCREMENT count.  All in one statement so concurrent invocations can't over-admit.
+    // The returned (window_start, count) reflects the post-update row; we grant iff count <= limit.
+    const rows = await this.db.query<{ count: number | string }>(
+      `INSERT INTO rate_bucket (key, window_start, count)
+         VALUES ($1, $2, 1)
+       ON CONFLICT (key) DO UPDATE SET
+         window_start = CASE
+                          WHEN rate_bucket.window_start + $3 <= $2 THEN $2
+                          ELSE rate_bucket.window_start
+                        END,
+         count        = CASE
+                          WHEN rate_bucket.window_start + $3 <= $2 THEN 1
+                          ELSE rate_bucket.count + 1
+                        END
+       RETURNING count`,
+      [key, nowMs, windowMs]
+    );
+    const count = rows[0] ? Number(rows[0].count) : limit + 1;
+    return count <= limit;
+  }
+
+  async recordNotification(input: RecordNotificationInput): Promise<void> {
+    const { id, receivedAt, actor, activity, body, objectIris } = input;
+    // `processed` defaults to TRUE (candidates enqueued at receipt). It is set FALSE when admission
+    // was DEFERRED (daily budget exhausted) so the daily drain can pick the notification up later.
+    const processed = input.processed ?? true;
+    // Insert the notification, then its extracted candidate objects. ON CONFLICT DO NOTHING keeps
+    // the write idempotent under at-least-once retries / a duplicated client Slug.
+    await this.db.query(
+      `INSERT INTO inbox (id, received_at, actor, activity, body, redacted, processed)
+         VALUES ($1, $2, $3, $4, $5, FALSE, $6)
+       ON CONFLICT (id) DO NOTHING`,
+      [id, receivedAt, actor, activity, body, processed]
+    );
+    for (const objectIri of objectIris) {
+      await this.db.query(
+        `INSERT INTO inbox_object (notif_id, object_iri)
+           VALUES ($1, $2)
+         ON CONFLICT (notif_id, object_iri) DO NOTHING`,
+        [id, objectIri]
+      );
+    }
+  }
+
+  async getNotification(id: string): Promise<InboxNotificationRecord | null> {
+    const rows = await this.db.query<{
+      id: string;
+      received_at: string;
+      actor: string | null;
+      activity: string;
+      body: string;
+      processed: boolean;
+    }>(
+      `SELECT id, received_at, actor, activity, body, processed
+         FROM inbox WHERE id = $1 LIMIT 1`,
+      [id]
+    );
+    const r = rows[0];
+    if (!r) return null;
+    return {
+      id: r.id,
+      receivedAt: Number(r.received_at),
+      actor: r.actor,
+      activity: r.activity,
+      body: r.body,
+      processed: Boolean(r.processed),
+    };
+  }
+
+  async listNotifications(opts: {
+    limit: number;
+    cursor?: string;
+  }): Promise<{
+    rows: InboxNotificationRecord[];
+    nextCursor: string | null;
+    total: number;
+  }> {
+    const { limit, cursor } = opts;
+    const cursorParts = cursor ? decodeInboxCursor(cursor) : null;
+
+    const params: unknown[] = [limit + 1];
+    let whereClause = "";
+    if (cursorParts) {
+      params.push(cursorParts.receivedAt, cursorParts.id);
+      // Keyset over (received_at DESC, id DESC): a row is AFTER the cursor when its received_at is
+      // smaller, or equal-received_at with a smaller id.
+      whereClause =
+        "WHERE (received_at < $2) OR (received_at = $2 AND id < $3)";
+    }
+
+    const rows = await this.db.query<{
+      id: string;
+      received_at: string;
+      actor: string | null;
+      activity: string;
+      body: string;
+      processed: boolean;
+    }>(
+      `SELECT id, received_at, actor, activity, body, processed
+         FROM inbox ${whereClause}
+        ORDER BY received_at DESC, id DESC
+        LIMIT $1`,
+      params
+    );
+
+    const totalRows = await this.db.query<{ n: number | string }>(
+      "SELECT COUNT(*) AS n FROM inbox"
+    );
+    const total = totalRows[0] ? Number(totalRows[0].n) : 0;
+
+    const hasMore = rows.length > limit;
+    const pageRows = hasMore ? rows.slice(0, limit) : rows;
+    const records: InboxNotificationRecord[] = pageRows.map((r) => ({
+      id: r.id,
+      receivedAt: Number(r.received_at),
+      actor: r.actor,
+      activity: r.activity,
+      body: r.body,
+      processed: Boolean(r.processed),
+    }));
+
+    const last = pageRows[pageRows.length - 1];
+    const nextCursor =
+      hasMore && last
+        ? encodeInboxCursor(Number(last.received_at), last.id)
+        : null;
+
+    return { rows: records, nextCursor, total };
   }
 }
 
@@ -1111,6 +1321,17 @@ function decodeSearchCursor(cursor: string): { rank: number; docUrl: string } {
   return JSON.parse(Buffer.from(cursor, "base64url").toString("utf-8")) as {
     rank: number;
     docUrl: string;
+  };
+}
+
+function encodeInboxCursor(receivedAt: number, id: string): string {
+  return Buffer.from(JSON.stringify({ receivedAt, id })).toString("base64url");
+}
+
+function decodeInboxCursor(cursor: string): { receivedAt: number; id: string } {
+  return JSON.parse(Buffer.from(cursor, "base64url").toString("utf-8")) as {
+    receivedAt: number;
+    id: string;
   };
 }
 
