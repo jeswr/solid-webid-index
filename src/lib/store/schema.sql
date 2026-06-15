@@ -201,3 +201,59 @@ CREATE TABLE IF NOT EXISTS rate_bucket (
   window_start  BIGINT  NOT NULL,            -- epoch ms of the current fixed window
   count         INTEGER NOT NULL DEFAULT 0   -- consumed slots in the current window
 );
+
+-- ─── triple — materialised triples for Triple Pattern Fragments (DESIGN.md §2.1.e / §4.5) ────
+--
+-- Indexed lookups (NOT derived scans over raw_rdf — arch M1) so GET /tpf?s=&p=&o= can answer a
+-- triple pattern from an index.  Each row records which indexed WebID + source document it was
+-- projected from so the TPF read can FILTER OUT triples about tombstoned WebIDs (DESIGN.md §4.8 H1:
+-- a tombstoned person's triples must never be served).  `o_is_iri` distinguishes an IRI object
+-- (matched/serialised as a NamedNode) from a literal object (Literal) so the round-trip is faithful.
+--
+-- The triple set for a WebID is REPLACED wholesale on each (re)projection (delete-by-webid then
+-- insert) — see PgStore.upsertTriples — so it never accumulates stale triples across re-crawls.
+
+CREATE TABLE IF NOT EXISTS triple (
+  s         TEXT     NOT NULL,                 -- subject IRI
+  p         TEXT     NOT NULL,                 -- predicate IRI
+  o         TEXT     NOT NULL,                 -- object: IRI or literal LEXICAL value
+  o_is_iri  BOOLEAN  NOT NULL,                 -- TRUE → object is an IRI (NamedNode); FALSE → literal
+  webid     TEXT,                              -- the indexed WebID this triple describes (tombstone gate)
+  doc_url   TEXT                               -- the source doc the triple was projected from
+);
+
+-- Triple-pattern access paths (DESIGN.md §2.1.e): (p,o) for ?p=&o=, (p,s) for ?s=&p=, s for ?s=.
+CREATE INDEX IF NOT EXISTS idx_triple_po    ON triple (p, o);
+CREATE INDEX IF NOT EXISTS idx_triple_ps    ON triple (p, s);
+CREATE INDEX IF NOT EXISTS idx_triple_s     ON triple (s);
+-- Tombstone-filter + delete-by-webid (re-projection / erasure) access path.
+CREATE INDEX IF NOT EXISTS idx_triple_webid ON triple (webid) WHERE webid IS NOT NULL;
+
+-- ─── stats — incremental dataset stats (DESIGN.md §2.1.j / §4.5) ─────────────────────────────
+--
+-- VoID/DCAT/health and the TPF `void:triples` PATTERN cardinality ESTIMATE read these counters
+-- (never a live COUNT on the hot path — arch M1).  Keyed counters: 'triples' (total), 'entities',
+-- and per-predicate keys ('p:<predicate-iri>') so a ?p= pattern can be estimated cheaply.
+--
+-- NOTE (pss-b0a / stats-sibling reconciliation): this is the MINIMAL stats surface needed by TPF.
+-- A concurrent sibling bead builds the richer incremental stats maintenance (per-class partitions,
+-- entity counts kept in the projection tx).  Both write to THIS table additively (idempotent
+-- CREATE TABLE IF NOT EXISTS) — the sibling's richer maintenance supersedes the simple counters
+-- written here at merge.  The TPF read goes through PgStore.estimatePatternCardinality (see below).
+
+-- The `stats` counters describe the SERVED query dataset (the materialised `triple` table that TPF
+-- serves), so a single `void:triples` is consistent across VoID (GET /.well-known/void) and the TPF
+-- empty-pattern estimate.  Maintenance is split additively inside `upsertTriples` (pgStore.ts):
+--   'triples'       — total triples              (TPF bead pss-b0a)
+--   'p:<predicate>' — per-predicate triple count (TPF bead; void:propertyPartition)
+--   'entities'      — number of indexed WebIDs    (stats bead pss-0zp; void:entities)
+--   'c:<classIri>'  — per-class entity count      (stats bead; void:classPartition)
+-- Counts are kept current by DELTAS computed from the OLD vs NEW triple set on every (re)projection
+-- and erasure — never a live COUNT(*) over the dataset — so reads stay O(1) (pss-0zp acceptance).
+-- The distinct-class / distinct-property counts (void:classes / void:properties) are DERIVED at read
+-- time from the number of c:/p: keys with v > 0.
+
+CREATE TABLE IF NOT EXISTS stats (
+  k   TEXT     PRIMARY KEY,                    -- counter key: 'triples', 'entities', 'p:<iri>', 'c:<iri>'
+  v   BIGINT   NOT NULL DEFAULT 0              -- counter value (>= 0)
+);

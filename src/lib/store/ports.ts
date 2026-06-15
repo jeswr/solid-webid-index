@@ -141,6 +141,40 @@ export interface SearchResult {
   label: string | null;
 }
 
+// ─── Triple Pattern Fragments supporting types ────────────────────────────────
+
+/**
+ * A triple pattern for `GET /tpf?s=&p=&o=` (DESIGN.md §4.5).  Any of the three
+ * terms may be omitted (a variable).  When `o` is present, `oIsIri` disambiguates
+ * an IRI object from a literal object — the route derives it from how the client
+ * supplied the value (an absolute IRI is matched as an IRI; otherwise a literal).
+ */
+export interface TpfPattern {
+  /** Subject IRI to match, or undefined for a variable subject. */
+  s?: string;
+  /** Predicate IRI to match, or undefined for a variable predicate. */
+  p?: string;
+  /** Object value (IRI or literal lexical form) to match, or undefined. */
+  o?: string;
+  /**
+   * When `o` is set, whether to match it as an IRI (true) or a literal (false).
+   * Ignored when `o` is undefined.  Default (route-level) is to treat an
+   * absolute-IRI-shaped `o` as an IRI and anything else as a literal.
+   */
+  oIsIri?: boolean;
+}
+
+/**
+ * One matched triple returned by {@link ReadStore.tpf}.  `oIsIri` lets the route
+ * faithfully rebuild the object term (NamedNode vs Literal) for serialisation.
+ */
+export interface TpfTriple {
+  s: string;
+  p: string;
+  o: string;
+  oIsIri: boolean;
+}
+
 // ─── CrawlCoordinator supporting types ────────────────────────────────────────
 
 /** Result of a completed crawl attempt, passed to markDone(). */
@@ -217,6 +251,52 @@ export interface ReadStore {
    * Idempotent; safe to call when the row doesn't exist (no-op).
    */
   tombstone(docUrl: string): Promise<void>;
+
+  /**
+   * Triple Pattern Fragments DATA read (DESIGN.md §4.5).
+   *
+   * Returns the matching triples from the materialised `triple` table for the given
+   * pattern, page-capped with an opaque keyset cursor.  Triples ABOUT a tombstoned
+   * WebID are NEVER returned (DESIGN.md §4.8 H1) — the filter is applied in SQL.
+   *
+   * Ordering is deterministic (s, p, o, o_is_iri) so keyset pagination is stable.
+   */
+  tpf(opts: {
+    pattern: TpfPattern;
+    limit: number;
+    cursor?: string;
+  }): Promise<{ triples: TpfTriple[]; nextCursor: string | null }>;
+
+  /**
+   * TPF METADATA read — the PATTERN cardinality ESTIMATE for `void:triples`
+   * (DESIGN.md §4.5).
+   *
+   * This is intentionally an ESTIMATE, not a live COUNT on the hot path (arch M1):
+   *  - the empty pattern (no s/p/o) reads the `stats` total-triples counter;
+   *  - a predicate-only pattern reads the per-predicate `stats` counter when present;
+   *  - any other pattern falls back to a BOUNDED COUNT (capped) so a hot pattern
+   *    never triggers an unbounded scan.
+   *
+   * STATS-SIBLING RECONCILIATION (pss-b0a): a concurrent sibling bead builds richer
+   * incremental stats (per-class/predicate maintenance in the projection tx).  This
+   * method is the SMALL, clearly-named stats-read seam the route depends on; the
+   * sibling's richer estimator can supersede the body of this method at merge
+   * WITHOUT changing this signature.
+   */
+  estimatePatternCardinality(pattern: TpfPattern): Promise<number>;
+
+  /**
+   * Project a WebID's triples into the materialised `triple` table for TPF
+   * (DESIGN.md §2.1.e), REPLACING any existing triples for that WebID first so a
+   * re-projection never leaves stale rows.  Maintains the minimal `stats` counters
+   * (total triples + per-predicate) additively.  Called from the projection/erasure
+   * path; safe to call with an empty triple list (acts as a delete-by-webid).
+   */
+  upsertTriples(opts: {
+    webid: string;
+    docUrl: string;
+    triples: TpfTriple[];
+  }): Promise<void>;
 }
 
 /**
@@ -505,4 +585,86 @@ export interface PolitenessStore {
     nextAllowedAt: number,
     consecutiveErrors: number
   ): Promise<void>;
+}
+
+// ─── StatsStore — incremental dataset statistics (DESIGN.md §2.1.j / §4.2) ─────
+
+/**
+ * One `void:classPartition` — a class IRI and how many entities (distinct
+ * subjects) carry that `rdf:type` across the served dataset.
+ */
+export interface ClassPartition {
+  /** The class IRI (the `rdf:type` object), e.g. `http://xmlns.com/foaf/0.1/Person`. */
+  classIri: string;
+  /** Number of entities (distinct subjects) of this class in the served dataset. */
+  entities: number;
+}
+
+/**
+ * One `void:propertyPartition` — a predicate IRI and how many triples in the
+ * served dataset use it.
+ */
+export interface PropertyPartition {
+  /** The predicate IRI, e.g. `http://xmlns.com/foaf/0.1/knows`. */
+  propertyIri: string;
+  /** Number of triples in the served dataset with this predicate. */
+  triples: number;
+}
+
+/**
+ * Dataset statistics for the VoID / DCAT description (DESIGN.md §4.2).
+ *
+ * Every field is read O(1) from the incrementally-maintained `stats` table — the
+ * read NEVER scans `doc` or counts triples live (arch M1 / pss-0zp acceptance).
+ *
+ * `triples` is the total triple count of the SERVED dataset (the union of every
+ * `/p/{slug}` entry graph), `entities` the number of indexed WebIDs, `classes` /
+ * `properties` the number of DISTINCT classes / predicates, and the two partition
+ * arrays the per-class / per-property breakdowns (`void:classPartition` /
+ * `void:propertyPartition`).
+ */
+export interface DatasetStats {
+  /** void:triples — total triples across all served entry graphs. */
+  triples: number;
+  /** void:entities — number of indexed WebIDs (served entries). */
+  entities: number;
+  /** void:classes — number of DISTINCT classes appearing in the dataset. */
+  classes: number;
+  /** void:properties — number of DISTINCT predicates appearing in the dataset. */
+  properties: number;
+  /** void:classPartition breakdown (sorted descending by entities, then IRI). */
+  classPartitions: ClassPartition[];
+  /** void:propertyPartition breakdown (sorted descending by triples, then IRI). */
+  propertyPartitions: PropertyPartition[];
+}
+
+/**
+ * StatsStore — the O(1) read seam for dataset statistics + the incremental
+ * maintenance hook (DESIGN.md §2.1.j / §4.2).
+ *
+ * The maintenance contract (pss-0zp): the served-entry write path
+ * ({@link CrawlCoordinator.markDone} on a `done` entry, and erasure /
+ * {@link ReadStore.tombstone}) applies a DELTA to the `stats` counters — it does
+ * NOT recount the dataset. `getStats()` therefore reads pre-aggregated counters and
+ * is O(number of distinct classes/properties), independent of the dataset size.
+ *
+ * The TPF sibling's `estimatePatternCardinality` reads the SAME `stats` table
+ * (predicate-partition counts) for its `void:triples` pattern estimate — this
+ * interface is the clearly-named accessor that read path depends on.
+ */
+export interface StatsStore {
+  /**
+   * Read the current dataset statistics from the incrementally-maintained `stats`
+   * table. O(distinct classes + distinct properties); never scans `doc` or `triple`.
+   */
+  getStats(): Promise<DatasetStats>;
+
+  /**
+   * Return the cardinality (triple count) of a single predicate across the served
+   * dataset, read O(1) from the per-predicate `stats` counter, or 0 when the
+   * predicate is absent. This is the cheap, clearly-named accessor the TPF sibling
+   * (`estimatePatternCardinality`) reads for a predicate-only pattern estimate so
+   * it never issues a live `COUNT` for `?p=` fragments.
+   */
+  getPredicateCardinality(propertyIri: string): Promise<number>;
 }
