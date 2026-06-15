@@ -93,12 +93,17 @@ async function indexProfile(
     opts.knows && opts.knows.length > 0
       ? `; foaf:knows ${opts.knows.map((k) => `<${k}>`).join(", ")} `
       : "";
+  // The served /p/{slug} response RE-PARSES this rawRdf (entryResponse.ts) and re-extracts knows
+  // from it — so the foaf:knows triples MUST actually parse. Declare @prefix foaf: (the knowsTtl
+  // uses the foaf:knows CURIE); without it the Turtle is invalid, parseProfile throws, the route
+  // falls back to a knows-less projection, and the inbound-edge erasure assertion below would pass
+  // VACUOUSLY (Bob's graph would never carry the edge even before Alice is erased).
   await store.markDone(
     docUrl,
     {
       state: "done",
       httpStatus: 200,
-      rawRdf: `<${webid}> a <${FOAF}Person> ; <${FOAF}name> "${opts.label}" ${knowsTtl}.`,
+      rawRdf: `@prefix foaf: <${FOAF}> . <${webid}> a foaf:Person ; foaf:name "${opts.label}" ${knowsTtl}.`,
       isSolid: true,
       webid,
       nextEligibleAt: Date.now() + 1_000_000,
@@ -278,18 +283,29 @@ describe("erasure completeness — after opt-out, Alice is 410/absent on EVERY r
     // graph). Erase ALICE, then Bob's served /p/{slug} must NOT serve foaf:knows → Alice — the
     // tombstone-filter on the friend's knows targets (entryResponse.ts) drops it. (Crucially this
     // tests the friend's surviving entry, NOT the erased person's own — which is 410.)
+    async function bobKnowsAlice(): Promise<boolean> {
+      const res = await entryGet(
+        new Request(`${INDEX_BASE_URL}/p/${BOB_SLUG}`, {
+          headers: { Accept: "text/turtle" },
+        }),
+        { params: Promise.resolve({ slug: BOB_SLUG }) }
+      );
+      expect(res.status).toBe(200);
+      const g = parseTurtle(await res.text());
+      return g.getQuads(BOB, FOAF_KNOWS, ALICE, null).length > 0;
+    }
+
+    // NON-VACUITY GUARD: the edge must actually EXIST + be served BEFORE Alice is erased — otherwise
+    // the post-erasure assertion would pass even if the tombstone-filter never ran (the bug that made
+    // the prior version of this test a false positive: an invalid-prefix rawRdf yielded a knows-less
+    // projection, so the edge was never present in the first place).
+    expect(await bobKnowsAlice()).toBe(true);
+
     await eraseAlice();
-    const res = await entryGet(
-      new Request(`${INDEX_BASE_URL}/p/${BOB_SLUG}`, {
-        headers: { Accept: "text/turtle" },
-      }),
-      { params: Promise.resolve({ slug: BOB_SLUG }) }
-    );
-    expect(res.status).toBe(200);
-    const g = parseTurtle(await res.text());
-    // Bob's served graph must NOT contain a foaf:knows pointing at the erased Alice.
-    const knowsAlice = g.getQuads(BOB, FOAF_KNOWS, ALICE, null);
-    expect(knowsAlice.length).toBe(0);
+
+    // After erasure the tombstone-filter on the friend's knows targets (entryResponse.ts) must drop
+    // the edge — proving the inbound-edge filter actually fired.
+    expect(await bobKnowsAlice()).toBe(false);
   });
 
   it("re-suggesting the erased WebID via POST /inbox/ → 409 (tombstone is permanent)", async () => {
