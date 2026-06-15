@@ -410,12 +410,20 @@ export interface CrawlCoordinator {
    *   enqueue() then markDone() directly without going through claim()); in that case
    *   the fence is skipped and the traditional "0 rows = unknown docUrl → throw"
    *   behaviour is preserved.
+   *
+   * @returns `true` when the completion was actually written (the fenced UPDATE matched
+   *   a row), `false` when it was discarded — either because the lease fence did NOT match
+   *   (a stale worker whose claim token was superseded) OR because the WebID/doc was
+   *   tombstoned mid-crawl. The caller MUST gate any out-of-fence side effect (projection /
+   *   stats mutation via {@link ReadStore.upsertTriples}) on a `true` result so a stale or
+   *   refused completion can never mutate served state outside the lease fence
+   *   (DESIGN.md §3.4 / §4.8 H1 — roborev HIGH).
    */
   markDone(
     docUrl: string,
     result: CrawlResult,
     claimToken?: string | null
-  ): Promise<void>;
+  ): Promise<boolean>;
 
   /**
    * Returns true when the doc is due for re-crawl.

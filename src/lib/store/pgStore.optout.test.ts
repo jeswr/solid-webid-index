@@ -101,9 +101,10 @@ describe("eraseWebId — completeness across every surface", () => {
     const entry = await store.getEntryByWebid(BOB);
     expect(entry).not.toBeNull();
     await store.eraseWebId({ webid: BOB, docUrl: BOB_DOC, reason: "opt-out" });
-    // The doc row is DELETED on erasure, so the slug is unknown (404). The PERMANENT tombstone is
-    // the durable gate (isTombstoned), which the route consults; either way the slug never serves a
-    // 200. Assert the slug no longer resolves to a live entry.
+    // The doc row is REPLACED by a durable redacted tombstone row (state='tombstone', slug retained),
+    // so getEntryBySlug resolves to 'tombstoned' (410). The PERMANENT tombstone table is the durable
+    // gate (isTombstoned) too; either way the slug never serves a live 200. Assert the slug no longer
+    // resolves to a live entry.
     const slug = entry?.slug;
     if (slug) {
       const res = await store.getEntryBySlug(slug);
@@ -339,12 +340,22 @@ describe("erasure resurrection race — a crawl that finishes AFTER the tombston
     expect(entry === null || entry === "tombstoned").toBe(true);
     const hits = await store.search({ query: "Bob", limit: 50 });
     expect(hits.rows.some((r) => r.webid === BOB)).toBe(false);
-    // And no raw_rdf row survives under the deleted doc URL.
-    const docRows = await db.query<{ raw_rdf: string | null }>(
-      "SELECT raw_rdf FROM doc WHERE doc_url = $1 OR webid = $2",
+    // The doc row is REPLACED by a DURABLE redacted tombstone row (HIGH 2): it SURVIVES so its PK
+    // permanently blocks a concurrent enqueue from resurrecting a `pending` row, but it carries NO PII
+    // — state='tombstone', raw_rdf NULL, webid NULL. There must be no servable (raw_rdf/webid) row.
+    const docRows = await db.query<{
+      state: string;
+      raw_rdf: string | null;
+      webid: string | null;
+    }>(
+      "SELECT state, raw_rdf, webid FROM doc WHERE doc_url = $1 OR webid = $2",
       [BOB_DOC, BOB]
     );
-    expect(docRows.rows.length).toBe(0);
+    for (const r of docRows.rows) {
+      expect(r.state).toBe("tombstone");
+      expect(r.raw_rdf).toBeNull();
+      expect(r.webid).toBeNull();
+    }
   });
 
   it("the token-less markDone() path is ALSO gated (enqueue→markDone after tombstone)", async () => {
@@ -360,6 +371,120 @@ describe("erasure resurrection race — a crawl that finishes AFTER the tombston
     });
     expect(await store.getEntryByWebid(BOB)).toBeNull();
     expect(await store.exists(BOB_DOC)).toBe(false);
+  });
+
+  it("enqueue after a committed erase CANNOT create a servable/pending row (durable tombstone-row + PK gate — HIGH 2)", async () => {
+    // Index Bob, then erase him: the erase leaves a DURABLE redacted tombstone doc row (state=
+    // 'tombstone', raw_rdf/webid NULL) whose PK is the doc URL.
+    await indexProfile(store, {
+      webid: BOB,
+      docUrl: BOB_DOC,
+      triples: bobTriples,
+    });
+    await store.eraseWebId({ webid: BOB, docUrl: BOB_DOC, reason: "opt-out" });
+    expect(await store.isTombstoned({ webid: BOB })).toBe(true);
+
+    // Simulate the resurrection RACE deterministically: a discovery path tries to enqueue the same
+    // canonical doc AFTER the erase committed (every discovery source — knows/inbox/seed/catalog).
+    // The `INSERT … ON CONFLICT (doc_url) DO NOTHING` hits the surviving tombstone row's PK, so NO
+    // competing `pending` row is created — the WebID stays erased regardless of READ COMMITTED.
+    await store.enqueue(BOB_DOC, { webid: BOB, source: "knows" });
+    await store.enqueue(BOB_DOC, { webid: BOB, source: "inbox" });
+    await store.enqueue(BOB_DOC, { webid: BOB, source: "seed" });
+
+    // No servable / pending row exists; the only doc row is the redacted tombstone (no PII).
+    expect(await store.exists(BOB_DOC)).toBe(false);
+    expect(await store.getEntryByWebid(BOB)).toBeNull();
+    const rows = await db.query<{ state: string; raw_rdf: string | null }>(
+      "SELECT state, raw_rdf FROM doc WHERE doc_url = $1",
+      [BOB_DOC]
+    );
+    expect(rows.rows.length).toBe(1);
+    expect(rows.rows[0].state).toBe("tombstone");
+    expect(rows.rows[0].raw_rdf).toBeNull();
+    // And it is never claimable (gate 2), so a crawl can never re-fetch it.
+    const claimed = await store.claim("w", 8);
+    expect(claimed.find((r) => r.docUrl === BOB_DOC)).toBeUndefined();
+  });
+
+  it("a STALE-token markDone() returns false + does NOT project/mutate stats; the valid-token holder returns true + projects (lease fence — HIGH 1)", async () => {
+    // Worker-1 claims Carol. Then the lease is taken over by worker-2 (simulate a reclaim) so
+    // worker-1's token is now STALE.  Worker-1's late markDone() must be a fenced NO-OP: it returns
+    // false and the caller (crawler) must NOT project — otherwise a stale lease clobbers the newer
+    // crawl's projection / stats OUTSIDE the fence.
+    const CAROL = "https://carol.example/card#me";
+    const CAROL_DOC = "https://carol.example/card";
+    const carolTriples: TpfTriple[] = [
+      { s: CAROL, p: RDF_TYPE, o: FOAF_PERSON, oIsIri: true },
+      { s: CAROL, p: FOAF_NAME, o: "Carol", oIsIri: false },
+    ];
+
+    await store.enqueue(CAROL_DOC, { webid: CAROL, source: "seed" });
+    const firstClaim = await store.claim("worker-1", 8);
+    const staleToken = firstClaim.find(
+      (r) => r.docUrl === CAROL_DOC
+    )?.claimToken;
+    expect(staleToken).toBeTruthy();
+
+    // Force-expire worker-1's lease so a second claim reclaims the row with a FRESH token.
+    await db.query("UPDATE doc SET claimed_at = 0 WHERE doc_url = $1", [
+      CAROL_DOC,
+    ]);
+    const secondClaim = await store.claim("worker-2", 8);
+    const freshToken = secondClaim.find(
+      (r) => r.docUrl === CAROL_DOC
+    )?.claimToken;
+    expect(freshToken).toBeTruthy();
+    expect(freshToken).not.toBe(staleToken);
+
+    // Worker-1 (STALE token) finishes late. markDone must return FALSE (fenced no-op).
+    const staleResult = await store.markDone(
+      CAROL_DOC,
+      {
+        state: "done",
+        webid: CAROL,
+        rawRdf: `<${CAROL}> <${FOAF_NAME}> "Carol(stale)" .`,
+        isSolid: true,
+        httpStatus: 200,
+      },
+      staleToken
+    );
+    expect(staleResult).toBe(false);
+    // The stale completion did NOT write: the row is still 'claimed' by worker-2 (not 'done'), and
+    // NOTHING was projected (no triple rows, stats untouched) — the caller skips upsertTriples when
+    // markDone returns false, so no out-of-fence projection happened.
+    const afterStale = await store.get(CAROL_DOC);
+    expect(afterStale?.state).toBe("claimed");
+    expect(
+      (await store.tpf({ pattern: { s: CAROL }, limit: 100 })).triples.length
+    ).toBe(0);
+    const statsAfterStale = await store.getStats();
+    expect(statsAfterStale.entities).toBe(0);
+
+    // Worker-2 (VALID token) finishes. markDone must return TRUE, and the caller may then project.
+    const validResult = await store.markDone(
+      CAROL_DOC,
+      {
+        state: "done",
+        webid: CAROL,
+        rawRdf: `<${CAROL}> <${FOAF_NAME}> "Carol" .`,
+        isSolid: true,
+        httpStatus: 200,
+      },
+      freshToken
+    );
+    expect(validResult).toBe(true);
+    expect((await store.get(CAROL_DOC))?.state).toBe("done");
+    // Project as the crawler would (only because markDone returned true).
+    await store.upsertTriples({
+      webid: CAROL,
+      docUrl: CAROL_DOC,
+      triples: carolTriples,
+    });
+    expect(
+      (await store.tpf({ pattern: { s: CAROL }, limit: 100 })).triples.length
+    ).toBe(2);
+    expect((await store.getStats()).entities).toBe(1);
   });
 
   it("upsertTriples() on a tombstoned WebID PURGES the doc row + raw_rdf (not just the projection)", async () => {

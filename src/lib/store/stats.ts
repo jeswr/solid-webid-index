@@ -131,6 +131,8 @@ export function classDelta(
 //   'p:<predicate>' -- per-predicate triple count (TPF bead owns; void:propertyPartition)
 //   'entities'      -- number of indexed WebIDs    (THIS bead owns; void:entities)
 //   'c:<classIri>'  -- per-class entity count      (THIS bead owns; void:classPartition)
+//   'sup'           -- total SUPPRESSED inbound edges (object = tombstoned WebID; opt-out bead owns)
+//   'sp:<predicate>'-- per-predicate suppressed inbound-edge count          (opt-out bead owns)
 // The distinct-class / distinct-property counts are DERIVED at read time (count of
 // c:/p: keys with v > 0), avoiding a second counter to keep consistent.
 
@@ -143,6 +145,17 @@ export const STATS_PREFIX_CLASS = "c:";
 /** Per-predicate partition key prefix (TPF bead owns; read here for VoID). */
 export const STATS_PREFIX_PROPERTY = "p:";
 
+/**
+ * Scalar counter for the TOTAL number of materialised triples that TPF/VoID SUPPRESS because their
+ * IRI object is a tombstoned WebID (inbound `foaf:knows`→erased-person edges that live under a
+ * still-served subject). Maintained INCREMENTALLY by the store (opt-out bead pss-1ez) on every
+ * projection mutation AND on erasure, so the O(1) VoID/TPF estimate subtracts the FULL hidden count
+ * with NO cap (roborev MEDIUM). `getStats`/`estimatePatternCardinality` read it directly.
+ */
+export const STATS_KEY_SUPPRESSED = "sup";
+/** Per-predicate suppressed inbound-edge counter prefix (opt-out bead owns; mirrors STATS_KEY_SUPPRESSED). */
+export const STATS_PREFIX_SUPPRESSED = "sp:";
+
 /** Build the `stats` row key for a class partition. */
 export function classKey(classIri: string): string {
   return `${STATS_PREFIX_CLASS}${classIri}`;
@@ -151,4 +164,9 @@ export function classKey(classIri: string): string {
 /** Build the `stats` row key for a predicate partition. */
 export function propertyKey(propertyIri: string): string {
   return `${STATS_PREFIX_PROPERTY}${propertyIri}`;
+}
+
+/** Build the `stats` row key for the per-predicate suppressed inbound-edge counter. */
+export function suppressedKey(propertyIri: string): string {
+  return `${STATS_PREFIX_SUPPRESSED}${propertyIri}`;
 }

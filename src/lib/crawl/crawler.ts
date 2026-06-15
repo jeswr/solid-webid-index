@@ -411,8 +411,10 @@ async function processDoc(
     return { fetched: true, added: 0, errored: false };
   }
 
-  // Store the projected record + validators + canonical body.
-  await store.markDone(
+  // Store the projected record + validators + canonical body.  markDone returns whether the FENCED
+  // completion actually committed: it is `false` when our lease token no longer matches (the row was
+  // reclaimed by a newer crawl after our lease expired) OR when the WebID was tombstoned mid-crawl.
+  const completed = await store.markDone(
     row.docUrl,
     {
       state: "done",
@@ -429,13 +431,20 @@ async function processDoc(
     },
     row.claimToken
   );
-  // Materialise the parsed triples for the TPF index (DESIGN.md §4.5).  REPLACE
-  // semantics keep the index in lock-step with raw_rdf on every re-crawl.
-  await store.upsertTriples({
-    webid: webIdIri,
-    docUrl: row.docUrl,
-    triples,
-  });
+  // Materialise the parsed triples for the TPF index (DESIGN.md §4.5) — but ONLY when the fenced
+  // completion above actually committed (roborev HIGH 1). If our lease was stale, upsertTriples runs
+  // OUTSIDE any fence and would clobber a newer crawl's projection / stats; if the WebID was
+  // tombstoned, projecting would resurrect erased PII (the projection gate would catch it, but the
+  // stats churn is still wrong). Skipping projection on a refused/stale completion keeps every
+  // projection + stats mutation INSIDE the lease fence. REPLACE semantics keep the index in lock-step
+  // with raw_rdf on every re-crawl.
+  if (completed) {
+    await store.upsertTriples({
+      webid: webIdIri,
+      docUrl: row.docUrl,
+      triples,
+    });
+  }
   // Healthy response → reset the host error counter.
   await store.stampHost(row.host, now() + hostDelay, 0);
 
