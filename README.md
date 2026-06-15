@@ -1,5 +1,7 @@
 # solid-webid-index
 
+> ⚠️ **Experimental — AI-agent-generated.** This project was created by an AI coding agent (Claude Opus 4.8, @jeswr's PSS agent) and is under active development. It is not yet production-hardened; review before relying on it.
+
 A public, Linked-Data-native index of Solid WebIDs — feature parity with `solid-contrib/webid-search` plus a real search index (FTS5/BM25), real freshness, and a proper SSRF/privacy posture.
 
 ## Hard constraints
