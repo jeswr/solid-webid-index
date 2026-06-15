@@ -396,6 +396,65 @@ describe("runCrawlBatch — noindex honouring", () => {
   });
 });
 
+describe("runCrawlBatch — tombstone-path suppressed-stats accounting (roborev MEDIUM)", () => {
+  const FOAF_KNOWS = "http://xmlns.com/foaf/0.1/knows";
+
+  it("a crawled 410 tombstones the doc AND suppresses the inbound knows edge from getStats/TPF", async () => {
+    const { store } = await makeStore();
+    // /alice knows /victim. /alice is served; /victim returns 410 Gone → tombstoned by the crawler.
+    serveProfile("/alice", { knows: [webIdOf("/victim")] });
+    routes.set("/victim", (_req, res) => {
+      res.writeHead(410, { "content-type": "text/plain" });
+      res.end("gone");
+    });
+    await store.enqueue(docOf("/alice"), { source: "seed", depth: 0 });
+    await drain(store);
+
+    // /victim is tombstoned (hidden), /alice is indexed.
+    expect(await store.exists(docOf("/victim"))).toBe(false);
+    expect((await store.get(docOf("/alice")))?.state).toBe("done");
+
+    // The crawler's 410 path must have applied the SAME suppressed-inbound accounting as
+    // eraseWebId/tombstone: Alice's foaf:knows→victim survives in `triple` but is SUPPRESSED, so it is
+    // excluded from getStats + the predicate-only estimate + served TPF (roborev MEDIUM).
+    const stats = await store.getStats();
+    expect(
+      stats.propertyPartitions.find((p) => p.propertyIri === FOAF_KNOWS)
+    ).toBeUndefined();
+    expect(await store.estimatePatternCardinality({ p: FOAF_KNOWS })).toBe(0);
+    const knowsTpf = await store.tpf({
+      pattern: { p: FOAF_KNOWS },
+      limit: 100,
+    });
+    expect(knowsTpf.triples.length).toBe(0);
+  });
+
+  it("a crawled noindex doc tombstones it AND suppresses the inbound knows edge from getStats/TPF", async () => {
+    const { store } = await makeStore();
+    // /alice knows /victim. /victim serves X-Robots-Tag: noindex → tombstoned (body discarded).
+    serveProfile("/alice", { knows: [webIdOf("/victim")] });
+    serveProfile("/victim", {
+      extraHeaders: { "x-robots-tag": "noindex" },
+    });
+    await store.enqueue(docOf("/alice"), { source: "seed", depth: 0 });
+    await drain(store);
+
+    expect(await store.exists(docOf("/victim"))).toBe(false);
+    expect((await store.get(docOf("/alice")))?.state).toBe("done");
+
+    const stats = await store.getStats();
+    expect(
+      stats.propertyPartitions.find((p) => p.propertyIri === FOAF_KNOWS)
+    ).toBeUndefined();
+    expect(await store.estimatePatternCardinality({ p: FOAF_KNOWS })).toBe(0);
+    const knowsTpf = await store.tpf({
+      pattern: { p: FOAF_KNOWS },
+      limit: 100,
+    });
+    expect(knowsTpf.triples.length).toBe(0);
+  });
+});
+
 describe("runCrawlBatch — anti-amplification: SHARED suggest budget (KEY correctness)", () => {
   it("a suggestion with budget N enqueues AT MOST N descendants despite high fan-out at one node", async () => {
     const { store } = await makeStore();

@@ -487,6 +487,96 @@ describe("erasure resurrection race — a crawl that finishes AFTER the tombston
     expect((await store.getStats()).entities).toBe(1);
   });
 
+  it.each([
+    {
+      label: "noindex (X-Robots-Tag) tombstone",
+      result: {
+        state: "tombstone" as const,
+        httpStatus: 200,
+        error: "noindex (X-Robots-Tag) — not indexed",
+      },
+    },
+    {
+      label: "HTTP 410 tombstone",
+      result: { state: "tombstone" as const, httpStatus: 410 },
+    },
+  ])(
+    "a STALE-token markDone($label) returns false + does NOT clear the newer owner's projection/stats (lease fence — HIGH, $label path)",
+    async ({ result }) => {
+      // The crawler's noindex AND 410 paths BOTH call markDone({state:'tombstone'}) then clear the
+      // projection. A STALE worker (whose lease was reclaimed) must NOT be able to tombstone + clear a
+      // NEWER owner's projection/stats outside the fence — markDone must return FALSE so the crawler
+      // skips the out-of-fence upsertTriples (roborev HIGH — same fence the 2xx path already uses).
+      const DAVE = "https://dave.example/card#me";
+      const DAVE_DOC = "https://dave.example/card";
+      const daveTriples: TpfTriple[] = [
+        { s: DAVE, p: RDF_TYPE, o: FOAF_PERSON, oIsIri: true },
+        { s: DAVE, p: FOAF_NAME, o: "Dave", oIsIri: false },
+      ];
+
+      await store.enqueue(DAVE_DOC, { webid: DAVE, source: "seed" });
+      const firstClaim = await store.claim("worker-1", 8);
+      const staleToken = firstClaim.find(
+        (r) => r.docUrl === DAVE_DOC
+      )?.claimToken;
+      expect(staleToken).toBeTruthy();
+
+      // Force-expire worker-1's lease so worker-2 reclaims the row with a FRESH token.
+      await db.query("UPDATE doc SET claimed_at = 0 WHERE doc_url = $1", [
+        DAVE_DOC,
+      ]);
+      const secondClaim = await store.claim("worker-2", 8);
+      const freshToken = secondClaim.find(
+        (r) => r.docUrl === DAVE_DOC
+      )?.claimToken;
+      expect(freshToken).toBeTruthy();
+      expect(freshToken).not.toBe(staleToken);
+
+      // The NEWER owner (worker-2) completes the crawl normally and projects Dave's profile.
+      const validResult = await store.markDone(
+        DAVE_DOC,
+        {
+          state: "done",
+          webid: DAVE,
+          rawRdf: `<${DAVE}> <${FOAF_NAME}> "Dave" .`,
+          isSolid: true,
+          httpStatus: 200,
+        },
+        freshToken
+      );
+      expect(validResult).toBe(true);
+      await store.upsertTriples({
+        webid: DAVE,
+        docUrl: DAVE_DOC,
+        triples: daveTriples,
+      });
+      expect(
+        (await store.tpf({ pattern: { s: DAVE }, limit: 100 })).triples.length
+      ).toBe(2);
+      expect((await store.getStats()).entities).toBe(1);
+
+      // Now the STALE worker-1 finishes late on the noindex/410 path: markDone({state:'tombstone'})
+      // with the stale token must be a FENCED NO-OP → false. The crawler gates upsertTriples on this.
+      const staleResult = await store.markDone(
+        DAVE_DOC,
+        { ...result, webid: DAVE },
+        staleToken
+      );
+      expect(staleResult).toBe(false);
+
+      // The newer owner's projection + stats SURVIVE untouched — a stale tombstone neither erased the
+      // entry nor cleared the triples/counters outside the fence.
+      expect((await store.get(DAVE_DOC))?.state).toBe("done");
+      expect(await store.getEntryByWebid(DAVE)).not.toBeNull();
+      expect(
+        (await store.tpf({ pattern: { s: DAVE }, limit: 100 })).triples.length
+      ).toBe(2);
+      expect((await store.getStats()).entities).toBe(1);
+      // And because markDone returned false, the crawler skips upsertTriples — modelled by NOT calling
+      // it here (the production code is gated `if (completed && row.webid)`).
+    }
+  );
+
   it("upsertTriples() on a tombstoned WebID PURGES the doc row + raw_rdf (not just the projection)", async () => {
     // Index Bob normally, then tombstone via the permanent table WITHOUT going through eraseWebId's
     // doc-row delete, to isolate the projection gate: a leftover `done` doc row with raw_rdf must be
@@ -564,6 +654,106 @@ describe("stats/VoID/TPF cardinality match SERVED data after an inbound knows-ta
       limit: 100,
     });
     expect(knowsTpf.triples.length).toBe(0);
+  });
+
+  it("tombstone(docUrl) updates the suppressed counters so getStats/TPF/VoID exclude the inbound edge (roborev MEDIUM)", async () => {
+    // tombstone() (the direct doc-row tombstone path) previously cleared the WebID's OWN projection
+    // but did NOT account for the surviving INBOUND foaf:knows→Bob edge under Alice — so getStats /
+    // the predicate-only estimate kept advertising it. The centralized transition helper now fixes it.
+    const before = await store.getStats();
+    expect(before.triples).toBe(aliceTriples.length + bobTriples.length); // 5
+    expect(
+      before.propertyPartitions.find((p) => p.propertyIri === FOAF_KNOWS)
+        ?.triples
+    ).toBe(1);
+
+    await store.tombstone(BOB_DOC);
+
+    const after = await store.getStats();
+    // Bob's 2 own triples are cleared; Alice's inbound knows→Bob is now SUPPRESSED → 5 - 2 - 1 = 2.
+    expect(after.triples).toBe(2);
+    expect(
+      after.propertyPartitions.find((p) => p.propertyIri === FOAF_KNOWS)
+    ).toBeUndefined();
+    expect(await store.estimatePatternCardinality({})).toBe(2);
+    expect(await store.estimatePatternCardinality({ p: FOAF_KNOWS })).toBe(0);
+    const knowsTpf = await store.tpf({
+      pattern: { p: FOAF_KNOWS },
+      limit: 100,
+    });
+    expect(knowsTpf.triples.length).toBe(0);
+  });
+
+  it("crawler markDone({state:'tombstone'}) updates the suppressed counters too (roborev MEDIUM — noindex/410 path)", async () => {
+    // The crawler's noindex / 410 path tombstones via markDone({state:'tombstone'}). It must apply the
+    // SAME suppressed-inbound accounting as eraseWebId/tombstone so the inbound knows→Bob edge under
+    // Alice is excluded from getStats/TPF/VoID. Drive it as the crawler does (claim → markDone). Bob is
+    // already a 'done' row from the beforeEach; make it due for re-crawl so claim() picks it up.
+    await db.query("UPDATE doc SET next_eligible_at = 0 WHERE doc_url = $1", [
+      BOB_DOC,
+    ]);
+    const claimed = await store.claim("worker-1", 8);
+    const bobToken = claimed.find((r) => r.docUrl === BOB_DOC)?.claimToken;
+    expect(bobToken).toBeTruthy();
+
+    const completed = await store.markDone(
+      BOB_DOC,
+      { state: "tombstone", httpStatus: 410, webid: BOB },
+      bobToken
+    );
+    expect(completed).toBe(true);
+
+    const after = await store.getStats();
+    // Alice's inbound knows→Bob is suppressed; Bob's own triples cleared by the transition. 5-2-1 = 2.
+    expect(after.triples).toBe(2);
+    expect(
+      after.propertyPartitions.find((p) => p.propertyIri === FOAF_KNOWS)
+    ).toBeUndefined();
+    expect(await store.estimatePatternCardinality({ p: FOAF_KNOWS })).toBe(0);
+    const knowsTpf = await store.tpf({
+      pattern: { p: FOAF_KNOWS },
+      limit: 100,
+    });
+    expect(knowsTpf.triples.length).toBe(0);
+  });
+
+  it("a repeat erase is IDEMPOTENT — the suppressed counters do NOT double-count (roborev MEDIUM)", async () => {
+    // eraseWebId() previously INCREMENTED the suppressed inbound counters on EVERY run, so a second
+    // erase of an already-tombstoned WebID double-counted Alice's inbound knows→Bob edge and made the
+    // estimates UNDER-report (the counter is subtracted from the total). The transition guard now makes
+    // the increment fire ONLY on a genuine non-tombstoned → tombstoned transition.
+    await store.eraseWebId({ webid: BOB, docUrl: BOB_DOC, reason: "opt-out" });
+    const afterFirst = await store.getStats();
+    expect(afterFirst.triples).toBe(2);
+    expect(await store.estimatePatternCardinality({})).toBe(2);
+    expect(await store.estimatePatternCardinality({ p: FOAF_KNOWS })).toBe(0);
+
+    // Erase AGAIN (idempotent). Stats must be IDENTICAL — no double-count of the suppressed edge.
+    await store.eraseWebId({ webid: BOB, docUrl: BOB_DOC, reason: "opt-out" });
+    const afterSecond = await store.getStats();
+    expect(afterSecond.triples).toBe(afterFirst.triples); // 2 — NOT 1 (would be the double-count bug)
+    expect(afterSecond.entities).toBe(afterFirst.entities);
+    expect(await store.estimatePatternCardinality({})).toBe(2);
+    expect(await store.estimatePatternCardinality({ p: FOAF_KNOWS })).toBe(0);
+    // A THIRD erase is still a no-op — proves the guard, not just a single extra run.
+    await store.eraseWebId({ webid: BOB, docUrl: BOB_DOC, reason: "opt-out" });
+    const afterThird = await store.getStats();
+    expect(afterThird.triples).toBe(afterFirst.triples);
+    expect(await store.estimatePatternCardinality({ p: FOAF_KNOWS })).toBe(0);
+  });
+
+  it("repeat erase via DIFFERENT tombstone paths (tombstone() then eraseWebId()) does not double-count either", async () => {
+    // The transition guard must hold ACROSS paths: tombstone Bob via tombstone(), then erase him via
+    // eraseWebId(). The second path sees him already tombstoned and must NOT re-add the inbound edge.
+    await store.tombstone(BOB_DOC);
+    const afterTombstone = await store.getStats();
+    expect(afterTombstone.triples).toBe(2);
+    expect(await store.estimatePatternCardinality({ p: FOAF_KNOWS })).toBe(0);
+
+    await store.eraseWebId({ webid: BOB, docUrl: BOB_DOC, reason: "opt-out" });
+    const afterErase = await store.getStats();
+    expect(afterErase.triples).toBe(afterTombstone.triples); // still 2 — no double-count
+    expect(await store.estimatePatternCardinality({ p: FOAF_KNOWS })).toBe(0);
   });
 });
 

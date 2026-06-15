@@ -266,20 +266,27 @@ async function processDoc(
   // blocked from re-crawl across all paths. The body was never read; nothing about the person is
   // indexed — and a malformed/oversized noindex body is still tombstoned (not skipped/errored).
   if (res.noindex) {
-    await store.markDone(
+    // markDone returns whether the FENCED tombstone completion actually committed: `false` when our
+    // lease token no longer matches (a stale worker — the row was reclaimed) OR the WebID was already
+    // tombstoned. Gate the out-of-fence projection clear on it so a stale lease can NEITHER tombstone
+    // NOR clear a newer owner's projection/stats (roborev HIGH — same fence the 2xx path uses).
+    const completed = await store.markDone(
       row.docUrl,
       {
         state: "tombstone",
         httpStatus: res.status,
+        webid: row.webid ?? undefined,
         error: "noindex (X-Robots-Tag) — not indexed",
         nextEligibleAt: farFuture(now()),
       },
       row.claimToken
     );
-    // Erase any previously-materialised triples for this WebID and SUBTRACT its
-    // dataset-stats contribution (DESIGN.md §2.1.j / §4.8 H1) — an empty triple list
-    // is the documented delete-by-webid, so VoID/DCAT counts decrement on tombstone.
-    if (row.webid) {
+    // Erase any previously-materialised triples for this WebID and SUBTRACT its dataset-stats
+    // contribution (DESIGN.md §2.1.j / §4.8 H1) — an empty triple list is the documented
+    // delete-by-webid, so VoID/DCAT counts decrement on tombstone. ONLY when the fenced completion
+    // above committed (markDone already cleared the projection + updated the suppressed counters for a
+    // known WebID inside its fence; this is belt-and-braces for any residue, still fence-gated).
+    if (completed && row.webid) {
       await store.upsertTriples({
         webid: row.webid,
         docUrl: row.docUrl,
@@ -613,19 +620,25 @@ async function finalizeHttpError(
 ): Promise<DocOutcome> {
   // 410 Gone → permanent erasure (DESIGN.md §3.4): tombstone.
   if (status === 410) {
-    await store.markDone(
+    // markDone returns whether the FENCED tombstone completion committed (false on a stale lease OR an
+    // already-tombstoned WebID). Gate the out-of-fence projection clear on it so a stale worker can
+    // NEITHER tombstone NOR clear a newer owner's projection/stats outside the lease fence (roborev
+    // HIGH — same fence as the 2xx + noindex paths).
+    const completed = await store.markDone(
       row.docUrl,
       {
         state: "tombstone",
         httpStatus: 410,
+        webid: row.webid ?? undefined,
         nextEligibleAt: farFuture(now()),
       },
       row.claimToken
     );
-    // Erase materialised triples + SUBTRACT the WebID's dataset-stats contribution
-    // (empty triple list = delete-by-webid) so VoID/DCAT counts decrement on erasure
-    // (DESIGN.md §2.1.j / §4.8 H1).
-    if (row.webid) {
+    // Erase materialised triples + SUBTRACT the WebID's dataset-stats contribution (empty triple list
+    // = delete-by-webid) so VoID/DCAT counts decrement on erasure (DESIGN.md §2.1.j / §4.8 H1). ONLY
+    // when the fenced completion committed (markDone already cleared the projection + updated the
+    // suppressed counters for a known WebID inside its fence; this is belt-and-braces, still gated).
+    if (completed && row.webid) {
       await store.upsertTriples({
         webid: row.webid,
         docUrl: row.docUrl,
