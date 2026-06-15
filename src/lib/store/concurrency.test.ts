@@ -296,8 +296,8 @@ describe("concurrency — interleaved projection leaves search + stats consisten
     // returns `completed` for exactly one worker, and the crawler gates upsertTriples() on that, so
     // the re-projections of a single WebID are SERIALISED by the lease, never concurrent. This asserts
     // the REPLACE invariant the fenced path relies on: re-projecting the same WebID replaces (never
-    // accumulates) its triples + stats. (The UNFENCED concurrent-same-WebID path is NOT serialised by
-    // the store itself — tracked as a follow-up bead — but the crawler never drives it concurrently.)
+    // accumulates) its triples + stats. (The unfenced concurrent-same-doc path is now ALSO serialised
+    // by the store itself — a doc-scoped advisory lock in upsertTriples, pss-0dks — see the next test.)
     const docUrl = "https://same.example/card";
     const webid = `${docUrl}#me`;
     await store.put(
@@ -321,5 +321,52 @@ describe("concurrency — interleaved projection leaves search + stats consisten
     const stats = await store.getStats();
     expect(stats.entities).toBe(1);
     expect(stats.triples).toBe(2);
+  });
+
+  it("CONCURRENT same-doc upserts do NOT duplicate triples or skew stats (advisory-lock serialised REPLACE — pss-0dks)", async () => {
+    // pss-0dks defence-in-depth: upsertTriples() now takes a doc-scoped advisory lock
+    // (pg_advisory_xact_lock(hashtext(docUrl))) and runs its whole DELETE+INSERT REPLACE inside one
+    // transaction, so two concurrent same-doc REPLACEs cannot interleave. pglite is a SINGLE
+    // connection (file-header note), so the two upserts below SERIALISE at the SQL level regardless;
+    // what this asserts is the SERIALISED-REPLACE INVARIANT the advisory lock guarantees in prod —
+    // however the two same-doc upserts order, the result is a clean REPLACE: no duplicate / orphaned
+    // triples and exact (un-skewed) stats, never the doubled-triple / double-counted-entity outcome a
+    // mid-REPLACE interleave would produce. Consistent with the framing of the sibling concurrency
+    // tests (they prove the SQL invariant; live multi-connection lock contention is the real-Postgres
+    // follow-up).
+    const docUrl = "https://race.example/card";
+    const webid = `${docUrl}#me`;
+    await store.put(
+      makeDoc({
+        docUrl,
+        webid,
+        state: "done",
+        rawRdf: `<${webid}> a <${FOAF}Person> .`,
+      })
+    );
+    const triples: TpfTriple[] = [
+      { s: webid, p: RDF_TYPE, o: `${FOAF}Person`, oIsIri: true },
+      { s: webid, p: `${FOAF}name`, o: "Racer", oIsIri: false },
+      { s: webid, p: `${FOAF}nick`, o: "rr", oIsIri: false },
+    ];
+    // Fire several same-doc REPLACEs at once — they contend for the SAME doc advisory lock.
+    await Promise.all(
+      Array.from({ length: 6 }, () =>
+        store.upsertTriples({ webid, docUrl, triples })
+      )
+    );
+
+    // The served triple set is EXACTLY one copy (3 triples) — no duplicates from an interleaved
+    // INSERT-before-DELETE.
+    const out = await store.tpf({ pattern: { s: webid }, limit: 100 });
+    expect(out.triples.length).toBe(3);
+    // Stats are un-skewed: this WebID counts as exactly one entity / one Person, 3 triples total.
+    const stats = await store.getStats();
+    expect(stats.entities).toBe(1);
+    expect(stats.triples).toBe(3);
+    const personPartition = stats.classPartitions.find(
+      (c) => c.classIri === `${FOAF}Person`
+    );
+    expect(personPartition?.entities).toBe(1);
   });
 });
