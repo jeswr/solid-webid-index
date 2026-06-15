@@ -11,8 +11,9 @@
  *  - timingSafeEqual is used (constant-time comparison is enforced)
  *  - runCrawlBatch is invoked and its summary is returned
  *  - Self-chain triggers when remaining = true AND depth < CRAWL_JOB_MAX_CHAIN_DEPTH:
- *      - after() is invoked (not a bare void promise) so the platform keeps the function alive
- *      - the scheduled promise is a fetch to /api/_jobs/crawl with depth+1
+ *      - after() is invoked with a callback function (not a pre-created promise) so the
+ *        platform can keep the function alive and invoke the callback after the response
+ *      - invoking the callback fires a fetch to /api/_jobs/crawl with depth+1
  *  - Self-chain does NOT trigger (after() not called) when remaining = false
  *  - Self-chain does NOT trigger when depth >= CRAWL_JOB_MAX_CHAIN_DEPTH (loop guard)
  *  - Chain cap halts further self-chaining
@@ -24,8 +25,8 @@
  * `vi.fn().mockImplementation(impl)`), and the crawlSummary object is mutated in-place
  * between tests (the function closes over the reference, not a snapshot).
  *
- * after() mock strategy: we mock `next/server` to capture the task passed to `after()`.
- * The mock immediately awaits it so we can synchronously verify the downstream fetch.
+ * after() mock strategy: we mock `next/server` to capture the callback passed to `after()`.
+ * The mock immediately invokes the callback so we can synchronously verify the downstream fetch.
  */
 import { timingSafeEqual } from "node:crypto";
 import { NextRequest } from "next/server";
@@ -70,11 +71,11 @@ vi.mock("@/lib/crawl/crawler", () => ({
 // Mock next/server — preserve NextRequest/NextResponse and capture after() calls.
 // afterMock is declared via vi.hoisted() so it is available inside the vi.mock() factory
 // (which is hoisted to before any import statements by vitest's transform).
-// The after() mock immediately invokes the task (a Promise) so we can assert on the
+// The after() mock immediately invokes the callback so we can assert on the
 // downstream fetch without asynchronous timing tricks.
 const { afterMock } = vi.hoisted(() => ({
-  afterMock: vi.fn(async (task: Promise<unknown>) => {
-    await task;
+  afterMock: vi.fn(async (task: () => unknown) => {
+    await task();
   }),
 }));
 
@@ -200,9 +201,10 @@ describe("/api/_jobs/crawl route", () => {
     crawlSummary.remaining = true;
     const { POST } = await import("./route");
     await POST(makeReq({ secret: GOOD_SECRET, depth: 0 }));
-    // after() should have been called once with the self-chain promise.
+    // after() should have been called once with a callback function (not a bare promise).
     expect(afterMock).toHaveBeenCalledOnce();
-    // The afterMock immediately awaits the task, so fetch should already have been called.
+    expect(typeof afterMock.mock.calls[0][0]).toBe("function");
+    // The afterMock immediately invokes the callback, so fetch should already have been called.
     expect(fetchMock).toHaveBeenCalledOnce();
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toMatch(/\/api\/_jobs\/crawl$/);
@@ -212,32 +214,41 @@ describe("/api/_jobs/crawl route", () => {
     );
   });
 
-  it("after() receives a Promise (the crawl is deferred to after(), not fetched inline)", async () => {
-    // The route must schedule the self-chain via after(promise), not by calling fetch directly
-    // and discarding the result.  We verify this by making after() NOT await the task and
-    // confirming the route can still return even if the task is never resolved.
+  it("after() receives a callback function (the crawl is deferred to after(), not fetched inline)", async () => {
+    // The route must schedule the self-chain via after(() => ...), not by calling fetch
+    // directly and discarding the result.  We verify:
+    //   1. after() is called with a function (not a Promise).
+    //   2. The route returns before the crawl fetch resolves (callback is not awaited by route).
+    //   3. Invoking the callback triggers the fetch.
     crawlSummary.remaining = true;
 
-    // Override after() so it does NOT await the task — simulates the platform keeping the
-    // function alive after the HTTP response is sent.
-    afterMock.mockImplementation(async (_task: Promise<unknown>) => {
-      // Deliberately do not await — the task runs asynchronously.
+    // Override after() so it does NOT invoke the callback — simulates the platform keeping
+    // the function alive after the HTTP response is sent.
+    afterMock.mockImplementation(async (_task: () => unknown) => {
+      // Deliberately do not call _task — the platform would call it asynchronously.
     });
 
     // Fetch never resolves (simulates a long-running follow-on crawl).
     fetchMock.mockReturnValue(new Promise<Response>(() => {}));
 
     const { POST } = await import("./route");
-    // POST must resolve even though the crawl promise never resolves, because the route
-    // hands the promise to after() and returns immediately without awaiting it.
+    // POST must resolve even though the callback is never invoked, because the route
+    // hands the callback to after() and returns immediately without calling it.
     const res = await POST(makeReq({ secret: GOOD_SECRET, depth: 0 }));
 
     expect(res.status).toBe(200);
-    // after() was invoked with the chain promise.
+    // after() was invoked once with a function (not a promise).
     expect(afterMock).toHaveBeenCalledOnce();
-    // fetch was NOT directly awaited by the route (it was deferred via after()).
-    // The fetch mock was called because after() received the promise (which started fetch),
-    // but the route did not block on it.
+    const capturedTask = afterMock.mock.calls[0][0];
+    expect(typeof capturedTask).toBe("function");
+    // fetch was NOT called yet — it only fires when the callback is invoked.
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    // Invoking the callback triggers the crawl fetch.
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), { status: 200 })
+    );
+    await (capturedTask as () => Promise<void>)();
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 

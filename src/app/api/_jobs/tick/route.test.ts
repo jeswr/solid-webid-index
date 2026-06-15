@@ -16,9 +16,9 @@
  *
  * VITEST NOTE: vi.mock() factories are hoisted to the top of the file.
  *
- * after() mock strategy: we mock `next/server` to capture the task passed to `after()`.
- * The mock can be configured per-test to either resolve immediately or block, letting us
- * verify that the route returns before the crawl completes.
+ * after() mock strategy: we mock `next/server` to capture the callback passed to `after()`.
+ * The mock can be configured per-test to either invoke the callback immediately or skip it,
+ * letting us verify that the route returns before the crawl completes.
  */
 import { timingSafeEqual } from "node:crypto";
 import { NextRequest } from "next/server";
@@ -36,10 +36,10 @@ import {
 
 // afterMock is declared via vi.hoisted() so it is available inside the vi.mock() factory
 // (which is hoisted to before any import statements by vitest's transform).
-// The after() mock records the task and resolves it so downstream assertions can observe it.
+// The after() mock records the callback and invokes it so downstream assertions can observe it.
 const { afterMock } = vi.hoisted(() => ({
-  afterMock: vi.fn(async (task: Promise<unknown>) => {
-    await task;
+  afterMock: vi.fn(async (task: () => unknown) => {
+    await task();
   }),
 }));
 
@@ -136,16 +136,17 @@ describe("/api/_jobs/tick route", () => {
     // the crawl-batch response.  We simulate a never-resolving crawl to prove the route
     // returns before the crawl completes.
 
-    let crawlStarted = false;
+    let callbackReceived = false;
     let crawlResolved = false;
 
-    // after() mock: records that the task started; does NOT await it (simulates platform
-    // behaviour — the platform keeps the function alive asynchronously).
-    afterMock.mockImplementation(async (task: Promise<unknown>) => {
-      crawlStarted = true;
-      // Intentionally do not await task here — we want to verify the route returns
-      // before the task resolves.
-      void task.then(() => {
+    // after() mock: records that the callback was received; does NOT invoke it (simulates
+    // platform behaviour — the platform calls the callback asynchronously after the response).
+    afterMock.mockImplementation(async (task: () => unknown) => {
+      callbackReceived = true;
+      // Intentionally do not call task() here — we want to verify the route returns
+      // before the callback is invoked.
+      void Promise.resolve().then(async () => {
+        await task();
         crawlResolved = true;
       });
     });
@@ -158,9 +159,10 @@ describe("/api/_jobs/tick route", () => {
 
     // Route returned with 202 even though the crawl is still pending.
     expect(res.status).toBe(202);
-    // after() was called (crawl was scheduled).
+    // after() was called with a callback function (crawl was scheduled).
     expect(afterMock).toHaveBeenCalledOnce();
-    expect(crawlStarted).toBe(true);
+    expect(typeof afterMock.mock.calls[0][0]).toBe("function");
+    expect(callbackReceived).toBe(true);
     // The crawl has NOT resolved yet (we never-resolved the fetch above).
     expect(crawlResolved).toBe(false);
   });
@@ -170,9 +172,10 @@ describe("/api/_jobs/tick route", () => {
   it("schedules the crawl via after() (not by awaiting fetch directly)", async () => {
     const { GET } = await import("./route");
     await GET(makeReq({ secret: GOOD_SECRET }));
-    // after() must be called exactly once with the crawl promise.
+    // after() must be called exactly once with a callback function (not a bare promise).
     expect(afterMock).toHaveBeenCalledOnce();
-    // The afterMock (default impl) awaits the task, so fetch should have been called.
+    expect(typeof afterMock.mock.calls[0][0]).toBe("function");
+    // The afterMock (default impl) invokes the callback, so fetch should have been called.
     expect(fetchMock).toHaveBeenCalledOnce();
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toMatch(/\/api\/_jobs\/crawl$/);

@@ -187,7 +187,7 @@ export async function POST(req: NextRequest): Promise<NextResponse> {
     // function is kept alive until the callback completes even after the HTTP response is
     // sent.  A bare `void` promise would be eligible for cancellation the moment the
     // response is flushed, causing the frontier to stall silently after the first batch.
-    after(triggerSelfChain(secret, depth + 1, baseUrl));
+    after(() => triggerSelfChain(secret, depth + 1, baseUrl));
   }
 
   return NextResponse.json({ ok: true, chainDepth: depth, summary });

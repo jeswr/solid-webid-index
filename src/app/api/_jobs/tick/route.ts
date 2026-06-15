@@ -125,7 +125,7 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
       ? `https://${process.env.VERCEL_URL}`
       : INDEX_BASE_URL;
 
-  after(fireCrawl(secret, baseUrl));
+  after(() => fireCrawl(secret, baseUrl));
 
   return NextResponse.json({ ok: true, scheduled: true }, { status: 202 });
 }
