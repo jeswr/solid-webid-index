@@ -19,6 +19,16 @@ function envStr(key: string, fallback: string): string {
   return process.env[key] ?? fallback;
 }
 
+/**
+ * Read a boolean env flag.  Truthy values: "1" / "true" / "yes" / "on"
+ * (case-insensitive).  Anything else (incl. unset / empty) → the fallback.
+ */
+function envBool(key: string, fallback: boolean): boolean {
+  const v = process.env[key];
+  if (v === undefined || v === "") return fallback;
+  return ["1", "true", "yes", "on"].includes(v.trim().toLowerCase());
+}
+
 // ─── Crawler bounds (§3.2) ───────────────────────────────────────────────────
 
 /** Maximum BFS depth from a seed. Termination is PK-dedup + FRONTIER_CAP; depth is a secondary guard. */
@@ -189,6 +199,36 @@ export const INBOX_PAGE_SIZE = envInt("INBOX_PAGE_SIZE", 50);
 
 /** Default page size for TPF fragments. */
 export const TPF_PAGE_SIZE = envInt("TPF_PAGE_SIZE", 100);
+
+/**
+ * Hard ceiling on the BOUNDED COUNT used for the TPF `void:triples` cardinality
+ * ESTIMATE when no `stats` counter covers the pattern (DESIGN.md §4.5 arch M1).
+ * The estimate is capped at this value so a hot/degenerate pattern can never
+ * trigger an unbounded scan on the hot path; the served `void:triples` is an
+ * advisory estimate, not an exact total.
+ */
+export const TPF_ESTIMATE_COUNT_CAP = envInt("TPF_ESTIMATE_COUNT_CAP", 10_000);
+
+/**
+ * Per-IP response byte budget for `GET /tpf` (DESIGN.md §4.5 security M3).  A
+ * single fragment response body larger than this is refused with 413; combined
+ * with the page cap it bounds the bytes any one client can pull per request.
+ */
+export const TPF_MAX_RESPONSE_BYTES = envInt(
+  "TPF_MAX_RESPONSE_BYTES",
+  512 * 1024
+);
+
+// ─── SPARQL (optional, OFF by default — §4.6) ────────────────────────────────
+
+/**
+ * Whether the optional SPARQL endpoint (`GET /sparql`) is enabled.  Default OFF
+ * (Hobby cost / no SPARQL engine): when false the dataset description routes
+ * (`/.well-known/void`, `/`) MUST NOT advertise a `void:sparqlEndpoint` /
+ * `sd:Service` / SPARQL `dcat:DataService` — never advertise an endpoint that would
+ * 404 (DESIGN.md §4.2 / §4.6 sw M2).
+ */
+export const SPARQL_ENABLED = envBool("SPARQL_ENABLED", false);
 
 /** Max FTS tokens after tokenisation (security H4 — never pass operators). */
 export const FTS_MAX_TOKENS = envInt("FTS_MAX_TOKENS", 8);
