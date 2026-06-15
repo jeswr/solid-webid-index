@@ -31,7 +31,9 @@
 
 import {
   EmbeddedJWK,
+  type FlattenedJWSInput,
   type JWK,
+  type JWTHeaderParameters,
   type JWTPayload,
   type JWTVerifyGetKey,
   calculateJwkThumbprint,
@@ -346,7 +348,7 @@ async function verifyDpopProof(
   try {
     const result = await jwtVerify(
       req.dpop as string,
-      async (h, token) => {
+      async (h: JWTHeaderParameters, token: FlattenedJWSInput) => {
         embeddedJwk = h.jwk;
         return EmbeddedJWK(h, token);
       },
