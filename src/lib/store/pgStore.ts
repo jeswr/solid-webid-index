@@ -246,6 +246,55 @@ export class PgStore
     // Neon uses statement-level splitting via splitSqlStatements() (safe for
     // DDL-only files with no dollar-quoted function bodies).
     await this.db.exec(schemaSql);
+
+    // ── slug backfill (idempotent) ──────────────────────────────────────────
+    //
+    // The `slug` column shipped AFTER `webid`, so rows crawled before the slug
+    // route landed have `webid IS NOT NULL AND slug IS NULL`.  Without a backfill,
+    // /lookup?webid= 303-redirects to /p/{slug} (it computes the slug forward)
+    // but /p/{slug} then 404s (getEntryBySlug reads the empty slug column) — a
+    // misleading 303→404 chain.  The slug is derived in app code (sha256+base32,
+    // see slugForWebId), not in SQL, so it cannot be a generated column — we
+    // compute it here for each affected row.
+    //
+    // Idempotent: the predicate `slug IS NULL` means a re-run after a successful
+    // backfill selects nothing, and slugForWebId is deterministic so a partial
+    // run is safe to resume.  Batched to keep memory bounded on large tables.
+    await this.backfillSlugs();
+  }
+
+  /**
+   * Compute and persist `slug` for every row that has a `webid` but no `slug`
+   * (pre-slug rows).  Called from migrate(); safe to call repeatedly.
+   *
+   * The slug is sha256(webid)→base32 (slugForWebId) — not expressible in SQL —
+   * so we read the backlog in pages and UPDATE each row by its webid.  The
+   * `WHERE slug IS NULL` guard on both the SELECT and the UPDATE makes this
+   * idempotent and re-entrant under concurrent migrators.
+   */
+  private async backfillSlugs(): Promise<void> {
+    const PAGE = 500;
+    // Loop until no more pre-slug rows remain.  Each page reads distinct webids
+    // that still lack a slug and writes the computed slug back.
+    for (;;) {
+      const rows = await this.db.query<{ webid: string }>(
+        `SELECT DISTINCT webid FROM doc
+           WHERE webid IS NOT NULL AND slug IS NULL
+           LIMIT $1`,
+        [PAGE]
+      );
+      if (rows.length === 0) break;
+
+      for (const { webid } of rows) {
+        await this.db.query(
+          "UPDATE doc SET slug = $1 WHERE webid = $2 AND slug IS NULL",
+          [slugForWebId(webid), webid]
+        );
+      }
+
+      // Final partial page → done (avoids an extra empty SELECT round-trip).
+      if (rows.length < PAGE) break;
+    }
   }
 
   // ─── ReadStore ─────────────────────────────────────────────────────────────

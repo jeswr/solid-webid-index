@@ -687,6 +687,39 @@ describe("buildRdfResponse", () => {
     expect(link).toContain("json-ld#context");
   });
 
+  // ── roborev MEDIUM: APPEND the JSON-LD context link, never overwrite a
+  //    caller-supplied Link header (RFC 8288 §3.5). ──────────────────────────
+  it("JSON-LD APPENDS the context link to a caller-supplied Link (does not overwrite)", async () => {
+    const callerLink =
+      '<https://example/Type>; rel="type", <https://example/void>; rel="describedby"';
+    const resp = await buildRdfResponse({
+      request: req("application/ld+json"),
+      quads: sampleQuads(),
+      extraHeaders: { Link: callerLink },
+    });
+    if (resp === null) throw new Error("expected non-null response");
+    const link = resp.headers.get("Link") ?? "";
+    // Caller links survive…
+    expect(link).toContain('rel="type"');
+    expect(link).toContain("describedby");
+    // …and the context link is appended (comma-joined).
+    expect(link).toContain("json-ld#context");
+    expect(link.split(",").length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("Turtle response preserves a caller-supplied Link verbatim (no context link)", async () => {
+    const callerLink = '<https://example/Type>; rel="type"';
+    const resp = await buildRdfResponse({
+      request: req("text/turtle"),
+      quads: sampleQuads(),
+      extraHeaders: { Link: callerLink },
+    });
+    if (resp === null) throw new Error("expected non-null response");
+    const link = resp.headers.get("Link") ?? "";
+    expect(link).toBe(callerLink);
+    expect(link).not.toContain("json-ld#context");
+  });
+
   // ── Finding 3: multi-value If-None-Match in buildRdfResponse ──────────────
 
   it("multi-value If-None-Match containing the current ETag → 304", async () => {
@@ -928,5 +961,25 @@ describe("buildCachedRdfResponse", () => {
       profile: null,
     });
     expect(resp.status).toBe(200);
+  });
+
+  // ── roborev MEDIUM: cached JSON-LD also APPENDS the context link ──────────────
+  it("cached JSON-LD APPENDS the context link to a caller-supplied Link", () => {
+    const body = '{"@context":{},"@id":"https://alice.example/card#me"}';
+    const callerLink =
+      '<https://example/Type>; rel="type", <https://example/void>; rel="describedby"';
+    const resp = buildCachedRdfResponse({
+      request: req("application/ld+json"),
+      body,
+      mediaType: "application/ld+json",
+      profile: null,
+      extraHeaders: { Link: callerLink },
+    });
+    expect(resp.status).toBe(200);
+    const link = resp.headers.get("Link") ?? "";
+    expect(link).toContain('rel="type"');
+    expect(link).toContain("describedby");
+    expect(link).toContain("json-ld#context");
+    expect(link.split(",").length).toBeGreaterThanOrEqual(3);
   });
 });

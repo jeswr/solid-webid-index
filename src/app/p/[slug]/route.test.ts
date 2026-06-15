@@ -154,6 +154,38 @@ describe("GET /p/{slug}", () => {
     expect(body).toHaveProperty("@context");
   });
 
+  // ── roborev MEDIUM: the JSON-LD context Link must be APPENDED, not overwrite ──
+  //
+  // buildRdfResponse previously OVERWROTE the caller-supplied Link header when it
+  // added the JSON-LD context link, so a JSON-LD /p/{slug} lost the required
+  // rel="type" + rel="describedby" links.  All three must now ride together
+  // (comma-joined per RFC 8288).
+  it("conneg: JSON-LD Link carries rel=type, rel=describedby AND the context link together", async () => {
+    await seedDone();
+    const res = await GET(req(SLUG, "application/ld+json"), ctx(SLUG));
+    expect(res.status).toBe(200);
+    const link = res.headers.get("Link") ?? "";
+    // The entry's required links survive the JSON-LD context append…
+    expect(link).toContain('rel="type"');
+    expect(link).toContain("describedby");
+    // …alongside the JSON-LD context link.
+    expect(link).toContain("json-ld#context");
+    // Sanity: it is genuinely a comma-joined multi-link header (RFC 8288), not
+    // just the bare context link replacing everything.
+    expect(link.split(",").length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("conneg: the Turtle branch keeps its rel=type + rel=describedby links (no context link)", async () => {
+    await seedDone();
+    const res = await GET(req(SLUG, "text/turtle"), ctx(SLUG));
+    expect(res.status).toBe(200);
+    const link = res.headers.get("Link") ?? "";
+    expect(link).toContain('rel="type"');
+    expect(link).toContain("describedby");
+    // Turtle is not JSON-LD → no context link is appended.
+    expect(link).not.toContain("json-ld#context");
+  });
+
   it("304 — conditional via If-None-Match echoes the ETag", async () => {
     await seedDone();
     const first = await GET(req(SLUG), ctx(SLUG));

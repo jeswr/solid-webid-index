@@ -177,6 +177,73 @@ describe("PgStore — migration", () => {
     );
     expect(cols.rows).toHaveLength(2);
   });
+
+  // ── roborev MEDIUM: pre-slug rows (webid, NULL slug) must be BACKFILLED ───────
+  //
+  // The `slug` column shipped after `webid`.  A row crawled before slug landed has
+  // `webid IS NOT NULL AND slug IS NULL`.  Without a backfill, /lookup?webid=
+  // 303-redirects to /p/{slug} (it computes the slug forward) but /p/{slug} 404s
+  // because getEntryBySlug reads the empty slug column — a misleading 303→404 chain.
+  // migrate() must backfill slug = slugForWebId(webid) so the 303 target 200s.
+  it("backfills slug for pre-slug rows (webid set, slug NULL) so /p/{slug} resolves", async () => {
+    const db = new PGlite();
+    const store = new PgStore(createPgliteExecutor(db));
+    // First migrate to create the table with the slug column.
+    await store.migrate();
+
+    // Simulate a PRE-SLUG row: insert a crawled `done` doc with a webid but NULL
+    // slug (as if it were written before the slug column / backfill existed).
+    const webid = "https://legacy.pod/card#me";
+    await db.exec(`
+      INSERT INTO doc (doc_url, host, webid, state, enqueued_at, slug)
+      VALUES ('https://legacy.pod/card', 'legacy.pod', '${webid}', 'done', 0, NULL);
+    `);
+
+    // Confirm the row genuinely has a NULL slug, and that /p/{slug} would 404.
+    const expectedSlug = slugForWebId(webid);
+    const before = await store.getEntryBySlug(expectedSlug);
+    expect(before).toBeNull(); // the 303 target would 404 before the backfill
+
+    // Re-run migrate() — its backfill step must fill slug for the pre-slug row.
+    await store.migrate();
+
+    // The slug column is now populated with the deterministic slug.
+    const slugRow = await db.query<{ slug: string | null }>(
+      `SELECT slug FROM doc WHERE webid = '${webid}'`
+    );
+    expect(slugRow.rows[0].slug).toBe(expectedSlug);
+
+    // The 303 target (/p/{slug}) now RESOLVES — getEntryBySlug returns the row,
+    // i.e. the entry route would 200, not 404.  This is the exact slug /lookup
+    // would redirect to (slugForWebId(canonical webid)).
+    const after = await store.getEntryBySlug(expectedSlug);
+    expect(after).not.toBeNull();
+    expect(after).not.toBe("tombstoned");
+    if (after && after !== "tombstoned") {
+      expect(after.webid).toBe(webid);
+    }
+  });
+
+  it("slug backfill is idempotent — a third migrate() leaves the slug unchanged", async () => {
+    const db = new PGlite();
+    const store = new PgStore(createPgliteExecutor(db));
+    await store.migrate();
+
+    const webid = "https://legacy2.pod/card#me";
+    await db.exec(`
+      INSERT INTO doc (doc_url, host, webid, state, enqueued_at, slug)
+      VALUES ('https://legacy2.pod/card', 'legacy2.pod', '${webid}', 'done', 0, NULL);
+    `);
+
+    await store.migrate(); // backfill
+    await store.migrate(); // re-run: WHERE slug IS NULL selects nothing
+    await expect(store.migrate()).resolves.toBeUndefined();
+
+    const slugRow = await db.query<{ slug: string | null }>(
+      `SELECT slug FROM doc WHERE webid = '${webid}'`
+    );
+    expect(slugRow.rows[0].slug).toBe(slugForWebId(webid));
+  });
 });
 
 describe("PgStore — ReadStore", () => {

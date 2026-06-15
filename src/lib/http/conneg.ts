@@ -686,6 +686,27 @@ export async function serializeToType(
   }
 }
 
+/**
+ * The JSON-LD context Link header value (rel per the JSON-LD 1.1 spec).
+ * Added to every `application/ld+json` response so a client can discover the
+ * bundled @context out-of-band (DESIGN.md §4.0).
+ */
+const JSONLD_CONTEXT_LINK = `<${INDEX_BASE_URL}/ns/context.jsonld>; rel="http://www.w3.org/ns/json-ld#context"`;
+
+/**
+ * Append the JSON-LD context link to an existing `Link` header value,
+ * comma-joining per RFC 8288 §3.5.  A caller-supplied `Link` (e.g. the entry
+ * route's rel="type" + rel="describedby" links) MUST be preserved — overwriting
+ * it would strip those required links from the JSON-LD representation.
+ *
+ * @param existing  The caller-supplied Link header value (may be undefined/empty).
+ * @returns The combined Link header value (existing links first, context last).
+ */
+function withJsonLdContextLink(existing: string | undefined): string {
+  const trimmed = existing?.trim();
+  return trimmed ? `${trimmed}, ${JSONLD_CONTEXT_LINK}` : JSONLD_CONTEXT_LINK;
+}
+
 // ─── Next.js response helpers ─────────────────────────────────────────────────
 
 /**
@@ -845,11 +866,12 @@ export async function buildRdfResponse(
     ...extraHeaders,
   };
 
-  // JSON-LD: add Link rel="http://www.w3.org/ns/json-ld#context" (DESIGN.md §4.0).
+  // JSON-LD: APPEND Link rel="http://www.w3.org/ns/json-ld#context" (DESIGN.md §4.0).
+  // RFC 8288 §3.5 — comma-join with any caller-supplied Link (e.g. the entry
+  // route's rel="type" + rel="describedby"); never overwrite it.
   if (type === "application/ld+json") {
     // biome-ignore lint/complexity/useLiteralKeys: "Link" key chosen to match HTTP header name
-    headers["Link"] =
-      `<${INDEX_BASE_URL}/ns/context.jsonld>; rel="http://www.w3.org/ns/json-ld#context"`;
+    headers["Link"] = withJsonLdContextLink(extraHeaders["Link"]);
   }
 
   return new Response(body, { status, headers });
@@ -969,9 +991,10 @@ export function buildCachedRdfResponse(opts: {
     "Content-Type": contentType,
   };
   if (mediaType === "application/ld+json") {
+    // APPEND the context link to any caller-supplied Link (RFC 8288 §3.5) — see
+    // withJsonLdContextLink; never overwrite the caller's rel="type"/describedby.
     // biome-ignore lint/complexity/useLiteralKeys: "Link" key chosen to match HTTP header name
-    headers["Link"] =
-      `<${INDEX_BASE_URL}/ns/context.jsonld>; rel="http://www.w3.org/ns/json-ld#context"`;
+    headers["Link"] = withJsonLdContextLink(extraHeaders["Link"]);
   }
 
   return new Response(body, { status, headers });
