@@ -10,7 +10,9 @@
  *   - hydra:IriTemplate describing the search entrypoint on the root resource
  *   - CORS for public read access
  *
- * Content-negotiated via conneg.ts (Turtle default, JSON-LD, N-Triples).
+ * Content-negotiated via conneg.ts (Turtle default, JSON-LD, N-Triples).  This is
+ * an RDF-only endpoint (no HTML page), so an HTML-preferring browser Accept is
+ * served Turtle with full headers (htmlBranch="turtle") — never a bare empty 200.
  *
  * FTS: delegates to SearchIndex.search() (pgStore — label_fts weighted tsvector).
  * Query sanitisation: lowercase → strip non-[a-z0-9 ] → split → cap tokens.
@@ -219,19 +221,21 @@ export async function GET(request: Request): Promise<Response> {
       nextCursor: null,
     });
 
+    // RDF-only endpoint: htmlBranch="turtle" means an HTML-preferring (browser)
+    // Accept is served Turtle with full CORS + Content-Type + ETag headers, never
+    // a bare empty 200 — so buildRdfResponse always returns a Response here.
     const rdfResponse = await buildRdfResponse({
       request,
       quads: emptyQuads,
       status: 200,
+      htmlBranch: "turtle",
       extraHeaders: {
         "Cache-Control":
           "public, max-age=60, s-maxage=300, stale-while-revalidate=86400",
       },
     });
 
-    // buildRdfResponse returns null for browser HTML branch — search has no HTML
-    // page component yet so we fall back to a minimal 200 Turtle response.
-    return rdfResponse ?? new Response("", { status: 200 });
+    return rdfResponse as Response;
   }
 
   const store = makeStore();
@@ -257,17 +261,19 @@ export async function GET(request: Request): Promise<Response> {
     nextCursor,
   });
 
+  // RDF-only endpoint (htmlBranch="turtle"): always a Response, never null.
   const rdfResponse = await buildRdfResponse({
     request,
     quads,
     status: 200,
+    htmlBranch: "turtle",
     extraHeaders: {
       "Cache-Control":
         "public, max-age=60, s-maxage=300, stale-while-revalidate=86400",
     },
   });
 
-  return rdfResponse ?? new Response("", { status: 200 });
+  return rdfResponse as Response;
 }
 
 // Handle OPTIONS (CORS preflight) — CORS headers are already set by buildRdfResponse

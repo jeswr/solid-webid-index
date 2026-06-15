@@ -71,6 +71,29 @@ CREATE TABLE IF NOT EXISTS doc (
                     ) STORED
 );
 
+-- ─── doc column migrations (idempotent) ──────────────────────────────────────
+--
+-- CREATE TABLE IF NOT EXISTS above is a NO-OP on an already-created `doc` table,
+-- so columns added AFTER the table first shipped (label, label_fts) would be
+-- ABSENT on a pre-existing database — and the CREATE INDEX … (label_fts) below
+-- would then FAIL with "column \"label_fts\" does not exist".
+--
+-- ALTER TABLE … ADD COLUMN IF NOT EXISTS is the idempotent bridge: it adds the
+-- column on an old-shape table and is a no-op once present (fresh schemas already
+-- have it from the CREATE TABLE above, so the ALTERs are no-ops there too).  These
+-- MUST run BEFORE the GIN index on label_fts.  The generated expression here is
+-- byte-identical to the CREATE TABLE definition above — keep the two in sync.
+--
+-- PG / pglite support: PostgreSQL ≥ 12 (pglite 0.5.x ships PG 18) supports adding
+-- a STORED generated column via ALTER TABLE, including the ADD COLUMN IF NOT EXISTS
+-- form — verified against pglite 0.5.2 in pgStore.test.ts.
+ALTER TABLE doc ADD COLUMN IF NOT EXISTS label TEXT;
+
+ALTER TABLE doc ADD COLUMN IF NOT EXISTS label_fts TSVECTOR GENERATED ALWAYS AS (
+  setweight(to_tsvector('english', coalesce(label, '')), 'A')
+  || setweight(to_tsvector('english', coalesce(raw_rdf, '')), 'D')
+) STORED;
+
 -- Frontier / claim query index
 CREATE INDEX IF NOT EXISTS idx_doc_ready    ON doc (state, next_eligible_at);
 CREATE INDEX IF NOT EXISTS idx_doc_host     ON doc (host, state, next_eligible_at);

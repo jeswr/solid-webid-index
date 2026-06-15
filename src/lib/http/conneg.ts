@@ -702,6 +702,21 @@ const READ_CORS_HEADERS: Record<string, string> = {
 };
 
 /**
+ * What to do when the `Accept` header prefers HTML (a browser request) on an
+ * endpoint that participates in conneg:
+ *
+ *   - "page"   (default): return `null` so the caller lets Next.js render its HTML
+ *                page component. Use this only when the route HAS an HTML page.
+ *   - "turtle": this is an RDF-ONLY endpoint with no HTML page — serve Turtle (with
+ *                full CORS + Content-Type + ETag headers) instead of deferring to a
+ *                non-existent page. A browser visiting the URL still gets a valid,
+ *                correctly-headed RDF body rather than a bare empty 200.
+ *   - "406":    reject the HTML-preferring request with a proper 406 Not Acceptable
+ *                (text/plain body, CORS + Vary headers) — never a bare empty 200.
+ */
+export type HtmlBranch = "page" | "turtle" | "406";
+
+/**
  * Options for `buildRdfResponse`.
  */
 export interface BuildRdfResponseOptions {
@@ -713,6 +728,15 @@ export interface BuildRdfResponseOptions {
   status?: number;
   /** Extra response headers to merge in (e.g. Link, Cache-Control). */
   extraHeaders?: Record<string, string>;
+  /**
+   * How to handle an HTML-preferring Accept header (default "page").
+   *
+   * RDF-only endpoints (e.g. /search) have no HTML page component, so they MUST
+   * pass "turtle" or "406" — otherwise this helper returns `null` and the caller
+   * is forced to fall back to a bare empty 200 with no headers (the bug this
+   * option fixes).
+   */
+  htmlBranch?: HtmlBranch;
 }
 
 /**
@@ -720,9 +744,9 @@ export interface BuildRdfResponseOptions {
  *
  * Behaviour:
  *   1. Negotiate the best representation from the `Accept` header.
- *      - Returns `null` when the caller should render the HTML page
- *        (browser detect); the caller must return a `null` check and
- *        let Next.js serve the page component.
+ *      - HTML-preferring Accept → behaviour controlled by `opts.htmlBranch`
+ *        ("page" → return `null` so the caller renders the Next.js page;
+ *         "turtle" → serve Turtle with full headers; "406" → 406 Not Acceptable).
  *      - Returns a `Response` with status 406 when no type is satisfiable.
  *   2. Serialise the quads to the winning type (Turtle / JSON-LD / N-Triples).
  *   3. Compute an ETag (sha256-{16hex} over body + media type + profile).
@@ -730,21 +754,52 @@ export interface BuildRdfResponseOptions {
  *   5. Set `Vary: Accept`, `Content-Type`, `ETag`, CORS headers, and any
  *      caller-supplied `extraHeaders`.
  *
- * @returns `null` when the HTML branch is taken (caller renders page);
- *          otherwise a `Response` (200/304/406).
+ * @returns `null` only when `htmlBranch === "page"` and the Accept prefers HTML
+ *          (caller renders the page); otherwise always a `Response` (200/304/406).
  */
 export async function buildRdfResponse(
   opts: BuildRdfResponseOptions
 ): Promise<Response | null> {
-  const { request, quads, status = 200, extraHeaders = {} } = opts;
+  const {
+    request,
+    quads,
+    status = 200,
+    extraHeaders = {},
+    htmlBranch = "page",
+  } = opts;
   const acceptHeader = request.headers.get("Accept");
   const ifNoneMatch = request.headers.get("If-None-Match");
 
   // ── 1. Negotiate ────────────────────────────────────────────────────────────
-  const { type, profile } = negotiateType(acceptHeader);
+  let { type, profile } = negotiateType(acceptHeader);
 
-  // HTML branch → tell the caller to let Next.js render the page.
-  if (type === HTML_SENTINEL) return null;
+  // HTML branch — an HTML-preferring Accept (a browser).  How to respond depends
+  // on whether the endpoint has an HTML page component (htmlBranch).
+  if (type === HTML_SENTINEL) {
+    if (htmlBranch === "page") {
+      // Endpoint has an HTML page → let the caller render it (Next.js page).
+      return null;
+    }
+    if (htmlBranch === "406") {
+      // RDF-only endpoint, strict: reject HTML with a proper 406 (never empty 200).
+      return new Response(
+        "Not Acceptable: this endpoint serves RDF only (text/turtle, application/ld+json, application/n-triples)",
+        {
+          status: 406,
+          headers: {
+            "Content-Type": "text/plain; charset=utf-8",
+            Vary: "Accept",
+            ...READ_CORS_HEADERS,
+            ...extraHeaders,
+          },
+        }
+      );
+    }
+    // htmlBranch === "turtle": RDF-only endpoint, friendly — serve Turtle with
+    // full headers so a browser still gets a valid, correctly-headed RDF body.
+    type = "text/turtle";
+    profile = null;
+  }
 
   // 406 — no satisfiable type.
   if (type === null) {

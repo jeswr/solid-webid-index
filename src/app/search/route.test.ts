@@ -663,6 +663,60 @@ describe("GET /search — content negotiation", () => {
     const res = await GET(req);
     expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
   });
+
+  // ── roborev MEDIUM: an HTML-preferring (browser) Accept must NOT yield a bare
+  // empty 200.  This RDF-only endpoint serves Turtle with full headers instead.
+  it("serves Turtle (not an empty 200) for a browser HTML-preferring Accept", async () => {
+    const browserAccept =
+      "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+    const req = makeRequest({ q: "dave" }, browserAccept);
+    const res = await GET(req);
+
+    expect(res.status).toBe(200);
+    // Real RDF content type — never an empty/unset body.
+    expect(res.headers.get("Content-Type")).toContain("text/turtle");
+    // Headers that the bug dropped must be present.
+    expect(res.headers.get("Vary")).toContain("Accept");
+    expect(res.headers.get("ETag")).toMatch(/^"sha256-[0-9a-f]{16}"$/);
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+
+    // Body is a non-empty, parseable RDF document with the matched member.
+    const body = await res.text();
+    expect(body.length).toBeGreaterThan(0);
+    const rdfStore = await parseTurtle(body, INDEX_BASE_URL);
+    const members = rdfStore.getQuads(
+      `${INDEX_BASE_URL}/search`,
+      `${HYDRA}member`,
+      null,
+      null
+    );
+    expect(members.map((t) => t.object.value)).toContain(
+      "https://dave.example/card#me"
+    );
+  });
+
+  it("serves Turtle with full headers for a browser Accept on an empty/blank query", async () => {
+    const browserAccept = "text/html,application/xhtml+xml,*/*;q=0.8";
+    const req = makeRequest({ q: "   " }, browserAccept);
+    const res = await GET(req);
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toContain("text/turtle");
+    expect(res.headers.get("ETag")).toMatch(/^"sha256-[0-9a-f]{16}"$/);
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+
+    // Empty collection, but a valid RDF body (not a bare empty 200).
+    const body = await res.text();
+    expect(body.length).toBeGreaterThan(0);
+    const rdfStore = await parseTurtle(body, INDEX_BASE_URL);
+    const typeTriples = rdfStore.getQuads(
+      `${INDEX_BASE_URL}/search`,
+      `${RDF}type`,
+      `${HYDRA}Collection`,
+      null
+    );
+    expect(typeTriples.length).toBeGreaterThan(0);
+  });
 });
 
 // ─── Route: OPTIONS preflight ──────────────────────────────────────────────────

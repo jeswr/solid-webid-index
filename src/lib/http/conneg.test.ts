@@ -516,7 +516,7 @@ describe("computeETag", () => {
 // ─── buildRdfResponse ─────────────────────────────────────────────────────────
 
 describe("buildRdfResponse", () => {
-  it("returns null for a browser Accept header", async () => {
+  it("returns null for a browser Accept header (default htmlBranch=page)", async () => {
     const result = await buildRdfResponse({
       request: req(
         "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
@@ -524,6 +524,38 @@ describe("buildRdfResponse", () => {
       quads: sampleQuads(),
     });
     expect(result).toBeNull();
+  });
+
+  it("htmlBranch=turtle serves Turtle (with headers) for a browser Accept — never null/empty", async () => {
+    const resp = await buildRdfResponse({
+      request: req(
+        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+      ),
+      quads: sampleQuads(),
+      htmlBranch: "turtle",
+    });
+    if (resp === null) throw new Error("expected non-null response");
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get("Content-Type")).toContain("text/turtle");
+    expect(resp.headers.get("Vary")).toBe("Accept");
+    expect(resp.headers.get("ETag")).toMatch(/^"sha256-[0-9a-f]{16}"$/);
+    expect(resp.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    expect((await resp.text()).length).toBeGreaterThan(0);
+  });
+
+  it("htmlBranch=406 rejects a browser Accept with 406 + CORS/Vary headers", async () => {
+    const resp = await buildRdfResponse({
+      request: req(
+        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+      ),
+      quads: sampleQuads(),
+      htmlBranch: "406",
+    });
+    if (resp === null) throw new Error("expected non-null response");
+    expect(resp.status).toBe(406);
+    expect(resp.headers.get("Content-Type")).toContain("text/plain");
+    expect(resp.headers.get("Vary")).toBe("Accept");
+    expect(resp.headers.get("Access-Control-Allow-Origin")).toBe("*");
   });
 
   it("returns 200 with text/turtle for */*", async () => {
