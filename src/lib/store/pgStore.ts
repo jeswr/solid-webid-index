@@ -1039,13 +1039,16 @@ export class PgStore
 
   async recordNotification(input: RecordNotificationInput): Promise<void> {
     const { id, receivedAt, actor, activity, body, objectIris } = input;
+    // `processed` defaults to TRUE (candidates enqueued at receipt). It is set FALSE when admission
+    // was DEFERRED (daily budget exhausted) so the daily drain can pick the notification up later.
+    const processed = input.processed ?? true;
     // Insert the notification, then its extracted candidate objects. ON CONFLICT DO NOTHING keeps
     // the write idempotent under at-least-once retries / a duplicated client Slug.
     await this.db.query(
       `INSERT INTO inbox (id, received_at, actor, activity, body, redacted, processed)
-         VALUES ($1, $2, $3, $4, $5, FALSE, TRUE)
+         VALUES ($1, $2, $3, $4, $5, FALSE, $6)
        ON CONFLICT (id) DO NOTHING`,
-      [id, receivedAt, actor, activity, body]
+      [id, receivedAt, actor, activity, body, processed]
     );
     for (const objectIri of objectIris) {
       await this.db.query(

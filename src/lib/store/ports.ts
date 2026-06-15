@@ -404,6 +404,14 @@ export interface RecordNotificationInput {
   body: string;
   /** The extracted `as:object` candidate IRIs (≥1, ≤10) — persisted to the child table. */
   objectIris: string[];
+  /**
+   * Whether this notification's candidates were enqueued at receipt time.
+   *  - `true`  (default) — at least one candidate was admitted + enqueued immediately.
+   *  - `false`           — admission was DEFERRED (daily admission budget exhausted): the candidates
+   *                        are persisted but NOT enqueued, so the daily drain (the cron) can pick the
+   *                        notification up later. Matches the `processed` column semantics.
+   */
+  processed?: boolean;
 }
 
 /**

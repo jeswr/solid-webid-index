@@ -12,10 +12,14 @@
  * decided WITHOUT touching the network:
  *
  *   1. Parse with WHATWG `URL` (reject unparseable).
- *   2. Scheme gate — https only (http only under `allowLoopback` for dev/tests, loopback host only).
+ *   2. Scheme gate — https only. http: is permitted ONLY when `allowLoopback` is set AND the host is
+ *      an actual loopback literal (the relaxation is scoped to the loopback fixture, never to any
+ *      `http:` URL — a misconfigured `allowLoopback` cannot admit a public http: host).
  *   3. Reject userinfo (username / password).
- *   4. Port gate — 443 only in production (defence in depth; an internal service on an odd port is
- *      exactly the SSRF we never want even to enqueue).
+ *   4. Port gate — 443 only, EXCEPT a loopback fixture host under `allowLoopback` (which binds an
+ *      ephemeral port). A non-loopback host always faces the strict https-and-443 gate even when
+ *      `allowLoopback` is set (defence in depth; an internal service on an odd port is exactly the
+ *      SSRF we never want even to enqueue).
  *   5. Hostname denylist (cloud-internal names) — reuses {@link isDeniedHostname}.
  *   6. Reject host LITERALS that classify as non-public (loopback / private / link-local / etc.) — an
  *      IP-literal candidate is decidable with NO DNS via the vendored {@link isPublicAddress}, after
@@ -28,7 +32,7 @@
  */
 
 import { isIP } from "node:net";
-import { isPublicAddress } from "./addresses";
+import { isLoopbackAddress, isPublicAddress } from "./addresses";
 import { isDeniedHostname, normalizeHostForClassification } from "./ssrf";
 
 /** Outcome of the syntactic gate. */
@@ -62,17 +66,31 @@ export function syntacticSsrfCheck(
     return { ok: false, reason: "candidate is not a valid absolute URL" };
   }
 
-  // 2. Scheme gate.
+  // ── Classify the host FIRST (no DNS) so the loopback relaxation can be scoped to loopback ONLY.
+  // Normalise alternate IPv4 encodings (decimal/octal/hex/short-form) so e.g. http://2130706433/
+  // (== 127.0.0.1) classifies as the loopback literal it really is. A real hostname round-trips
+  // unchanged and is NOT an IP literal — `isHostLoopback` is therefore false for it, so a hostname
+  // never benefits from the loopback relaxation (it always faces the strict https-and-443 gate).
+  const normalized = normalizeHostForClassification(url.hostname);
+  const isHostLoopback =
+    isIP(normalized) !== 0 && isLoopbackAddress(normalized);
+  // The dev/test relaxation (http: + arbitrary port) applies ONLY when BOTH the env hook is set AND
+  // the host is an actual loopback literal. A misconfigured `allowLoopback` therefore can NEVER admit
+  // a public http: URL or a non-443 public host (M4 — over-relaxation fix).
+  const relax = allowLoopback && isHostLoopback;
+
+  // 2. Scheme gate. http: is permitted ONLY for a loopback host under the dev/test hook.
   if (url.protocol !== "https:" && url.protocol !== "http:") {
     return {
       ok: false,
       reason: `candidate scheme must be https: (got ${url.protocol})`,
     };
   }
-  if (url.protocol === "http:" && !allowLoopback) {
+  if (url.protocol === "http:" && !relax) {
     return {
       ok: false,
-      reason: "candidate scheme must be https: (http: is dev/test only)",
+      reason:
+        "candidate scheme must be https: (http: is dev/test loopback only)",
     };
   }
 
@@ -81,8 +99,9 @@ export function syntacticSsrfCheck(
     return { ok: false, reason: "candidate URL must not carry userinfo" };
   }
 
-  // 4. Port gate — production only. Under allowLoopback the fixture binds an ephemeral port.
-  if (!allowLoopback && url.port !== "") {
+  // 4. Port gate. In production (and for ANY non-loopback host even under allowLoopback) only 443 is
+  //    permitted. The ephemeral-port relaxation is scoped to a loopback fixture host (`relax`).
+  if (!relax && url.port !== "") {
     const port = Number(url.port);
     if (!(url.protocol === "https:" && port === 443)) {
       return {
@@ -101,9 +120,10 @@ export function syntacticSsrfCheck(
     };
   }
 
-  // 6. IP-literal classification (NO DNS). Normalise alternate encodings first so a candidate like
-  //    http://2130706433/ (== 127.0.0.1) or http://0x7f.1/ cannot slip past as a "hostname".
-  const normalized = normalizeHostForClassification(url.hostname);
+  // 6. IP-literal classification (NO DNS). Re-check the normalised form against the denylist, then
+  //    classify any IP literal (loopback is admitted only via `allowLoopback`, never via `relax`,
+  //    which already required the loopback classification — keeping the address classifier the single
+  //    authority on public-vs-loopback).
   if (isDeniedHostname(normalized)) {
     return {
       ok: false,

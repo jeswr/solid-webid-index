@@ -139,6 +139,12 @@ export async function parseSuggestion({
  * RDF/JS term matching — NEVER JSON key access (the house "never hand-read JSON keys" rule mirrors
  * "never hand-build triples"). Only IRI (`NamedNode`) objects are collected for `as:object`/`as:actor`
  * — a blank-node or literal object is not a dereferenceable WebID and is ignored.
+ *
+ * STRICT typing (security M2 — AS2 type bypass): candidates are ONLY collected from subjects that
+ * bear an ACCEPTED activity `rdf:type` (`as:Announce`/`as:Offer`/`as:Add`). An UNTYPED (or
+ * non-accepted-type) payload yields NO candidates — there is no "harvest any as:object" fallback, so
+ * arbitrary non-Announce/Offer/Add RDF can never enqueue a crawl. The route additionally rejects
+ * (422) when `activityTypes` is empty, so the failure is explicit rather than a silent empty result.
  */
 export function extractSuggestion(dataset: DatasetCore): ParsedSuggestion {
   const activityTypes = new Set<string>();
@@ -161,26 +167,21 @@ export function extractSuggestion(dataset: DatasetCore): ParsedSuggestion {
     }
   }
 
-  // If no recognised activity type is present, fall back to treating ALL subjects with an as:object
-  // as candidate-bearing (lenient): a sender may omit/garble the type. The route still gates on
-  // activityTypes being non-empty when it wants strictness; here we surface what we found.
-  const restrictToActivitySubjects = activitySubjects.size > 0;
+  // No "harvest any as:object" fallback: when NO accepted activity type is present there are no
+  // activity subjects, so the passes below collect NOTHING (objectIris stays empty). An untyped
+  // payload therefore cannot enqueue a crawl — see the route's empty-activityTypes 422 gate.
 
-  // Second pass: as:object (candidate WebIDs).
+  // Second pass: as:object (candidate WebIDs) — only on accepted-activity subjects.
   for (const q of matchP(dataset, AS_OBJECT)) {
     if (q.object.termType !== "NamedNode") continue;
-    if (restrictToActivitySubjects && !activitySubjects.has(q.subject.value)) {
-      continue;
-    }
+    if (!activitySubjects.has(q.subject.value)) continue;
     objectIris.add(q.object.value);
   }
 
-  // Third pass: as:actor (first IRI actor, for provenance).
+  // Third pass: as:actor (first IRI actor, for provenance) — only on accepted-activity subjects.
   for (const q of matchP(dataset, AS_ACTOR)) {
     if (q.object.termType !== "NamedNode") continue;
-    if (restrictToActivitySubjects && !activitySubjects.has(q.subject.value)) {
-      continue;
-    }
+    if (!activitySubjects.has(q.subject.value)) continue;
     actor = q.object.value;
     break;
   }

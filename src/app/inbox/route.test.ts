@@ -223,6 +223,48 @@ describe("POST /inbox/", () => {
     expect(res.status).toBe(413);
   });
 
+  it("STREAMS the body with a hard cap: a large stream returns 413 and is NOT fully buffered", async () => {
+    // Build a ReadableStream that would emit ~1 MiB in 16 KiB chunks, with NO Content-Length declared
+    // (and an understated one is irrelevant — the cap is on the actually-read bytes). We count how
+    // many chunks the reader pulls: the capped reader must abort (cancel) after exceeding 64 KiB,
+    // so it pulls FAR fewer chunks than the full stream — proving the rest is never buffered (H).
+    const CHUNK = new Uint8Array(16 * 1024).fill(0x20); // 16 KiB of spaces
+    const TOTAL_CHUNKS = 64; // would be 1 MiB if fully read
+    let pulled = 0;
+    let cancelled = false;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (pulled >= TOTAL_CHUNKS) {
+          controller.close();
+          return;
+        }
+        pulled++;
+        controller.enqueue(CHUNK);
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const req = new Request(INBOX_IRI, {
+      method: "POST",
+      headers: { "content-type": "application/ld+json" },
+      body: stream,
+      // `duplex` is required by the Fetch spec when streaming a request body.
+      // @ts-expect-error — duplex is not yet in the lib.dom Request typings.
+      duplex: "half",
+    });
+
+    const res = await POST(req);
+    expect(res.status).toBe(413);
+    // The reader stopped well before draining the whole stream: 64 KiB / 16 KiB = 4 chunks to first
+    // exceed the cap (the 5th read crosses it). Far fewer than the 64 chunks of the full body.
+    expect(cancelled).toBe(true);
+    expect(pulled).toBeLessThan(TOTAL_CHUNKS);
+    expect(pulled).toBeLessThanOrEqual(8);
+    // Nothing was parsed/enqueued.
+    expect(triggerCrawlMock).not.toHaveBeenCalled();
+  });
+
   it("returns 400 for malformed RDF", async () => {
     const res = await POST(postReq("{ not json"));
     expect(res.status).toBe(400);
@@ -235,6 +277,27 @@ describe("POST /inbox/", () => {
     });
     const res = await POST(postReq(body));
     expect(res.status).toBe(422);
+  });
+
+  it("returns 422 + enqueues NOTHING for an UNTYPED as:object payload (AS2 type bypass guard, M2)", async () => {
+    // An untyped subject carrying as:object must NOT enqueue a crawl — the route rejects when no
+    // accepted AS2 activity type is present, and extractSuggestion harvests no untyped candidate.
+    const turtle = `@prefix as: <https://www.w3.org/ns/activitystreams#> .
+<urn:untyped> as:object <https://attacker.pod/card#me> .`;
+    const res = await POST(postReq(turtle, { contentType: "text/turtle" }));
+    expect(res.status).toBe(422);
+    // No crawl enqueued, no notification recorded.
+    expect(triggerCrawlMock).not.toHaveBeenCalled();
+    const store = _store as PgStore;
+    expect(await store.get("https://attacker.pod/card")).toBeNull();
+  });
+
+  it("returns 422 for a NON-accepted activity type (e.g. as:Like) — no enqueue", async () => {
+    const turtle = `@prefix as: <https://www.w3.org/ns/activitystreams#> .
+<urn:act> a as:Like ; as:object <https://attacker.pod/card#me> .`;
+    const res = await POST(postReq(turtle, { contentType: "text/turtle" }));
+    expect(res.status).toBe(422);
+    expect(triggerCrawlMock).not.toHaveBeenCalled();
   });
 
   it("returns 422 when more than 10 as:object candidates are present", async () => {
@@ -269,6 +332,38 @@ describe("POST /inbox/", () => {
     );
     expect(over.status).toBe(429);
     expect(over.headers.get("Retry-After")).toBeTruthy();
+  });
+
+  // ── Daily admission budget (deferred, not dropped) ───────────────────────────
+
+  it("DEFERS a valid suggestion when the daily admission budget is exhausted (202, not 422)", async () => {
+    // Budget = 1: the first valid suggestion is admitted (201); the second is DEFERRED — recorded
+    // with processed=FALSE for the daily drain, answered 202 (NOT a misleading 422), NOT enqueued.
+    process.env.INBOX_DAILY_ADMISSION_BUDGET = "1";
+    const store = _store as PgStore;
+
+    const first = await POST(postReq(announce("https://one.pod/card#me")));
+    expect(first.status).toBe(201);
+    triggerCrawlMock.mockClear();
+    afterMock.mockClear();
+
+    const second = await POST(postReq(announce("https://two.pod/card#me")));
+    expect(second.status).toBe(202);
+    expect(second.headers.get("Location")).toBeTruthy();
+    expect(second.headers.get("Retry-After")).toBeTruthy();
+
+    // The deferred candidate was NOT enqueued (the daily drain will admit it later).
+    expect(await store.get("https://two.pod/card")).toBeNull();
+    // No crawl kick for a deferred suggestion.
+    expect(triggerCrawlMock).not.toHaveBeenCalled();
+    expect(afterMock).not.toHaveBeenCalled();
+
+    // The notification IS persisted, marked processed=FALSE so the daily drain picks it up.
+    const loc = second.headers.get("Location") as string;
+    const id = loc.slice(INBOX_IRI.length);
+    const notif = await store.getNotification(id);
+    expect(notif).not.toBeNull();
+    expect(notif?.processed).toBe(false);
   });
 
   // ── Fan-out bomb is BOUNDED ──────────────────────────────────────────────────

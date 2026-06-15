@@ -84,4 +84,62 @@ describe("syntacticSsrfCheck — allowLoopback dev hook", () => {
         .ok
     ).toBe(true);
   });
+
+  it("permits a loopback IPv6 http fixture under allowLoopback", () => {
+    expect(
+      syntacticSsrfCheck("http://[::1]:8080/card", { allowLoopback: true }).ok
+    ).toBe(true);
+  });
+});
+
+describe("syntacticSsrfCheck — allowLoopback is SCOPED to loopback only (M4)", () => {
+  // Setting allowLoopback must relax http:/arbitrary-port ONLY for an actual loopback host. A
+  // misconfigured allowLoopback in production must NEVER admit a public http: URL or a non-443
+  // public host — the strict https-and-443 gate still applies to every non-loopback host.
+
+  it("STILL rejects a PUBLIC http: URL even with allowLoopback set", () => {
+    expect(
+      syntacticSsrfCheck("http://alice.pod/card", { allowLoopback: true }).ok
+    ).toBe(false);
+    expect(
+      syntacticSsrfCheck("http://example.com/profile", { allowLoopback: true })
+        .ok
+    ).toBe(false);
+  });
+
+  it("STILL rejects a PUBLIC http: IP literal even with allowLoopback set", () => {
+    expect(
+      syntacticSsrfCheck("http://8.8.8.8/x", { allowLoopback: true }).ok
+    ).toBe(false);
+  });
+
+  it("STILL rejects a non-443 PUBLIC host even with allowLoopback set", () => {
+    expect(
+      syntacticSsrfCheck("https://alice.pod:8080/card", {
+        allowLoopback: true,
+      }).ok
+    ).toBe(false);
+    expect(
+      syntacticSsrfCheck("https://8.8.8.8:8443/x", { allowLoopback: true }).ok
+    ).toBe(false);
+  });
+
+  it("STILL rejects a non-loopback PRIVATE host even with allowLoopback set", () => {
+    // allowLoopback re-permits ONLY loopback (127/8, ::1), never RFC1918/link-local.
+    expect(
+      syntacticSsrfCheck("http://10.0.0.5:9000/x", { allowLoopback: true }).ok
+    ).toBe(false);
+    expect(
+      syntacticSsrfCheck("https://169.254.169.254/x", { allowLoopback: true })
+        .ok
+    ).toBe(false);
+  });
+
+  it("STILL permits a normal public https:443 host under allowLoopback", () => {
+    // The relaxation does not break the ordinary production-shaped candidate.
+    expect(
+      syntacticSsrfCheck("https://alice.pod/card#me", { allowLoopback: true })
+        .ok
+    ).toBe(true);
+  });
 });

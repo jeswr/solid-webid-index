@@ -137,3 +137,32 @@ describe("extractSuggestion — restricts to activity subjects when typed", () =
     expect(parsed.objectIris).not.toContain("https://eve.example/card#me");
   });
 });
+
+describe("extractSuggestion — AS2 type bypass guard (M2)", () => {
+  it("yields NO candidates and NO type for an UNTYPED as:object payload (no harvest fallback)", async () => {
+    // An untyped subject carrying as:object MUST NOT surface a candidate — there is no
+    // "harvest any as:object" fallback (a non-Announce/Offer/Add payload cannot enqueue a crawl).
+    const turtle = `@prefix as: <${AS2}> .
+<urn:untyped> as:object <${WEBID}> .`;
+    const parsed = await parseSuggestion({
+      text: turtle,
+      contentType: "text/turtle",
+      baseIri: "https://index.example/inbox/",
+    });
+    expect(parsed.activityTypes).toEqual([]);
+    expect(parsed.objectIris).toEqual([]);
+  });
+
+  it("yields NO candidates for a non-accepted activity type (e.g. as:Like)", async () => {
+    // A typed activity whose type is NOT in the accepted set is treated as untyped → no candidates.
+    const turtle = `@prefix as: <${AS2}> .
+<urn:act> a as:Like ; as:object <${WEBID}> .`;
+    const parsed = await parseSuggestion({
+      text: turtle,
+      contentType: "text/turtle",
+      baseIri: "https://index.example/inbox/",
+    });
+    expect(parsed.activityTypes).toEqual([]);
+    expect(parsed.objectIris).toEqual([]);
+  });
+});
