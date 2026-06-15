@@ -108,6 +108,13 @@ ALTER TABLE doc ADD COLUMN IF NOT EXISTS label_fts TSVECTOR GENERATED ALWAYS AS 
   || setweight(to_tsvector('english', coalesce(raw_rdf, '')), 'D')
 ) STORED;
 
+-- terminal_at — epoch ms a doc most recently entered a TERMINAL / tombstoned state
+-- (done / failed / skipped / blocked / tombstone).  Drives the 7-day re-suggest cooldown
+-- (anti-amplification C2 — DESIGN.md §4.3/§5): a freshly-terminal or tombstoned WebID may not be
+-- re-suggested until `now - terminal_at >= RESUGGEST_COOLDOWN_MS`.  Owned by the suggest-inbox bead;
+-- the crawler stamps it on finalize (additive — pre-existing rows have NULL = no cooldown).
+ALTER TABLE doc ADD COLUMN IF NOT EXISTS terminal_at BIGINT;
+
 -- Frontier / claim query index
 CREATE INDEX IF NOT EXISTS idx_doc_ready    ON doc (state, next_eligible_at);
 CREATE INDEX IF NOT EXISTS idx_doc_host     ON doc (host, state, next_eligible_at);
@@ -172,4 +179,25 @@ CREATE TABLE IF NOT EXISTS inbox_object (
   notif_id    TEXT    NOT NULL REFERENCES inbox (id) ON DELETE CASCADE,
   object_iri  TEXT    NOT NULL,
   PRIMARY KEY (notif_id, object_iri)
+);
+
+-- ─── rate_bucket — fixed-window rate limiting + daily admission budget ────────
+--
+-- A single keyed table (DESIGN.md §2.1.i) backing TWO anti-amplification controls
+-- (DESIGN.md §4.3/§5), both consumed ATOMICALLY before any inbox write:
+--
+--   * per-IP token bucket  — key = 'ip:<addr>:<windowMs>' ; a fixed-window counter capped at
+--     INBOX_RATE_LIMIT_PER_IP_PER_HOUR.  Over-cap → 429 (the immediate-crawl path is privileged to a
+--     LOW budget; the slow daily drain handles the rest).
+--   * daily admission budget — key = 'admit:<YYYY-MM-DD>' ; a global daily ceiling on accepted
+--     suggestions so an open inbox cannot drive unbounded queue inserts / crawl fan-out.
+--
+-- `window_start` is epoch ms of the current fixed window; when a request lands in a NEW window the
+-- row is reset (window_start advanced, count → 1).  The reset+increment is one atomic UPSERT so
+-- concurrent serverless invocations cannot over-admit (see PgStore.consumeRateBucket).
+
+CREATE TABLE IF NOT EXISTS rate_bucket (
+  key           TEXT    PRIMARY KEY,
+  window_start  BIGINT  NOT NULL,            -- epoch ms of the current fixed window
+  count         INTEGER NOT NULL DEFAULT 0   -- consumed slots in the current window
 );

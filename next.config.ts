@@ -12,6 +12,30 @@ const nextConfig: NextConfig = {
   // {require, import} at the top level).  Mark it as a server-external so
   // Next.js bundles it via require() rather than webpack module resolution.
   serverExternalPackages: ["@neondatabase/serverless"],
+
+  // Advertise EXACTLY ONE `ldp:inbox` Link on the ROOT `/` (DESIGN.md §4.3 / sw H2) — the global
+  // suggest inbox is discoverable from `/`, NOT from individual entries (`/p/{slug}`), which would
+  // misuse `ldp:inbox` to mean "notifications about this person". The Link header is the discovery
+  // surface; a future DCAT `GET /` RDF route may additionally emit the triple in-body (additive).
+  async headers() {
+    const origin = (
+      process.env.INDEX_BASE_URL ??
+      (process.env.VERCEL_URL
+        ? `https://${process.env.VERCEL_URL}`
+        : "http://localhost:3000")
+    ).replace(/\/+$/, "");
+    return [
+      {
+        source: "/",
+        headers: [
+          {
+            key: "Link",
+            value: `<${origin}/inbox/>; rel="http://www.w3.org/ns/ldp#inbox"`,
+          },
+        ],
+      },
+    ];
+  },
 };
 
 export default nextConfig;
