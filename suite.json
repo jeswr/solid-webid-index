@@ -1,0 +1,29 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jeswr/full-solid-ecosystem/main/tracking/schema/suite.schema.json",
+  "id": "solid-webid-index",
+  "kind": "service",
+  "name": "Solid WebID Index",
+  "repo": "https://github.com/jeswr/solid-webid-index",
+  "category": "identity",
+  "maturity": "alpha",
+  "visibility": "public",
+  "stack": {
+    "language": "TypeScript",
+    "runtime": "Node >=24",
+    "framework": "Next.js ~15",
+    "ui": "shadcn/ui + Radix + Tailwind 4",
+    "database": "Neon (serverless Postgres) + PGlite (local)",
+    "rdf": "@jeswr/fetch-rdf, @solid/object ^0.6, n3 ^2, jsonld ^9",
+    "fetch": "undici ^7 (SSRF-guarded)",
+    "test": "vitest ^4",
+    "deploy": "Vercel Hobby (serverless)"
+  },
+  "dependsOn": [],
+  "federation": {
+    "sectors": ["identity"],
+    "accessModes": ["Read"],
+    "consumes": ["identity"],
+    "produces": [],
+    "membershipTodo": "TODO(O1-gated): declare fedapp:memberOf once the fedapp: namespace is frozen and the registry engine ships. The index reads public WebID profiles (identity sector, Read only); its client-id doc will gain a fedapp: block at that point."
+  }
+}
