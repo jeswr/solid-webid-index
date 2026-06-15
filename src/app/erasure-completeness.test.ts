@@ -10,7 +10,8 @@
  *   - /tpf?s=…             → no triples about the erased WebID
  *   - the served-entry list (the dump source) → the erased entry is gone
  *   - /.well-known/void    → stats decremented (entities/triples)
- *   - a friend's /p/{slug} → the foaf:knows edge TO the erased WebID is DROPPED from served output
+ *   - a friend's /p/{slug} → the INBOUND foaf:knows edge TO the erased WebID is DROPPED (the friend's
+ *     own served entry loses (friend, foaf:knows, erased) after the erased person opts out)
  *   - POST /inbox/ (re-suggest the erased WebID) → 409
  *
  * Offline: pglite store (mocked makeStore) — no network. Erasure is driven via store.eraseWebId
@@ -125,12 +126,17 @@ beforeEach(async () => {
   afterMock.mockImplementation(async (task: () => unknown) => {
     await task();
   });
-  // Alice knows Bob; both indexed.
+  // Alice and Bob each know the other (mutual foaf:knows); both indexed. The mutual edge lets the
+  // inbound-edge-drop test assert the canonical direction: erase Alice, then Bob's served entry must
+  // drop its (Bob, foaf:knows, Alice) edge — the FRIEND's outbound view of the erased person.
   await indexProfile(_store, ALICE, ALICE_DOC, {
     label: "Alice Eraseme",
     knows: [BOB],
   });
-  await indexProfile(_store, BOB, BOB_DOC, { label: "Bob Friend" });
+  await indexProfile(_store, BOB, BOB_DOC, {
+    label: "Bob Friend",
+    knows: [ALICE],
+  });
 });
 
 function store(): PgStore {
@@ -266,26 +272,24 @@ describe("erasure completeness — after opt-out, Alice is 410/absent on EVERY r
     expect(entitiesAfter).toBe(1); // only Bob remains
   });
 
-  it("a friend's /p/{slug} DROPS the foaf:knows edge to the erased WebID", async () => {
-    // Before: Bob is the friend; Alice knows Bob (the edge lives on Alice). After erasing Alice the
-    // edge is gone with her. To prove the inbound-edge drop, erase BOB and assert Alice's entry no
-    // longer serves foaf:knows → Bob.
-    await store().eraseWebId({
-      webid: BOB,
-      docUrl: BOB_DOC,
-      reason: "opt-out",
-    });
+  it("a friend's /p/{slug} DROPS its inbound foaf:knows edge TO the erased WebID", async () => {
+    // The guarantee is INBOUND: after Alice opts out, her FRIENDS' served entries must drop their
+    // edges pointing AT Alice. Bob knows Alice (the (Bob, foaf:knows, Alice) edge lives in Bob's own
+    // graph). Erase ALICE, then Bob's served /p/{slug} must NOT serve foaf:knows → Alice — the
+    // tombstone-filter on the friend's knows targets (entryResponse.ts) drops it. (Crucially this
+    // tests the friend's surviving entry, NOT the erased person's own — which is 410.)
+    await eraseAlice();
     const res = await entryGet(
-      new Request(`${INDEX_BASE_URL}/p/${ALICE_SLUG}`, {
+      new Request(`${INDEX_BASE_URL}/p/${BOB_SLUG}`, {
         headers: { Accept: "text/turtle" },
       }),
-      { params: Promise.resolve({ slug: ALICE_SLUG }) }
+      { params: Promise.resolve({ slug: BOB_SLUG }) }
     );
     expect(res.status).toBe(200);
     const g = parseTurtle(await res.text());
-    // Alice's served graph must NOT contain a foaf:knows pointing at the erased Bob.
-    const knowsBob = g.getQuads(ALICE, FOAF_KNOWS, BOB, null);
-    expect(knowsBob.length).toBe(0);
+    // Bob's served graph must NOT contain a foaf:knows pointing at the erased Alice.
+    const knowsAlice = g.getQuads(BOB, FOAF_KNOWS, ALICE, null);
+    expect(knowsAlice.length).toBe(0);
   });
 
   it("re-suggesting the erased WebID via POST /inbox/ → 409 (tombstone is permanent)", async () => {
