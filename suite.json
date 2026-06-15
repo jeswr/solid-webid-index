@@ -1,5 +1,4 @@
 {
-  "$schema": "https://solid.example/suite-tracking/suite.schema.json",
   "id": "solid-webid-index",
   "kind": "service",
   "name": "Solid WebID Index",
