@@ -18,20 +18,39 @@ import { join } from "node:path";
 
 import { neon } from "@neondatabase/serverless";
 
+import { TPF_ESTIMATE_COUNT_CAP } from "../config";
 import { slugForWebId } from "../url/slug";
 import type {
+  ClassPartition,
   CrawlCoordinator,
   CrawlResult,
+  DatasetStats,
   DocRecord,
   DocSource,
   DocState,
   FailClass,
   HostState,
   PolitenessStore,
+  PropertyPartition,
   ReadStore,
   SearchIndex,
   SearchResult,
+  StatsStore,
+  TpfPattern,
+  TpfTriple,
 } from "./ports.js";
+import {
+  STATS_KEY_ENTITIES,
+  STATS_KEY_TRIPLES,
+  STATS_PREFIX_CLASS,
+  STATS_PREFIX_PROPERTY,
+  type StatTriple,
+  classDelta,
+  classEntityContribution,
+} from "./stats";
+
+/** The rdf:type predicate IRI — class partitions count its IRI objects. */
+const RDF_TYPE_IRI = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
 // ─── SqlExecutor interface ────────────────────────────────────────────────────
 
@@ -207,7 +226,12 @@ function rowToRecord(r: DocRow): DocRecord {
  * Instantiate via makeStore() in production or directly with a pglite executor in tests.
  */
 export class PgStore
-  implements ReadStore, SearchIndex, CrawlCoordinator, PolitenessStore
+  implements
+    ReadStore,
+    SearchIndex,
+    CrawlCoordinator,
+    PolitenessStore,
+    StatsStore
 {
   constructor(private readonly db: SqlExecutor) {}
 
@@ -261,6 +285,79 @@ export class PgStore
     // backfill selects nothing, and slugForWebId is deterministic so a partial
     // run is safe to resume.  Batched to keep memory bounded on large tables.
     await this.backfillSlugs();
+
+    // ── triple + stats backfill (idempotent) ─────────────────────────────────
+    //
+    // The `triple` table + `stats` counters shipped AFTER the crawler first ran, so
+    // a database with already-crawled `done` rows would expose EMPTY /tpf + VoID
+    // stats until every profile is re-crawled (roborev).  Re-project each served row
+    // (state='done', has webid + raw_rdf) that has NO triple rows yet, parsing its
+    // stored canonical raw_rdf through the sanctioned path.  Idempotent: a row that
+    // already has triples is skipped; upsertTriples is REPLACE-by-webid so a partial
+    // run is safe to resume and re-running after completion is a no-op.
+    await this.backfillTriples();
+  }
+
+  /**
+   * Re-project served rows (state='done', webid + raw_rdf set) that have NO triples
+   * materialised yet, populating the `triple` table + `stats` counters.  Bounded by
+   * paging; safe to call repeatedly (idempotent — only rows lacking triples).
+   *
+   * The parse + projection helpers are dynamic-imported so the store's hot path stays
+   * free of the parser bundle (mirrors claim()'s config dynamic-import).
+   */
+  private async backfillTriples(): Promise<void> {
+    const PAGE = 200;
+    const { parseProfile } = await import("@/lib/rdf/profile");
+    const { datasetToTriples } = await import("@/lib/rdf/tpf");
+
+    // KEYSET page by doc_url so each candidate row is visited AT MOST ONCE per call:
+    // a row that re-projects to ZERO triples still has NO `triple` rows, so a
+    // NOT-EXISTS-only predicate would re-select it forever (infinite loop).  Walking
+    // forward by doc_url > cursor guarantees termination regardless of triple yield.
+    let cursor = "";
+    for (;;) {
+      const rows = await this.db.query<{
+        doc_url: string;
+        webid: string;
+        raw_rdf: string;
+      }>(
+        `SELECT d.doc_url, d.webid, d.raw_rdf
+           FROM doc d
+          WHERE d.state = 'done'
+            AND d.webid IS NOT NULL
+            AND d.raw_rdf IS NOT NULL
+            AND d.doc_url > $1
+            AND NOT EXISTS (SELECT 1 FROM triple t WHERE t.webid = d.webid)
+          ORDER BY d.doc_url ASC
+          LIMIT $2`,
+        [cursor, PAGE]
+      );
+      if (rows.length === 0) break;
+      cursor = rows[rows.length - 1].doc_url;
+
+      for (const row of rows) {
+        try {
+          const dataset = await parseProfile({
+            text: row.raw_rdf,
+            contentType: "text/turtle",
+            baseIri: row.doc_url,
+          });
+          const triples = datasetToTriples(dataset);
+          await this.upsertTriples({
+            webid: row.webid,
+            docUrl: row.doc_url,
+            triples,
+          });
+        } catch {
+          // A row whose stored raw_rdf no longer parses is left un-projected — it will
+          // be re-projected on its next crawl.  Never let one bad row abort the backfill;
+          // the keyset cursor has already moved past it so it is not re-selected this call.
+        }
+      }
+
+      if (rows.length < PAGE) break;
+    }
   }
 
   /**
@@ -458,6 +555,21 @@ export class PgStore
   }
 
   async tombstone(docUrl: string): Promise<void> {
+    // Clear this document's materialised triples + SUBTRACT its stats contribution
+    // BEFORE tombstoning the doc row (roborev): a direct tombstone() (the opt-out /
+    // erasure path, DESIGN.md §4.8) must decrement the stats counters too, otherwise
+    // a predicate-only TPF estimate (which reads the 'p:<iri>' counter directly) would
+    // keep advertising void:triples / hydra:totalItems for an erased WebID even though
+    // the data rows are tombstone-filtered out of the response.  Erase by EVERY webid
+    // currently projected from this document so no counter is left over-counting.
+    const projectedWebids = await this.db.query<{ webid: string }>(
+      "SELECT DISTINCT webid FROM triple WHERE doc_url = $1 AND webid IS NOT NULL",
+      [docUrl]
+    );
+    for (const { webid } of projectedWebids) {
+      await this.clearWebidProjection(webid);
+    }
+
     await this.db.query(
       `INSERT INTO doc (
          doc_url, host, state, source, enqueued_at
@@ -468,6 +580,479 @@ export class PgStore
          raw_rdf = NULL`,
       [docUrl, Date.now()]
     );
+  }
+
+  // ─── Triple Pattern Fragments (ReadStore — DESIGN.md §4.5) ───────────────────
+
+  /**
+   * TPF data read.  Builds a parameterised WHERE from whichever of s/p/o are bound,
+   * then filters out triples ABOUT a tombstoned WebID via a correlated NOT EXISTS
+   * against the `doc` table (DESIGN.md §4.8 H1).  Keyset paginated on (s,p,o,o_is_iri)
+   * with an opaque cursor; ORDER BY matches the keyset so paging is stable.
+   */
+  async tpf(opts: {
+    pattern: TpfPattern;
+    limit: number;
+    cursor?: string;
+  }): Promise<{ triples: TpfTriple[]; nextCursor: string | null }> {
+    const { pattern, limit, cursor } = opts;
+
+    // LIMIT placeholder is $1; subsequent bound terms append after it.
+    const params: unknown[] = [limit + 1];
+    const where: string[] = [];
+
+    if (pattern.s !== undefined) {
+      params.push(pattern.s);
+      where.push(`t.s = $${params.length}`);
+    }
+    if (pattern.p !== undefined) {
+      params.push(pattern.p);
+      where.push(`t.p = $${params.length}`);
+    }
+    if (pattern.o !== undefined) {
+      params.push(pattern.o);
+      where.push(`t.o = $${params.length}`);
+      // Only constrain o_is_iri when the route disambiguated the object term.
+      if (pattern.oIsIri !== undefined) {
+        params.push(pattern.oIsIri);
+        where.push(`t.o_is_iri = $${params.length}`);
+      }
+    }
+
+    // Tombstone gate: never serve a triple about a tombstoned WebID.  A triple with
+    // a NULL webid (provenance/structural) is always servable.
+    where.push(
+      `(t.webid IS NULL OR NOT EXISTS (
+         SELECT 1 FROM doc d
+          WHERE d.webid = t.webid AND d.state = 'tombstone'
+       ))`
+    );
+
+    // Keyset cursor encodes the last (s,p,o,o_is_iri) tuple emitted; the row-value
+    // comparison (a,b,c,d) > ($..,$..,$..,$..) walks forward deterministically.
+    const cursorTuple = cursor ? decodeTpfCursor(cursor) : null;
+    if (cursorTuple) {
+      params.push(
+        cursorTuple.s,
+        cursorTuple.p,
+        cursorTuple.o,
+        cursorTuple.oIsIri
+      );
+      const b = params.length;
+      where.push(
+        `(t.s, t.p, t.o, t.o_is_iri) > ($${b - 3}, $${b - 2}, $${b - 1}, $${b})`
+      );
+    }
+
+    const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+
+    const rows = await this.db.query<{
+      s: string;
+      p: string;
+      o: string;
+      o_is_iri: boolean;
+    }>(
+      `SELECT t.s, t.p, t.o, t.o_is_iri
+         FROM triple t
+         ${whereClause}
+        ORDER BY t.s ASC, t.p ASC, t.o ASC, t.o_is_iri ASC
+        LIMIT $1`,
+      params
+    );
+
+    const hasMore = rows.length > limit;
+    const pageRows = hasMore ? rows.slice(0, limit) : rows;
+
+    const triples: TpfTriple[] = pageRows.map((r) => ({
+      s: r.s,
+      p: r.p,
+      o: r.o,
+      oIsIri: Boolean(r.o_is_iri),
+    }));
+
+    const last = triples[triples.length - 1];
+    const nextCursor =
+      hasMore && last
+        ? encodeTpfCursor({
+            s: last.s,
+            p: last.p,
+            o: last.o,
+            oIsIri: last.oIsIri,
+          })
+        : null;
+
+    return { triples, nextCursor };
+  }
+
+  /**
+   * TPF metadata read — the `void:triples` PATTERN cardinality ESTIMATE.
+   *
+   * Estimate sources (NEVER a live COUNT on the unbounded hot path — arch M1):
+   *  - empty pattern → the `stats` 'triples' total counter (0 when unset);
+   *  - predicate-only (p set, s+o unset) → the per-predicate `stats` 'p:<iri>' counter
+   *    when present, else a bounded COUNT fallback;
+   *  - any other pattern → a BOUNDED COUNT (capped at TPF_ESTIMATE_COUNT_CAP) so a
+   *    pathological pattern can never trigger an unbounded scan.
+   *
+   * Tombstoned-WebID triples are excluded from every estimate path (the bounded
+   * COUNT applies the same NOT EXISTS gate as tpf()).
+   */
+  async estimatePatternCardinality(pattern: TpfPattern): Promise<number> {
+    const noTerms =
+      pattern.s === undefined &&
+      pattern.p === undefined &&
+      pattern.o === undefined;
+
+    if (noTerms) {
+      // Empty pattern → the SHARED total-triples counter (STATS_KEY_TRIPLES is
+      // maintained in upsertTriples; the stats sibling reads the same key for
+      // void:triples).  Absent row (pre-projection) → bounded COUNT fallback.
+      const rows = await this.db.query<{ v: number | string }>(
+        "SELECT v FROM stats WHERE k = $1",
+        [STATS_KEY_TRIPLES]
+      );
+      if (rows[0]) return Number(rows[0].v);
+    } else if (
+      pattern.p !== undefined &&
+      pattern.s === undefined &&
+      pattern.o === undefined
+    ) {
+      // Predicate-only → the per-predicate counter via the stats sibling's
+      // clearly-named O(1) accessor (its 'p:<iri>' key, maintained by this bead).
+      // It returns 0 for an absent predicate; a 0 means the predicate is not in the
+      // dataset, so a bounded COUNT would also return 0 — fall through only when the
+      // accessor yields a positive estimate to avoid masking a transient empty state.
+      const card = await this.getPredicateCardinality(pattern.p);
+      if (card > 0) return card;
+    }
+
+    // Bounded COUNT fallback — never an unbounded scan.  We count over a capped
+    // subquery so the planner stops after at most the cap rows.
+    return this.boundedPatternCount(pattern);
+  }
+
+  /**
+   * BOUNDED COUNT over the triple table for a pattern, applying the tombstone gate.
+   * Counts at most {@link TPF_ESTIMATE_COUNT_CAP} matching rows — a hard ceiling so
+   * a hot/degenerate pattern can never trigger an unbounded scan on the hot path.
+   */
+  private async boundedPatternCount(pattern: TpfPattern): Promise<number> {
+    const params: unknown[] = [];
+    const where: string[] = [];
+
+    if (pattern.s !== undefined) {
+      params.push(pattern.s);
+      where.push(`t.s = $${params.length}`);
+    }
+    if (pattern.p !== undefined) {
+      params.push(pattern.p);
+      where.push(`t.p = $${params.length}`);
+    }
+    if (pattern.o !== undefined) {
+      params.push(pattern.o);
+      where.push(`t.o = $${params.length}`);
+      if (pattern.oIsIri !== undefined) {
+        params.push(pattern.oIsIri);
+        where.push(`t.o_is_iri = $${params.length}`);
+      }
+    }
+    where.push(
+      `(t.webid IS NULL OR NOT EXISTS (
+         SELECT 1 FROM doc d
+          WHERE d.webid = t.webid AND d.state = 'tombstone'
+       ))`
+    );
+
+    params.push(TPF_ESTIMATE_COUNT_CAP);
+    const capParam = `$${params.length}`;
+    const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+
+    const rows = await this.db.query<{ n: number | string }>(
+      `SELECT COUNT(*) AS n FROM (
+         SELECT 1 FROM triple t ${whereClause} LIMIT ${capParam}
+       ) capped`,
+      params
+    );
+    return rows[0] ? Number(rows[0].n) : 0;
+  }
+
+  /**
+   * Project a WebID's triples into the materialised `triple` table (REPLACE), and
+   * maintain the minimal `stats` counters additively.  Delete-by-webid first so a
+   * re-projection never leaves stale rows; then bulk-insert the new triple set.
+   */
+  async upsertTriples(opts: {
+    webid: string;
+    docUrl: string;
+    triples: TpfTriple[];
+  }): Promise<void> {
+    const { webid, docUrl, triples } = opts;
+
+    // ── Clear any STALE prior projection of this DOCUMENT under a DIFFERENT webid
+    // (roborev): a doc_url that first resolved to W1 and later to W2 would otherwise
+    // leave W1's triples (keyed by doc_url) served + counted forever.  For each such
+    // stale webid, run the empty-projection clear (delete-by-webid + subtract its
+    // stats) so both the triple table AND the stats counters stay exact.  Skipped in
+    // the common case (no doc_url/webid change) by the WHERE webid != $2 filter.
+    const staleWebids = await this.db.query<{ webid: string }>(
+      "SELECT DISTINCT webid FROM triple WHERE doc_url = $1 AND webid IS NOT NULL AND webid != $2",
+      [docUrl, webid]
+    );
+    for (const { webid: stale } of staleWebids) {
+      await this.clearWebidProjection(stale);
+    }
+
+    // Decrement the stats counters by the OLD triple count for this webid before
+    // replacing, then re-add the new count — keeps 'triples'/'p:<iri>' consistent
+    // across re-projections.  (TPF bead owns these counters; the stats bead pss-0zp
+    // owns 'entities'/'c:<iri>', maintained below from the same old→new diff.)
+    const oldByPred = await this.db.query<{ p: string; n: number | string }>(
+      "SELECT p, COUNT(*) AS n FROM triple WHERE webid = $1 GROUP BY p",
+      [webid]
+    );
+
+    // OLD entity + class-partition contribution for this webid — read its existing
+    // rdf:type IRI triples BEFORE the DELETE so the stats-bead delta (entities +
+    // c:<iri>) is computed against the previous served state (DESIGN.md §2.1.j).
+    const oldTypeRows = await this.db.query<{ s: string; o: string }>(
+      "SELECT s, o FROM triple WHERE webid = $1 AND p = $2 AND o_is_iri = TRUE",
+      [webid, RDF_TYPE_IRI]
+    );
+    // isEntity reflects whether the webid had ANY served triples (not just typed
+    // ones), so a typeless-but-present webid still counts as an entity. Derive it
+    // from oldByPred (the previous total triple count); take the class breakdown
+    // from the typed rows.
+    const oldContribution = {
+      isEntity: oldByPred.length > 0 ? 1 : 0,
+      classes: classEntityContribution(
+        oldTypeRows.map((r) => ({
+          s: r.s,
+          p: RDF_TYPE_IRI,
+          o: r.o,
+          oIsIri: true,
+        }))
+      ).classes,
+    };
+
+    await this.db.query("DELETE FROM triple WHERE webid = $1", [webid]);
+
+    // Subtract the OLD per-predicate counts (TPF bead's 'triples' + 'p:<iri>'
+    // counters) in ONE batched upsert — fewer round-trips than a query per predicate.
+    const oldDelta: Array<[string, number]> = [];
+    let oldTotal = 0;
+    for (const old of oldByPred) {
+      const n = Number(old.n);
+      oldTotal += n;
+      oldDelta.push([`p:${old.p}`, -n]);
+    }
+    if (oldTotal > 0) oldDelta.push(["triples", -oldTotal]);
+    await this.adjustStatsBatch(oldDelta);
+
+    // NEW entity + class-partition contribution (this bead's owned counters).
+    const newContribution = classEntityContribution(triples as StatTriple[]);
+    await this.applyClassEntityDelta(oldContribution, newContribution);
+
+    if (triples.length > 0) {
+      // Build a single multi-row INSERT (bounded by MAX_QUADS upstream).
+      const values: string[] = [];
+      const params: unknown[] = [webid, docUrl];
+      for (const t of triples) {
+        const base = params.length;
+        params.push(t.s, t.p, t.o, t.oIsIri);
+        // s=$(base+1), p=$(base+2), o=$(base+3), o_is_iri=$(base+4); webid=$1, doc_url=$2.
+        values.push(
+          `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $1, $2)`
+        );
+      }
+      await this.db.query(
+        `INSERT INTO triple (s, p, o, o_is_iri, webid, doc_url) VALUES ${values.join(", ")}`,
+        params
+      );
+
+      // Re-add the new per-predicate counts + the total in ONE batched upsert.
+      const newByPred = new Map<string, number>();
+      for (const t of triples) {
+        newByPred.set(t.p, (newByPred.get(t.p) ?? 0) + 1);
+      }
+      const newDelta: Array<[string, number]> = [["triples", triples.length]];
+      for (const [pred, n] of newByPred) {
+        newDelta.push([`p:${pred}`, n]);
+      }
+      await this.adjustStatsBatch(newDelta);
+    }
+  }
+
+  /**
+   * Fully clear a WebID's materialised projection: delete its triples and subtract
+   * its WHOLE stats contribution (TPF bead's 'triples'/'p:<iri>' + this bead's
+   * 'entities'/'c:<iri>').  Used to evict a STALE projection when a document changes
+   * the WebID it resolves to (roborev) — the old WebID's rows must not linger.
+   * Idempotent: a WebID with no rows is a no-op.
+   */
+  private async clearWebidProjection(webid: string): Promise<void> {
+    const oldByPred = await this.db.query<{ p: string; n: number | string }>(
+      "SELECT p, COUNT(*) AS n FROM triple WHERE webid = $1 GROUP BY p",
+      [webid]
+    );
+    if (oldByPred.length === 0) return; // nothing projected for this webid
+
+    const oldTypeRows = await this.db.query<{ s: string; o: string }>(
+      "SELECT s, o FROM triple WHERE webid = $1 AND p = $2 AND o_is_iri = TRUE",
+      [webid, RDF_TYPE_IRI]
+    );
+    const oldContribution = {
+      isEntity: 1,
+      classes: classEntityContribution(
+        oldTypeRows.map((r) => ({
+          s: r.s,
+          p: RDF_TYPE_IRI,
+          o: r.o,
+          oIsIri: true,
+        }))
+      ).classes,
+    };
+
+    await this.db.query("DELETE FROM triple WHERE webid = $1", [webid]);
+
+    // Subtract TPF counters ('triples' + 'p:<iri>').
+    const delta: Array<[string, number]> = [];
+    let total = 0;
+    for (const old of oldByPred) {
+      const n = Number(old.n);
+      total += n;
+      delta.push([`p:${old.p}`, -n]);
+    }
+    if (total > 0) delta.push(["triples", -total]);
+    await this.adjustStatsBatch(delta);
+
+    // Subtract this bead's counters ('entities' + 'c:<iri>') — to EMPTY.
+    await this.applyClassEntityDelta(oldContribution, {
+      isEntity: 0,
+      classes: {},
+    });
+  }
+
+  // ─── StatsStore (pss-0zp) — entities + class partitions + O(1) reads ──────────
+
+  /**
+   * Apply the signed entity + class-partition delta computed by classDelta() to the
+   * `stats` counters (this bead's owned keys: 'entities' + 'c:<classIri>').  Called
+   * from upsertTriples on every (re)projection AND erasure (empty triple list), so
+   * the counters are maintained INCREMENTALLY on upsert AND erase (pss-0zp).
+   */
+  private async applyClassEntityDelta(
+    old: { isEntity: number; classes: Record<string, number> },
+    next: { isEntity: number; classes: Record<string, number> }
+  ): Promise<void> {
+    const delta = classDelta(old, next);
+
+    // Collect every non-zero counter adjustment ('entities' + each 'c:<iri>') and
+    // apply them in ONE multi-row upsert — fewer round-trips than a query per class
+    // (keeps the projection write cheap under load).
+    const adjustments: Array<[string, number]> = [];
+    if (delta.entities !== 0) {
+      adjustments.push([STATS_KEY_ENTITIES, delta.entities]);
+    }
+    for (const [classIri, n] of Object.entries(delta.classes)) {
+      adjustments.push([`${STATS_PREFIX_CLASS}${classIri}`, n]);
+    }
+    await this.adjustStatsBatch(adjustments);
+  }
+
+  /**
+   * Apply a batch of (key, delta) counter adjustments in a SINGLE multi-row upsert,
+   * clamping each at 0 (GREATEST(0, …) — a counter never goes negative).  Zero
+   * deltas are skipped.  One round-trip regardless of how many counters change.
+   */
+  private async adjustStatsBatch(
+    adjustments: Array<[string, number]>
+  ): Promise<void> {
+    const nonZero = adjustments.filter(([, d]) => d !== 0);
+    if (nonZero.length === 0) return;
+
+    // The inserted value carries the RAW delta so the conflict branch can add it
+    // (EXCLUDED.v = the raw delta).  GREATEST(0, …) clamps the RESULT in the conflict
+    // branch.  A brand-new key is only ever created by a POSITIVE delta (a class /
+    // entity that did not exist before its first projection), so the unclamped INSERT
+    // value is always ≥ 0 — a negative delta always targets an existing row (the
+    // conflict branch), where the result is clamped.  One round-trip regardless of
+    // how many counters change.
+    const values: string[] = [];
+    const params: unknown[] = [];
+    for (const [key, delta] of nonZero) {
+      const base = params.length;
+      params.push(key, delta);
+      values.push(`($${base + 1}, $${base + 2}::bigint)`);
+    }
+    await this.db.query(
+      `INSERT INTO stats (k, v) VALUES ${values.join(", ")}
+       ON CONFLICT (k) DO UPDATE SET v = GREATEST(0, stats.v + EXCLUDED.v)`,
+      params
+    );
+  }
+
+  async getStats(): Promise<DatasetStats> {
+    // Single O(distinct classes + distinct properties) read of the pre-aggregated
+    // counters — NEVER a live COUNT over doc/triple (arch M1 / pss-0zp acceptance).
+    // Only rows with v > 0 count: a partition that dropped to 0 (erased) leaves a
+    // v=0 row (the counter clamps at 0, it does not DELETE the row) which must not
+    // inflate the distinct class/property counts.
+    const rows = await this.db.query<{ k: string; v: number | string }>(
+      "SELECT k, v FROM stats WHERE v > 0"
+    );
+
+    let triples = 0;
+    let entities = 0;
+    const classPartitions: ClassPartition[] = [];
+    const propertyPartitions: PropertyPartition[] = [];
+
+    for (const r of rows) {
+      const v = Number(r.v);
+      if (r.k === STATS_KEY_TRIPLES) {
+        triples = v;
+      } else if (r.k === STATS_KEY_ENTITIES) {
+        entities = v;
+      } else if (r.k.startsWith(STATS_PREFIX_CLASS)) {
+        classPartitions.push({
+          classIri: r.k.slice(STATS_PREFIX_CLASS.length),
+          entities: v,
+        });
+      } else if (r.k.startsWith(STATS_PREFIX_PROPERTY)) {
+        propertyPartitions.push({
+          propertyIri: r.k.slice(STATS_PREFIX_PROPERTY.length),
+          triples: v,
+        });
+      }
+    }
+
+    // Sort partitions deterministically: descending count, then IRI for stable
+    // ordering (so the VoID graph + its ETag are stable across reads).
+    classPartitions.sort(
+      (a, b) => b.entities - a.entities || a.classIri.localeCompare(b.classIri)
+    );
+    propertyPartitions.sort(
+      (a, b) =>
+        b.triples - a.triples || a.propertyIri.localeCompare(b.propertyIri)
+    );
+
+    return {
+      triples,
+      entities,
+      // void:classes / void:properties = number of DISTINCT classes / predicates
+      // (derived from the partition counts, all already v > 0).
+      classes: classPartitions.length,
+      properties: propertyPartitions.length,
+      classPartitions,
+      propertyPartitions,
+    };
+  }
+
+  async getPredicateCardinality(propertyIri: string): Promise<number> {
+    const rows = await this.db.query<{ v: number | string }>(
+      "SELECT v FROM stats WHERE k = $1",
+      [`${STATS_PREFIX_PROPERTY}${propertyIri}`]
+    );
+    return rows[0] ? Number(rows[0].v) : 0;
   }
 
   // ─── SearchIndex ───────────────────────────────────────────────────────────
@@ -1112,6 +1697,24 @@ function decodeSearchCursor(cursor: string): { rank: number; docUrl: string } {
     rank: number;
     docUrl: string;
   };
+}
+
+/** Opaque keyset cursor for TPF — encodes the last (s,p,o,oIsIri) emitted. */
+interface TpfCursorTuple {
+  s: string;
+  p: string;
+  o: string;
+  oIsIri: boolean;
+}
+
+function encodeTpfCursor(tuple: TpfCursorTuple): string {
+  return Buffer.from(JSON.stringify(tuple)).toString("base64url");
+}
+
+function decodeTpfCursor(cursor: string): TpfCursorTuple {
+  return JSON.parse(
+    Buffer.from(cursor, "base64url").toString("utf-8")
+  ) as TpfCursorTuple;
 }
 
 // ─── URL helpers ──────────────────────────────────────────────────────────────

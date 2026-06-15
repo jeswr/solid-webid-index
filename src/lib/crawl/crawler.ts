@@ -57,6 +57,7 @@ import {
   isSolidWebId,
   parseProfile,
 } from "../rdf/profile.js";
+import { type FragmentTriple, datasetToTriples } from "../rdf/tpf.js";
 import {
   BodyTooLargeError,
   GuardedFetchError,
@@ -80,7 +81,7 @@ import {
 /** The minimal store surface `runCrawlBatch` needs (a subset of PgStore). */
 export type CrawlStore = CrawlCoordinator &
   PolitenessStore &
-  Pick<ReadStore, "exists">;
+  Pick<ReadStore, "exists" | "upsertTriples">;
 
 export interface RunCrawlBatchOptions {
   /** Logical worker identity passed to `claim()` (not stored as the fence token). */
@@ -275,6 +276,16 @@ async function processDoc(
       },
       row.claimToken
     );
+    // Erase any previously-materialised triples for this WebID and SUBTRACT its
+    // dataset-stats contribution (DESIGN.md §2.1.j / §4.8 H1) — an empty triple list
+    // is the documented delete-by-webid, so VoID/DCAT counts decrement on tombstone.
+    if (row.webid) {
+      await store.upsertTriples({
+        webid: row.webid,
+        docUrl: row.docUrl,
+        triples: [],
+      });
+    }
     await store.stampHost(row.host, now() + hostDelay, 0);
     return { fetched: true, added: 0, errored: false };
   }
@@ -343,6 +354,7 @@ async function processDoc(
   let knows: string[];
   let canonicalRdf: string;
   let contentHash: string;
+  let triples: FragmentTriple[];
   try {
     const dataset = await parseProfile({
       text: res.text,
@@ -353,6 +365,10 @@ async function processDoc(
     knows = extractWebIdProfile(dataset, webIdIri).knows;
     canonicalRdf = serializeCanonical(dataset);
     contentHash = sha256(canonicalRdf);
+    // Materialise the parsed graph into the TPF triple index (DESIGN.md §2.1.e /
+    // §4.5).  upsertTriples REPLACES the WebID's prior triples, so a re-crawl never
+    // leaves stale rows.  Built via the typed projection helper — never hand-built.
+    triples = datasetToTriples(dataset);
   } catch (err: unknown) {
     // Parse error / parser-bomb cap / content-type reject → deterministic, no retry (DESIGN.md §3.4).
     if (err instanceof ParseLimitError || err instanceof RdfFetchError) {
@@ -413,6 +429,13 @@ async function processDoc(
     },
     row.claimToken
   );
+  // Materialise the parsed triples for the TPF index (DESIGN.md §4.5).  REPLACE
+  // semantics keep the index in lock-step with raw_rdf on every re-crawl.
+  await store.upsertTriples({
+    webid: webIdIri,
+    docUrl: row.docUrl,
+    triples,
+  });
   // Healthy response → reset the host error counter.
   await store.stampHost(row.host, now() + hostDelay, 0);
 
@@ -590,6 +613,16 @@ async function finalizeHttpError(
       },
       row.claimToken
     );
+    // Erase materialised triples + SUBTRACT the WebID's dataset-stats contribution
+    // (empty triple list = delete-by-webid) so VoID/DCAT counts decrement on erasure
+    // (DESIGN.md §2.1.j / §4.8 H1).
+    if (row.webid) {
+      await store.upsertTriples({
+        webid: row.webid,
+        docUrl: row.docUrl,
+        triples: [],
+      });
+    }
     await store.stampHost(row.host, now() + hostDelay, 0);
     return { fetched: true, added: 0, errored: true };
   }
