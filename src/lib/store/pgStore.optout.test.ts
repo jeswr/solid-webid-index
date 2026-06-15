@@ -757,6 +757,253 @@ describe("stats/VoID/TPF cardinality match SERVED data after an inbound knows-ta
   });
 });
 
+// ─── Unified tombstone-transition accounting invariant (roborev MEDIUM ×3 round 6) ───
+//
+// THE invariant under test: the `sup` (total) + `sp:<pred>` (per-predicate) suppressed-inbound-edge
+// counters are incremented for a WebID IFF (a) it genuinely transitions non-tombstoned → tombstoned
+// in this op AND (b) a tombstone is actually persisted for it; the inbound count is taken BEFORE its
+// projection clears, EXCLUDING self-referential edges (Bob→Bob). These four tests pin the three
+// findings + the never-negative guard, all routed through tombstoneTransitionAccounting().
+describe("tombstone-transition suppressed accounting — the unified invariant (roborev MEDIUM)", () => {
+  /** Read the raw suppressed counters straight from the stats table. */
+  async function rawSuppressed(): Promise<{
+    total: number;
+    byPred: Map<string, number>;
+  }> {
+    const res = await db.query<{ k: string; v: number | string }>(
+      "SELECT k, v FROM stats WHERE k = 'sup' OR k LIKE 'sp:%'"
+    );
+    let total = 0;
+    const byPred = new Map<string, number>();
+    for (const r of res.rows) {
+      const v = Number(r.v);
+      if (r.k === "sup") total = v;
+      else byPred.set(r.k.slice("sp:".length), v);
+    }
+    return { total, byPred };
+  }
+
+  /** Assert NO suppressed counter (`sup` or any `sp:<pred>`) is negative (clamp invariant). */
+  async function assertNoNegativeSuppressed(): Promise<void> {
+    const res = await db.query<{ k: string; v: number | string }>(
+      "SELECT k, v FROM stats WHERE (k = 'sup' OR k LIKE 'sp:%') AND v < 0"
+    );
+    expect(res.rows).toEqual([]); // any row here is a negative counter — the bug
+  }
+
+  // (1) MEDIUM 1 — tombstone() a doc whose webid has NO materialised projection.
+  it("tombstone(docUrl) for a webid with NO projection keeps the counters correct (no over-report)", async () => {
+    // Alice is fully indexed and has an inbound edge knows→Bob. Bob is a KNOWN doc.webid but has NO
+    // materialised triples (only the doc row carries his webid — e.g. his profile failed to parse).
+    await indexProfile(store, {
+      webid: ALICE,
+      docUrl: ALICE_DOC,
+      triples: aliceTriples, // includes ALICE knows BOB
+    });
+    // Register Bob's doc row with his webid but DO NOT upsertTriples — no projection for Bob.
+    await store.enqueue(BOB_DOC, { webid: BOB, source: "seed" });
+    await store.markDone(BOB_DOC, {
+      state: "done",
+      webid: BOB,
+      rawRdf: `<${BOB}> <${FOAF_NAME}> "Bob" .`,
+      isSolid: true,
+      httpStatus: 200,
+    });
+
+    const before = await store.getStats();
+    expect(before.triples).toBe(aliceTriples.length); // only Alice projected (3)
+    expect(
+      before.propertyPartitions.find((p) => p.propertyIri === FOAF_KNOWS)
+        ?.triples
+    ).toBe(1); // Alice knows Bob is served pre-tombstone
+
+    // Tombstone Bob's doc. Even though Bob had NO projection, the doc row flips to 'tombstone' with his
+    // webid, so TPF suppresses Alice's inbound knows→Bob — the counters MUST account for it.
+    await store.tombstone(BOB_DOC);
+
+    const after = await store.getStats();
+    // Alice's 3 triples remain projected, but the inbound knows→Bob is suppressed → 3 - 1 = 2.
+    expect(after.triples).toBe(2);
+    expect(
+      after.propertyPartitions.find((p) => p.propertyIri === FOAF_KNOWS)
+    ).toBeUndefined();
+    expect(await store.estimatePatternCardinality({})).toBe(2);
+    expect(await store.estimatePatternCardinality({ p: FOAF_KNOWS })).toBe(0);
+    expect(
+      (await store.tpf({ pattern: { p: FOAF_KNOWS }, limit: 100 })).triples
+        .length
+    ).toBe(0);
+    // The suppressed counter was incremented EXACTLY once for the single inbound edge (no over/under).
+    const sup = await rawSuppressed();
+    expect(sup.total).toBe(1);
+    expect(sup.byPred.get(FOAF_KNOWS)).toBe(1);
+    await assertNoNegativeSuppressed();
+  });
+
+  // (2) MEDIUM 2 — a self-referential Bob→Bob edge must not create a negative counter and must not be
+  // counted as an inbound-suppressed edge.
+  it("a self-referential Bob→Bob edge is neither counted as suppressed nor drives a counter negative", async () => {
+    // Bob's profile includes a SELF edge: Bob knows Bob (o == subject == webid). Plus Alice knows Bob.
+    const bobSelfTriples: TpfTriple[] = [
+      { s: BOB, p: RDF_TYPE, o: FOAF_PERSON, oIsIri: true },
+      { s: BOB, p: FOAF_NAME, o: "Bob", oIsIri: false },
+      { s: BOB, p: FOAF_KNOWS, o: BOB, oIsIri: true }, // SELF-LOOP Bob→Bob
+    ];
+    await indexProfile(store, {
+      webid: ALICE,
+      docUrl: ALICE_DOC,
+      triples: aliceTriples, // ALICE knows BOB (genuine inbound edge)
+    });
+    await indexProfile(store, {
+      webid: BOB,
+      docUrl: BOB_DOC,
+      triples: bobSelfTriples,
+    });
+
+    // Tombstone Bob via markDone (crawler noindex/410 path) — the path that previously ran the
+    // accounting AFTER flipping the doc row to 'tombstone', so the self-loop was wrongly subtracted.
+    await db.query("UPDATE doc SET next_eligible_at = 0 WHERE doc_url = $1", [
+      BOB_DOC,
+    ]);
+    const claimed = await store.claim("worker-1", 8);
+    const bobToken = claimed.find((r) => r.docUrl === BOB_DOC)?.claimToken;
+    expect(bobToken).toBeTruthy();
+    const completed = await store.markDone(
+      BOB_DOC,
+      { state: "tombstone", httpStatus: 410, webid: BOB },
+      bobToken
+    );
+    expect(completed).toBe(true);
+
+    // Only Alice's GENUINE inbound knows→Bob is suppressed (count 1) — the Bob→Bob self-loop is NOT
+    // counted (it was cleared with Bob's own projection and excluded as a self-edge).
+    const sup = await rawSuppressed();
+    expect(sup.total).toBe(1); // NOT 2 (would include the self-loop), NOT clamped-from-negative
+    expect(sup.byPred.get(FOAF_KNOWS)).toBe(1);
+    await assertNoNegativeSuppressed();
+
+    // Served stats: Alice's type+name (2) survive; her knows→Bob + Bob's whole projection gone.
+    const after = await store.getStats();
+    expect(after.triples).toBe(2);
+    expect(await store.estimatePatternCardinality({ p: FOAF_KNOWS })).toBe(0);
+    expect(
+      (await store.tpf({ pattern: { p: FOAF_KNOWS }, limit: 100 })).triples
+        .length
+    ).toBe(0);
+  });
+
+  // (3) MEDIUM 3 — a doc projecting ALTERNATE WebIDs: only the actually-tombstoned WebID's inbound
+  // edges are subtracted; alternates that are NOT tombstoned keep being served (no under-report).
+  it("only the tombstoned WebID's inbound edges are subtracted; an alternate still served is not", async () => {
+    const ALT = "https://bob.example/card#alt"; // alternate WebID under the SAME doc as BOB
+    // Alice knows the canonical Bob; Carol knows the ALTERNATE — both inbound foaf:knows edges.
+    const CAROL = "https://carol.example/card#me";
+    const CAROL_DOC = "https://carol.example/card";
+    const carolTriples: TpfTriple[] = [
+      { s: CAROL, p: RDF_TYPE, o: FOAF_PERSON, oIsIri: true },
+      { s: CAROL, p: FOAF_KNOWS, o: ALT, oIsIri: true }, // inbound edge → the ALTERNATE
+    ];
+    await indexProfile(store, {
+      webid: ALICE,
+      docUrl: ALICE_DOC,
+      triples: aliceTriples,
+    }); // knows BOB
+    await indexProfile(store, {
+      webid: CAROL,
+      docUrl: CAROL_DOC,
+      triples: carolTriples,
+    }); // knows ALT
+    // Project the alternate WebID's own triples keyed under the SAME BOB_DOC (variant-key residue).
+    await store.enqueue(BOB_DOC, { webid: BOB, source: "seed" });
+    await store.markDone(BOB_DOC, {
+      state: "done",
+      webid: BOB,
+      rawRdf: `<${BOB}> a <${FOAF_PERSON}> .`,
+      isSolid: true,
+      httpStatus: 200,
+    });
+    await store.upsertTriples({
+      webid: BOB,
+      docUrl: BOB_DOC,
+      triples: bobTriples,
+    });
+    await store.upsertTriples({
+      webid: ALT,
+      docUrl: BOB_DOC, // same doc, different (alternate) webid key
+      triples: [{ s: ALT, p: RDF_TYPE, o: FOAF_PERSON, oIsIri: true }],
+    });
+
+    // Two inbound foaf:knows edges pre-tombstone: Alice→BOB and Carol→ALT.
+    const before = await store.getStats();
+    expect(
+      before.propertyPartitions.find((p) => p.propertyIri === FOAF_KNOWS)
+        ?.triples
+    ).toBe(2);
+
+    // markDone({state:'tombstone'}) tombstones the CANONICAL webid (BOB) ONLY. ALT is variant-key
+    // residue: its projection is cleared but NO tombstone is persisted for ALT — so Carol→ALT keeps
+    // being SERVED and must NOT be subtracted (counting it would under-report).
+    await db.query("UPDATE doc SET next_eligible_at = 0 WHERE doc_url = $1", [
+      BOB_DOC,
+    ]);
+    const claimed = await store.claim("worker-1", 8);
+    const bobToken = claimed.find((r) => r.docUrl === BOB_DOC)?.claimToken;
+    expect(bobToken).toBeTruthy();
+    const completed = await store.markDone(
+      BOB_DOC,
+      { state: "tombstone", httpStatus: 410, webid: BOB },
+      bobToken
+    );
+    expect(completed).toBe(true);
+
+    // Only Alice→BOB is suppressed (count 1). Carol→ALT is NOT subtracted (ALT not tombstoned).
+    const sup = await rawSuppressed();
+    expect(sup.total).toBe(1);
+    expect(sup.byPred.get(FOAF_KNOWS)).toBe(1);
+    await assertNoNegativeSuppressed();
+
+    // The served foaf:knows estimate = 1 (Carol→ALT still served), NOT 0 (which would under-report the
+    // alternate's still-served edge) and NOT 2 (which would over-report the suppressed BOB edge).
+    expect(await store.estimatePatternCardinality({ p: FOAF_KNOWS })).toBe(1);
+    const knowsTpf = await store.tpf({
+      pattern: { p: FOAF_KNOWS },
+      limit: 100,
+    });
+    expect(knowsTpf.triples.length).toBe(1);
+    expect(knowsTpf.triples[0]?.o).toBe(ALT); // the surviving served edge is Carol→ALT
+  });
+
+  // (4) The never-negative guard, exercised across the paths + a redundant re-tombstone.
+  it("sup / sp:<pred> are NEVER negative across tombstone / erase / repeat-tombstone", async () => {
+    await indexProfile(store, {
+      webid: ALICE,
+      docUrl: ALICE_DOC,
+      triples: aliceTriples,
+    }); // knows BOB
+    await indexProfile(store, {
+      webid: BOB,
+      docUrl: BOB_DOC,
+      triples: bobTriples,
+    });
+    await assertNoNegativeSuppressed();
+
+    await store.tombstone(BOB_DOC);
+    await assertNoNegativeSuppressed();
+    // Repeat tombstone via a DIFFERENT path — must not drive any counter below zero.
+    await store.eraseWebId({ webid: BOB, docUrl: BOB_DOC, reason: "opt-out" });
+    await assertNoNegativeSuppressed();
+    // And a third, redundant erase.
+    await store.eraseWebId({ webid: BOB, docUrl: BOB_DOC, reason: "opt-out" });
+    await assertNoNegativeSuppressed();
+
+    // The counter stayed EXACT (1), never went negative-then-clamped, never double-counted.
+    const sup = await rawSuppressed();
+    expect(sup.total).toBe(1);
+    expect(sup.byPred.get(FOAF_KNOWS)).toBe(1);
+    expect(await store.estimatePatternCardinality({ p: FOAF_KNOWS })).toBe(0);
+  });
+});
+
 // ─── Path B nonce lifecycle ──────────────────────────────────────────────────
 
 describe("opt-out nonce — single-use + 24h TTL", () => {
