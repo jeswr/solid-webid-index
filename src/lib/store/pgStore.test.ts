@@ -56,6 +56,7 @@ function makeDoc(
     error: overrides.error ?? null,
     noindex: overrides.noindex ?? false,
     rawRdf: overrides.rawRdf ?? null,
+    label: overrides.label ?? null,
   };
 }
 
@@ -74,6 +75,105 @@ describe("PgStore — migration", () => {
     const { store } = await makeTestStore();
     // Second apply should be a no-op (IF NOT EXISTS guards every statement)
     await expect(store.migrate()).resolves.toBeUndefined();
+  });
+
+  // ── roborev HIGH: label / label_fts must be MIGRATED onto pre-existing DBs ────
+  //
+  // CREATE TABLE IF NOT EXISTS is a no-op for an existing `doc` table, so on a
+  // database created before label / label_fts shipped those columns are absent and
+  // the CREATE INDEX … (label_fts) would FAIL.  migrate() must ALTER them in first.
+  it("migrates label + label_fts onto an OLD-shape doc table (no columns) and creates the index", async () => {
+    const db = new PGlite();
+
+    // Simulate a pre-existing database: a `doc` table WITHOUT label / label_fts.
+    // (Minimal old shape — only the columns the new generated expression reads.)
+    // The pre-label `doc` shape: every column the OTHER indexes reference
+    // (host, state, next_eligible_at, last_crawled) plus raw_rdf/fts_vector,
+    // but NOT label / label_fts (those shipped later).
+    await db.exec(`
+      CREATE TABLE doc (
+        doc_url          TEXT PRIMARY KEY,
+        host             TEXT NOT NULL DEFAULT '',
+        state            TEXT NOT NULL DEFAULT 'pending',
+        next_eligible_at BIGINT NOT NULL DEFAULT 0,
+        last_crawled     BIGINT,
+        raw_rdf          TEXT,
+        fts_vector TSVECTOR GENERATED ALWAYS AS (
+          to_tsvector('english', coalesce(raw_rdf, ''))
+        ) STORED
+      );
+    `);
+
+    // Sanity: confirm the old shape is genuinely missing the new columns.
+    const before = await db.query<{ column_name: string }>(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_name = 'doc' AND column_name IN ('label', 'label_fts')`
+    );
+    expect(before.rows.map((r) => r.column_name).sort()).toEqual([]);
+
+    // Migrate the OLD-shape table.
+    const store = new PgStore(createPgliteExecutor(db));
+    await expect(store.migrate()).resolves.toBeUndefined();
+
+    // Both columns must now exist.
+    const after = await db.query<{ column_name: string }>(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_name = 'doc' AND column_name IN ('label', 'label_fts')`
+    );
+    expect(after.rows.map((r) => r.column_name).sort()).toEqual([
+      "label",
+      "label_fts",
+    ]);
+
+    // The label_fts GIN index must have been created (it would have FAILED before
+    // the ALTER added the column).
+    const idx = await db.query<{ indexname: string }>(
+      `SELECT indexname FROM pg_indexes
+       WHERE tablename = 'doc' AND indexname = 'idx_doc_label_fts'`
+    );
+    expect(idx.rows).toHaveLength(1);
+
+    // label_fts must be a GENERATED column that actually computes (weighted A/D).
+    await db.exec(
+      `INSERT INTO doc (doc_url, raw_rdf, label) VALUES ('u', 'hello world', 'Alice');`
+    );
+    const lf = await db.query<{ label_fts: string }>(
+      `SELECT label_fts FROM doc WHERE doc_url = 'u'`
+    );
+    // 'alic':1A means the label token got weight 'A' (highest) — the generated
+    // expression ran, proving ALTER … GENERATED ALWAYS AS … STORED took effect.
+    expect(lf.rows[0].label_fts).toContain("A");
+  });
+
+  it("migrate() is idempotent on an OLD-shape table (re-run after ALTER does not error)", async () => {
+    const db = new PGlite();
+    // The pre-label `doc` shape: every column the OTHER indexes reference
+    // (host, state, next_eligible_at, last_crawled) plus raw_rdf/fts_vector,
+    // but NOT label / label_fts (those shipped later).
+    await db.exec(`
+      CREATE TABLE doc (
+        doc_url          TEXT PRIMARY KEY,
+        host             TEXT NOT NULL DEFAULT '',
+        state            TEXT NOT NULL DEFAULT 'pending',
+        next_eligible_at BIGINT NOT NULL DEFAULT 0,
+        last_crawled     BIGINT,
+        raw_rdf          TEXT,
+        fts_vector TSVECTOR GENERATED ALWAYS AS (
+          to_tsvector('english', coalesce(raw_rdf, ''))
+        ) STORED
+      );
+    `);
+    const store = new PgStore(createPgliteExecutor(db));
+    await store.migrate(); // adds label / label_fts + index
+    await store.migrate(); // ADD COLUMN IF NOT EXISTS → no-op
+    await expect(store.migrate()).resolves.toBeUndefined();
+
+    // Columns + index still present (and not duplicated).
+    const cols = await db.query<{ column_name: string }>(
+      `SELECT column_name FROM information_schema.columns
+       WHERE table_name = 'doc' AND column_name IN ('label', 'label_fts')`
+    );
+    expect(cols.rows).toHaveLength(2);
   });
 });
 

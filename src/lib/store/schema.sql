@@ -50,12 +50,49 @@ CREATE TABLE IF NOT EXISTS doc (
   noindex           BOOLEAN     NOT NULL DEFAULT FALSE,
   raw_rdf           TEXT,
 
-  -- FTS: generated tsvector over raw_rdf; updated automatically by Postgres.
-  -- websearch_to_tsquery / plainto_tsquery both work against this column.
+  -- Extracted display label (foaf:name / vcard:fn / schema:name) for the WebID
+  -- agent described by this doc.  Populated by the crawler's projection step.
+  -- Null until the doc has been crawled and a name extracted.
+  label             TEXT,
+
+  -- FTS: generated tsvector over raw_rdf (backward-compat; used when label_fts
+  -- is unavailable on older rows or when label_fts index is not yet built).
   fts_vector        TSVECTOR    GENERATED ALWAYS AS (
                       to_tsvector('english', coalesce(raw_rdf, ''))
+                    ) STORED,
+
+  -- Weighted FTS: label is 'A' (highest weight), raw_rdf is 'D' (lowest weight).
+  -- ts_rank against label_fts ranks name-matching results above URI/predicate hits.
+  -- Populated automatically; populated even when label is NULL (falls back to
+  -- to_tsvector on empty string = empty tsvector).
+  label_fts         TSVECTOR    GENERATED ALWAYS AS (
+                      setweight(to_tsvector('english', coalesce(label, '')), 'A')
+                      || setweight(to_tsvector('english', coalesce(raw_rdf, '')), 'D')
                     ) STORED
 );
+
+-- ─── doc column migrations (idempotent) ──────────────────────────────────────
+--
+-- CREATE TABLE IF NOT EXISTS above is a NO-OP on an already-created `doc` table,
+-- so columns added AFTER the table first shipped (label, label_fts) would be
+-- ABSENT on a pre-existing database — and the CREATE INDEX … (label_fts) below
+-- would then FAIL with "column \"label_fts\" does not exist".
+--
+-- ALTER TABLE … ADD COLUMN IF NOT EXISTS is the idempotent bridge: it adds the
+-- column on an old-shape table and is a no-op once present (fresh schemas already
+-- have it from the CREATE TABLE above, so the ALTERs are no-ops there too).  These
+-- MUST run BEFORE the GIN index on label_fts.  The generated expression here is
+-- byte-identical to the CREATE TABLE definition above — keep the two in sync.
+--
+-- PG / pglite support: PostgreSQL ≥ 12 (pglite 0.5.x ships PG 18) supports adding
+-- a STORED generated column via ALTER TABLE, including the ADD COLUMN IF NOT EXISTS
+-- form — verified against pglite 0.5.2 in pgStore.test.ts.
+ALTER TABLE doc ADD COLUMN IF NOT EXISTS label TEXT;
+
+ALTER TABLE doc ADD COLUMN IF NOT EXISTS label_fts TSVECTOR GENERATED ALWAYS AS (
+  setweight(to_tsvector('english', coalesce(label, '')), 'A')
+  || setweight(to_tsvector('english', coalesce(raw_rdf, '')), 'D')
+) STORED;
 
 -- Frontier / claim query index
 CREATE INDEX IF NOT EXISTS idx_doc_ready    ON doc (state, next_eligible_at);
@@ -64,6 +101,9 @@ CREATE INDEX IF NOT EXISTS idx_doc_recrawl  ON doc (state, last_crawled);
 
 -- FTS GIN index — required for @@ operator to be fast
 CREATE INDEX IF NOT EXISTS idx_doc_fts      ON doc USING GIN (fts_vector);
+
+-- Weighted FTS GIN index (label_fts combines label A + raw_rdf D weights)
+CREATE INDEX IF NOT EXISTS idx_doc_label_fts ON doc USING GIN (label_fts);
 
 -- ─── suggest_budget — shared anti-amplification budget per suggestion root ────
 --

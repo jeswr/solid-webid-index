@@ -163,6 +163,7 @@ interface DocRow {
   error: string | null;
   noindex: boolean;
   raw_rdf: string | null;
+  label: string | null;
 }
 
 function rowToRecord(r: DocRow): DocRecord {
@@ -191,6 +192,7 @@ function rowToRecord(r: DocRow): DocRecord {
     error: r.error,
     noindex: Boolean(r.noindex),
     rawRdf: r.raw_rdf,
+    label: r.label ?? null,
   };
 }
 
@@ -224,10 +226,11 @@ export class PgStore
     let schemaSql: string;
     try {
       // Primary: resolve from the directory containing this module file.
-      const schemaPath = join(
-        new URL(".", import.meta.url).pathname,
-        "schema.sql"
-      );
+      // Use new URL("schema.sql", import.meta.url) — the two-argument form is
+      // recognised by webpack 5 as a static asset URL and does NOT trigger the
+      // "can't resolve '.'" error that the new URL(".", import.meta.url) form
+      // causes (webpack interprets "." as a module specifier).
+      const schemaPath = new URL("schema.sql", import.meta.url).pathname;
       schemaSql = readFileSync(schemaPath, "utf-8");
     } catch {
       // Fallback: resolve from process.cwd() (e.g. project root in some vitest configs).
@@ -312,12 +315,12 @@ export class PgStore
          doc_url, host, webid, state, depth, root_seed, suggest_budget,
          source, discovered_from, claim_token, claimed_at, attempts,
          etag, last_modified, content_hash, last_crawled, next_eligible_at,
-         enqueued_at, http_status, is_solid, fail_class, error, noindex, raw_rdf
+         enqueued_at, http_status, is_solid, fail_class, error, noindex, raw_rdf, label
        ) VALUES (
          $1, $2, $3, $4, $5, $6, $7,
          $8, $9, $10, $11, $12,
          $13, $14, $15, $16, $17,
-         $18, $19, $20, $21, $22, $23, $24
+         $18, $19, $20, $21, $22, $23, $24, $25
        )
        ON CONFLICT (doc_url) DO UPDATE SET
          host             = EXCLUDED.host,
@@ -342,7 +345,8 @@ export class PgStore
          fail_class       = EXCLUDED.fail_class,
          error            = EXCLUDED.error,
          noindex          = EXCLUDED.noindex,
-         raw_rdf          = EXCLUDED.raw_rdf`,
+         raw_rdf          = EXCLUDED.raw_rdf,
+         label            = EXCLUDED.label`,
       [
         record.docUrl,
         record.host,
@@ -368,6 +372,7 @@ export class PgStore
         record.error,
         record.noindex,
         record.rawRdf,
+        record.label ?? null,
       ]
     );
   }
@@ -402,13 +407,19 @@ export class PgStore
     // Keyset: filter out rows that would appear before the cursor.
     // Ordering: rank DESC, doc_url ASC (deterministic tiebreak).
     // Keyset condition: (rank < cursorRank) OR (rank = cursorRank AND doc_url > cursorDocUrl)
+    //
+    // ts_rank() returns REAL (float4). Passing a float8 cursor rank back as a
+    // Postgres parameter risks the equality branch failing due to float64→float4
+    // precision loss. Cast the parameter to ::real so Postgres compares float4
+    // to float4 (the same type as the computed rank expression).
     let cursorClause = "";
     if (cursorParts) {
       params.push(cursorParts.rank, cursorParts.docUrl);
+      const rankParam = `$${params.length - 1}::real`;
       cursorClause = `AND (
-        ts_rank(fts_vector, websearch_to_tsquery('english', $1)) < $${params.length - 1}
+        ts_rank(label_fts, websearch_to_tsquery('english', $1)) < ${rankParam}
         OR (
-          ts_rank(fts_vector, websearch_to_tsquery('english', $1)) = $${params.length - 1}
+          ts_rank(label_fts, websearch_to_tsquery('english', $1)) = ${rankParam}
           AND doc_url > $${params.length}
         )
       )`;
@@ -422,38 +433,43 @@ export class PgStore
       state: string;
       last_crawled: string | null;
       rank: number | string;
+      label: string | null;
     }
 
+    // Use label_fts (weighted: label='A', raw_rdf='D') for ranking so name-matching
+    // results outrank incidental URI/predicate hits.  Fall back to fts_vector (raw_rdf
+    // only) when websearch_to_tsquery is unavailable (older pglite builds) or if
+    // label_fts column has not yet been migrated in (guard against schema-lag).
     let rows: SearchRow[];
     try {
       rows = await this.db.query<SearchRow>(
-        `SELECT doc_url, webid, raw_rdf, is_solid, state, last_crawled,
-                ts_rank(fts_vector, websearch_to_tsquery('english', $1)) AS rank
+        `SELECT doc_url, webid, raw_rdf, is_solid, state, last_crawled, label,
+                ts_rank(label_fts, websearch_to_tsquery('english', $1)) AS rank
          FROM doc
-         WHERE fts_vector @@ websearch_to_tsquery('english', $1)
+         WHERE label_fts @@ websearch_to_tsquery('english', $1)
            AND state != 'tombstone'
            ${cursorClause}
          ORDER BY rank DESC, doc_url ASC
-         LIMIT $2`,
+         LIMIT $2::int`,
         params
       );
     } catch (err) {
-      // Fallback ONLY when websearch_to_tsquery is absent (Postgres error code
-      // 42883 = undefined_function; pglite surfaces it in the message).
-      // All other errors (connection, schema, permission, param) are rethrown
-      // immediately so they are not masked by a spurious fallback attempt.
-      if (!isUndefinedFunctionError(err)) {
+      // Fallback 1: websearch_to_tsquery absent (pglite ≤0.4.x) — try plainto_tsquery
+      // with label_fts.  Fallback 2: label_fts column absent (pre-migration schema) —
+      // fall back to fts_vector.  Both are caught by the same "undefined function /
+      // column not found" error class; we try once more with fts_vector + plainto_tsquery.
+      if (!isUndefinedFunctionError(err) && !isUndefinedColumnError(err)) {
         throw err;
       }
 
-      // Older pglite builds may not ship websearch_to_tsquery.
-      // plainto_tsquery is always available and semantically close enough.
+      // Older pglite builds may not ship websearch_to_tsquery; label_fts may be absent
+      // on pre-migration schemas.  plainto_tsquery + fts_vector is always available.
       const fallbackParams = [...params];
       const fallbackCursorClause = cursorParts
         ? `AND (
-          ts_rank(fts_vector, plainto_tsquery('english', $1)) < $${fallbackParams.length - 1}
+          ts_rank(fts_vector, plainto_tsquery('english', $1)) < $${fallbackParams.length - 1}::real
           OR (
-            ts_rank(fts_vector, plainto_tsquery('english', $1)) = $${fallbackParams.length - 1}
+            ts_rank(fts_vector, plainto_tsquery('english', $1)) = $${fallbackParams.length - 1}::real
             AND doc_url > $${fallbackParams.length}
           )
         )`
@@ -461,13 +477,14 @@ export class PgStore
 
       rows = await this.db.query<SearchRow>(
         `SELECT doc_url, webid, raw_rdf, is_solid, state, last_crawled,
+                NULL::TEXT AS label,
                 ts_rank(fts_vector, plainto_tsquery('english', $1)) AS rank
          FROM doc
          WHERE fts_vector @@ plainto_tsquery('english', $1)
            AND state != 'tombstone'
            ${fallbackCursorClause}
          ORDER BY rank DESC, doc_url ASC
-         LIMIT $2`,
+         LIMIT $2::int`,
         fallbackParams
       );
     }
@@ -483,6 +500,7 @@ export class PgStore
       state: r.state as DocState,
       lastCrawled: r.last_crawled != null ? Number(r.last_crawled) : null,
       rank: Number(r.rank),
+      label: r.label ?? null,
     }));
 
     const nextCursor =
@@ -616,7 +634,7 @@ export class PgStore
     // Import LEASE_MS from config so the threshold is the single-source constant.
     // We inline the import here to keep the adapter config-aware without coupling
     // the constructor to config (tests inject their own batchSize).
-    const { LEASE_MS } = await import("../config.js");
+    const { LEASE_MS } = await import("@/lib/config");
     const expiredBefore = now - LEASE_MS;
 
     // Generate a FRESH UNIQUE opaque token for this claim() call.  All rows in
@@ -969,6 +987,19 @@ function isUndefinedFunctionError(err: unknown): boolean {
     msg.includes("websearch_to_tsquery") &&
     (msg.includes("does not exist") || msg.includes("undefined"))
   );
+}
+
+/**
+ * Returns true only when the error signals an undefined column reference
+ * (SQLSTATE 42703).  Used to guard the label_fts → fts_vector fallback when
+ * the schema has not yet been migrated to add the label_fts column.
+ */
+function isUndefinedColumnError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const code = (err as Error & { code?: string }).code;
+  if (code === "42703") return true;
+  const msg = err.message.toLowerCase();
+  return msg.includes("label_fts") && msg.includes("does not exist");
 }
 
 // ─── Cursor helpers ───────────────────────────────────────────────────────────
