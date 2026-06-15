@@ -17,6 +17,7 @@
 import { PGlite } from "@electric-sql/pglite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { slugForWebId } from "../url/slug.js";
 import { PgStore, createPgliteExecutor } from "./pgStore.js";
 import type { SqlExecutor } from "./pgStore.js";
 import type { TpfTriple } from "./ports.js";
@@ -297,6 +298,147 @@ describe("inbound foaf:knows edges to a tombstoned WebID are dropped from served
     const set = await store.tombstonedWebids([ALICE, BOB]);
     expect(set.has(BOB)).toBe(true);
     expect(set.has(ALICE)).toBe(false);
+  });
+});
+
+// ─── Erasure resurrection RACE (roborev HIGH) ────────────────────────────────
+
+describe("erasure resurrection race — a crawl that finishes AFTER the tombstone cannot resurrect", () => {
+  it("markDone() for a tombstoned WebID 410s the entry + search returns nothing (no resurrected row)", async () => {
+    // Simulate the RACE: a crawl claims Bob, then an opt-out erases Bob (tombstone written + doc row
+    // deleted), then the in-flight crawl finishes and calls markDone() with state='done' + raw_rdf +
+    // webid. Without the markDone tombstone gate this RESURRECTS a servable `done` doc row.
+    await store.enqueue(BOB_DOC, { webid: BOB, source: "seed" });
+    const claimed = await store.claim("worker-1", 8);
+    const bobClaim = claimed.find((r) => r.docUrl === BOB_DOC);
+    expect(bobClaim).toBeDefined();
+
+    // Opt-out erasure lands FIRST (tombstone committed, doc row deleted).
+    await store.eraseWebId({ webid: BOB, docUrl: BOB_DOC, reason: "opt-out" });
+    expect(await store.isTombstoned({ webid: BOB })).toBe(true);
+
+    // The racing crawl now finishes — markDone with the live claim token + full result payload.
+    await store.markDone(
+      BOB_DOC,
+      {
+        state: "done",
+        webid: BOB,
+        rawRdf: `<${BOB}> <${FOAF_NAME}> "Bob" .`,
+        isSolid: true,
+        httpStatus: 200,
+      },
+      bobClaim?.claimToken
+    );
+
+    // The completion must NOT have resurrected a servable row: the entry 410s (tombstoned, no live
+    // doc), search returns nothing, and getEntryByWebid is null.
+    expect(await store.getEntryByWebid(BOB)).toBeNull();
+    expect(await store.exists(BOB_DOC)).toBe(false);
+    const slug = slugForWebId(BOB);
+    const entry = await store.getEntryBySlug(slug);
+    expect(entry === null || entry === "tombstoned").toBe(true);
+    const hits = await store.search({ query: "Bob", limit: 50 });
+    expect(hits.rows.some((r) => r.webid === BOB)).toBe(false);
+    // And no raw_rdf row survives under the deleted doc URL.
+    const docRows = await db.query<{ raw_rdf: string | null }>(
+      "SELECT raw_rdf FROM doc WHERE doc_url = $1 OR webid = $2",
+      [BOB_DOC, BOB]
+    );
+    expect(docRows.rows.length).toBe(0);
+  });
+
+  it("the token-less markDone() path is ALSO gated (enqueue→markDone after tombstone)", async () => {
+    await store.eraseWebId({ webid: BOB, docUrl: BOB_DOC, reason: "opt-out" });
+    // A bare enqueue is refused by gate 1, but force the race even harder: markDone directly (no
+    // claimToken) must still refuse to write a servable row for a tombstoned WebID.
+    await store.markDone(BOB_DOC, {
+      state: "done",
+      webid: BOB,
+      rawRdf: `<${BOB}> <${FOAF_NAME}> "Bob" .`,
+      isSolid: true,
+      httpStatus: 200,
+    });
+    expect(await store.getEntryByWebid(BOB)).toBeNull();
+    expect(await store.exists(BOB_DOC)).toBe(false);
+  });
+
+  it("upsertTriples() on a tombstoned WebID PURGES the doc row + raw_rdf (not just the projection)", async () => {
+    // Index Bob normally, then tombstone via the permanent table WITHOUT going through eraseWebId's
+    // doc-row delete, to isolate the projection gate: a leftover `done` doc row with raw_rdf must be
+    // purged by the projection-gate path when upsertTriples runs for the tombstoned WebID.
+    await indexProfile(store, {
+      webid: BOB,
+      docUrl: BOB_DOC,
+      triples: bobTriples,
+    });
+    await db.query(
+      `INSERT INTO tombstone (webid, doc_url, reason, created_at)
+         VALUES ($1, $2, 'opt-out', $3)`,
+      [BOB, BOB_DOC, Date.now()]
+    );
+    // The doc row is still live (raw_rdf present) at this point — the projection gate must purge it.
+    await store.upsertTriples({
+      webid: BOB,
+      docUrl: BOB_DOC,
+      triples: bobTriples,
+    });
+    expect(await store.getEntryByWebid(BOB)).toBeNull();
+    expect(await store.exists(BOB_DOC)).toBe(false);
+    const tpf = await store.tpf({ pattern: { s: BOB }, limit: 100 });
+    expect(tpf.triples.length).toBe(0);
+  });
+});
+
+// ─── Stats consistency after inbound-edge suppression (roborev MEDIUM) ────────
+
+describe("stats/VoID/TPF cardinality match SERVED data after an inbound knows-target is erased", () => {
+  beforeEach(async () => {
+    await indexProfile(store, {
+      webid: ALICE,
+      docUrl: ALICE_DOC,
+      triples: aliceTriples,
+    });
+    await indexProfile(store, {
+      webid: BOB,
+      docUrl: BOB_DOC,
+      triples: bobTriples,
+    });
+  });
+
+  it("getStats() total triples + foaf:knows partition exclude the suppressed inbound edge", async () => {
+    const before = await store.getStats();
+    // Alice (3) + Bob (2) = 5 triples; one foaf:knows (Alice→Bob).
+    expect(before.triples).toBe(aliceTriples.length + bobTriples.length);
+    const knowsBefore = before.propertyPartitions.find(
+      (p) => p.propertyIri === FOAF_KNOWS
+    );
+    expect(knowsBefore?.triples).toBe(1);
+
+    await store.eraseWebId({ webid: BOB, docUrl: BOB_DOC, reason: "opt-out" });
+
+    const after = await store.getStats();
+    // Bob's 2 own triples are deleted on erasure; Alice's inbound foaf:knows→Bob remains in the
+    // table but is SUPPRESSED from served output, so the total must drop by it too: 5 - 2 (Bob) - 1
+    // (suppressed knows) = 2 (Alice's type + name).
+    expect(after.triples).toBe(2);
+    // The foaf:knows partition drops to 0 served → not advertised at all.
+    expect(
+      after.propertyPartitions.find((p) => p.propertyIri === FOAF_KNOWS)
+    ).toBeUndefined();
+    // The TPF empty-pattern estimate matches the served triple count.
+    const emptyEstimate = await store.estimatePatternCardinality({});
+    expect(emptyEstimate).toBe(2);
+    // The predicate-only estimate for foaf:knows now matches the 0 served edges.
+    const knowsEstimate = await store.estimatePatternCardinality({
+      p: FOAF_KNOWS,
+    });
+    expect(knowsEstimate).toBe(0);
+    // Sanity: the served TPF for foaf:knows is indeed empty (the estimate matches reality).
+    const knowsTpf = await store.tpf({
+      pattern: { p: FOAF_KNOWS },
+      limit: 100,
+    });
+    expect(knowsTpf.triples.length).toBe(0);
   });
 });
 

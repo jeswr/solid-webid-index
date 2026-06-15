@@ -154,7 +154,27 @@ function isJsonObject(v: unknown): v is Record<string, unknown> {
 const JSON_CONTENT_TYPES = ["application/json", "application/jwk-set+json"];
 
 /**
- * Default issuer-keys resolver: OIDC discovery on `${issuer}/.well-known/openid-configuration`,
+ * Build the OIDC discovery URL for an issuer per OpenID Connect Discovery 1.0 §4: the well-known
+ * segment is APPENDED to the issuer, PRESERVING any path component — so a pathful issuer like
+ * `https://idp.example/solid` discovers at `https://idp.example/solid/.well-known/openid-configuration`,
+ * not at the host-root (which would drop `/solid` and hit the wrong endpoint → spurious rejection).
+ * A root issuer (`https://idp.example` or `https://idp.example/`) yields
+ * `https://idp.example/.well-known/openid-configuration`. Query + fragment on the issuer are dropped
+ * (an issuer identifier carries neither, RFC 8414 §2).
+ */
+export function wellKnownConfigUrl(issuerUrl: URL): string {
+  // Strip any trailing slash from the path so we don't produce a doubled `//.well-known`.
+  const basePath = issuerUrl.pathname.replace(/\/+$/, "");
+  const out = new URL(issuerUrl.href);
+  out.search = "";
+  out.hash = "";
+  out.pathname = `${basePath}/.well-known/openid-configuration`;
+  return out.href;
+}
+
+/**
+ * Default issuer-keys resolver: OIDC discovery on the issuer's well-known config URL
+ * (path-preserving, see {@link wellKnownConfigUrl}),
  * cross-checking the discovered `issuer` and reading `jwks_uri`, then fetching the JWKS — BOTH
  * through the SSRF chokepoint {@link guardedFetch} (the `iss` is attacker-influenced until the
  * signature check, so its metadata MUST be fetched SSRF-safely, not via a raw fetch). A LOCAL JWKS
@@ -165,8 +185,7 @@ async function discoverIssuerKeys(issuer: string): Promise<JWTVerifyGetKey> {
   if (issuerUrl.protocol !== "https:") {
     throw new DpopVerifyError("Token issuer must be an https: URL.");
   }
-  const wellKnown = new URL("/.well-known/openid-configuration", issuerUrl)
-    .href;
+  const wellKnown = wellKnownConfigUrl(issuerUrl);
 
   let meta: { issuer?: unknown; jwks_uri?: unknown };
   try {

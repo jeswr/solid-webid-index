@@ -28,6 +28,7 @@ import {
   DpopVerifyError,
   localIssuerKeys,
   verifyDpopWebId,
+  wellKnownConfigUrl,
 } from "./dpopVerifier";
 
 const ISSUER = "https://idp.example";
@@ -299,5 +300,47 @@ describe("verifyDpopWebId — trusted-issuer allowlist", () => {
       trustedIssuers: [ISSUER],
     });
     expect(result.webid).toBe(WEBID);
+  });
+});
+
+// ─── OIDC discovery URL (path-preserving) ──────────────────────────────────────
+
+describe("wellKnownConfigUrl — OIDC discovery URL construction (roborev LOW)", () => {
+  it("PRESERVES the issuer path for a pathful issuer (OIDC Discovery §4)", () => {
+    // A pathful issuer must discover UNDER its path, not at the host root. The buggy
+    // `new URL("/.well-known/...", issuer)` form dropped `/solid` → wrong endpoint → spurious reject.
+    expect(wellKnownConfigUrl(new URL("https://idp.example/solid"))).toBe(
+      "https://idp.example/solid/.well-known/openid-configuration"
+    );
+  });
+
+  it("handles a pathful issuer WITH a trailing slash (no doubled slash)", () => {
+    expect(wellKnownConfigUrl(new URL("https://idp.example/solid/"))).toBe(
+      "https://idp.example/solid/.well-known/openid-configuration"
+    );
+  });
+
+  it("handles a multi-segment issuer path", () => {
+    expect(wellKnownConfigUrl(new URL("https://idp.example/a/b/c"))).toBe(
+      "https://idp.example/a/b/c/.well-known/openid-configuration"
+    );
+  });
+
+  it("builds the host-root URL for a root issuer (no path)", () => {
+    expect(wellKnownConfigUrl(new URL("https://idp.example"))).toBe(
+      "https://idp.example/.well-known/openid-configuration"
+    );
+  });
+
+  it("builds the host-root URL for a root issuer with a bare trailing slash", () => {
+    expect(wellKnownConfigUrl(new URL("https://idp.example/"))).toBe(
+      "https://idp.example/.well-known/openid-configuration"
+    );
+  });
+
+  it("drops query + fragment on the issuer (issuer identifiers carry neither)", () => {
+    expect(
+      wellKnownConfigUrl(new URL("https://idp.example/solid?x=1#frag"))
+    ).toBe("https://idp.example/solid/.well-known/openid-configuration");
   });
 });
