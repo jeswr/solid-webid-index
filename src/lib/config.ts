@@ -236,3 +236,37 @@ export const CRAWL_CATALOG_URLS = envStr("CRAWL_CATALOG_URLS", "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
+
+// ─── Job scheduling / self-chaining (§3.5) ───────────────────────────────────
+
+/**
+ * Name of the environment variable that holds the shared CRON_SECRET.
+ * Vercel Cron sends `Authorization: Bearer <CRON_SECRET>` on every invocation;
+ * the /api/_jobs/tick and /api/_jobs/crawl routes verify against this value.
+ */
+export const CRON_SECRET_ENV = "CRON_SECRET";
+
+/**
+ * Max self-chain hops an /api/_jobs/crawl invocation may trigger before stopping
+ * (prevents an unbounded cascade).  The daily Vercel Cron resets the cycle.
+ */
+export const CRAWL_JOB_MAX_CHAIN_DEPTH = envInt(
+  "CRAWL_JOB_MAX_CHAIN_DEPTH",
+  10
+);
+
+/**
+ * Return the shared CRON_SECRET from the environment, or null when unset.
+ * Used by all job routes and the triggerCrawl helper to authenticate calls.
+ * Throws at boot in production when the variable is absent so the route fails
+ * closed rather than silently accepting unsigned requests.
+ */
+export function getCronSecret(): string {
+  const v = process.env[CRON_SECRET_ENV];
+  if (!v) {
+    throw new Error(
+      `[solid-webid-index] ${CRON_SECRET_ENV} env var is not set — job routes will not authenticate requests`
+    );
+  }
+  return v;
+}

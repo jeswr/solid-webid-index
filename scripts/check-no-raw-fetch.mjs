@@ -21,11 +21,27 @@ import { join, relative } from "node:path";
 const ROOT = process.cwd();
 const SRC = join(ROOT, "src");
 
-/** Files allowed to reference the raw primitives (relative to repo root, POSIX slashes). */
+/**
+ * Files allowed to reference the raw primitives (relative to repo root, POSIX slashes).
+ *
+ * Allowlist rationale:
+ *  - src/lib/security/guardedFetch.ts  — the SSRF chokepoint; imports undici directly.
+ *  - src/lib/security/ssrf.ts          — vendored SSRF guard.
+ *  - src/lib/security/body.ts          — vendored bounded reader.
+ *  - src/app/api/_jobs/crawl/route.ts  — self-chain trigger: fires a POST to its OWN
+ *    deployment URL (always HTTPS on Vercel, never attacker-controlled).  This is an
+ *    internal relay, not an external fetch of user-supplied content.
+ *  - src/app/api/_jobs/tick/route.ts   — tick→crawl relay: same reasoning as above.
+ *  - src/lib/crawl/triggerCrawl.ts     — LDN-inbox→crawl relay: fires a POST to its
+ *    own deployment URL when a new suggestion arrives; same reasoning.
+ */
 const ALLOWLIST = new Set([
   "src/lib/security/guardedFetch.ts",
   "src/lib/security/ssrf.ts",
   "src/lib/security/body.ts",
+  "src/app/api/_jobs/crawl/route.ts",
+  "src/app/api/_jobs/tick/route.ts",
+  "src/lib/crawl/triggerCrawl.ts",
 ]);
 
 /** Patterns that indicate a raw external-fetch call. Comment-only lines are skipped. */
