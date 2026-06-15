@@ -107,6 +107,13 @@ export interface DocRecord {
    * matches rank above raw-RDF URI/predicate hits.
    */
   label: string | null;
+  /**
+   * Opaque, deterministic slug for the served entry document /p/{slug}
+   * (= base32(sha256(webid))[0..24]; DESIGN.md §2.1.c).  Maintained alongside
+   * `webid` so the reverse lookup slug → doc is a single indexed read.  Null until
+   * the doc has a webid.
+   */
+  slug: string | null;
 }
 
 /**
@@ -165,6 +172,25 @@ export interface ReadStore {
    * Returns null when the URL is unknown OR when state = 'tombstone' (hidden from reads).
    */
   get(docUrl: string): Promise<DocRecord | null>;
+
+  /**
+   * Fetch the indexed entry by its opaque slug (the /p/{slug} reverse lookup).
+   *
+   * Returns:
+   *  - the DocRecord when a non-tombstoned row with that slug exists (served as 200);
+   *  - `"tombstoned"` when the slug maps to a tombstoned row (served as 410 + no-store);
+   *  - null when the slug is unknown (served as 404).
+   *
+   * The three-way result lets the entry route distinguish 404 (never indexed / erased
+   * without a tombstone) from 410 (explicitly tombstoned — DESIGN.md §4.1 H1).
+   */
+  getEntryBySlug(slug: string): Promise<DocRecord | "tombstoned" | null>;
+
+  /**
+   * Fetch the indexed entry by canonical WebID (the /lookup?webid= forward lookup).
+   * Returns the DocRecord (non-tombstoned), or null when the WebID is not indexed.
+   */
+  getEntryByWebid(webid: string): Promise<DocRecord | null>;
 
   /**
    * Returns true when the URL is present AND state != 'tombstone'.

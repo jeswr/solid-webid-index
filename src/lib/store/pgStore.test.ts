@@ -9,6 +9,7 @@
 import { PGlite } from "@electric-sql/pglite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { slugForWebId } from "../url/slug.js";
 import {
   PgStore,
   createPgliteExecutor,
@@ -57,6 +58,7 @@ function makeDoc(
     noindex: overrides.noindex ?? false,
     rawRdf: overrides.rawRdf ?? null,
     label: overrides.label ?? null,
+    slug: overrides.slug ?? null,
   };
 }
 
@@ -1212,5 +1214,66 @@ describe("PgStore — PolitenessStore", () => {
     s = await store.getHostState("alice.example");
     expect(s.nextAllowedAt).toBe(9000);
     expect(s.consecutiveErrors).toBe(0);
+  });
+});
+
+describe("PgStore — entry lookups (slug / webid; SW-CONFORMANCE)", () => {
+  const WEBID = "https://alice.example/card#me";
+  const DOC_URL = "https://alice.example/card";
+  const EXPECTED_SLUG = slugForWebId(WEBID);
+
+  it("enqueue() with a webid populates the slug column (slug → doc lookup works)", async () => {
+    const { store } = await makeTestStore();
+    await store.enqueue(DOC_URL, { webid: WEBID, source: "seed" });
+    const bySlug = await store.getEntryBySlug(EXPECTED_SLUG);
+    expect(bySlug).not.toBeNull();
+    expect(bySlug).not.toBe("tombstoned");
+    if (bySlug && bySlug !== "tombstoned") {
+      expect(bySlug.webid).toBe(WEBID);
+      expect(bySlug.slug).toBe(EXPECTED_SLUG);
+    }
+  });
+
+  it("markDone() sets the slug when the webid is first learned", async () => {
+    const { store } = await makeTestStore();
+    // Enqueue without a webid (slug null), then learn it on markDone.
+    await store.enqueue(DOC_URL, { source: "seed" });
+    const claimed = await store.claim("test", 1);
+    await store.markDone(
+      DOC_URL,
+      { state: "done", webid: WEBID, isSolid: true, rawRdf: "x" },
+      claimed[0].claimToken
+    );
+    const bySlug = await store.getEntryBySlug(EXPECTED_SLUG);
+    expect(bySlug).not.toBeNull();
+  });
+
+  it("getEntryByWebid() resolves the canonical webid → doc", async () => {
+    const { store } = await makeTestStore();
+    await store.enqueue(DOC_URL, { webid: WEBID, source: "seed" });
+    const byWebid = await store.getEntryByWebid(WEBID);
+    expect(byWebid?.docUrl).toBe(DOC_URL);
+  });
+
+  it("getEntryBySlug() returns null for an unknown slug", async () => {
+    const { store } = await makeTestStore();
+    expect(
+      await store.getEntryBySlug(slugForWebId("https://nobody.example/x#me"))
+    ).toBeNull();
+  });
+
+  it("getEntryBySlug() returns 'tombstoned' for a tombstoned row (410 vs 404)", async () => {
+    const { store } = await makeTestStore();
+    await store.put(
+      makeDoc({
+        docUrl: DOC_URL,
+        webid: WEBID,
+        state: "tombstone",
+        slug: EXPECTED_SLUG,
+      })
+    );
+    expect(await store.getEntryBySlug(EXPECTED_SLUG)).toBe("tombstoned");
+    // getEntryByWebid hides tombstones (returns null).
+    expect(await store.getEntryByWebid(WEBID)).toBeNull();
   });
 });

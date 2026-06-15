@@ -18,6 +18,7 @@ import { join } from "node:path";
 
 import { neon } from "@neondatabase/serverless";
 
+import { slugForWebId } from "../url/slug";
 import type {
   CrawlCoordinator,
   CrawlResult,
@@ -164,6 +165,7 @@ interface DocRow {
   noindex: boolean;
   raw_rdf: string | null;
   label: string | null;
+  slug: string | null;
 }
 
 function rowToRecord(r: DocRow): DocRecord {
@@ -193,6 +195,7 @@ function rowToRecord(r: DocRow): DocRecord {
     noindex: Boolean(r.noindex),
     rawRdf: r.raw_rdf,
     label: r.label ?? null,
+    slug: r.slug ?? null,
   };
 }
 
@@ -255,6 +258,27 @@ export class PgStore
     return rows[0] ? rowToRecord(rows[0]) : null;
   }
 
+  async getEntryBySlug(slug: string): Promise<DocRecord | "tombstoned" | null> {
+    // Include tombstoned rows so we can distinguish 410 (tombstoned) from 404
+    // (unknown slug) — the entry route serves a different status for each.
+    const rows = await this.db.query<DocRow>(
+      "SELECT * FROM doc WHERE slug = $1 LIMIT 1",
+      [slug]
+    );
+    const row = rows[0];
+    if (!row) return null;
+    if (row.state === "tombstone") return "tombstoned";
+    return rowToRecord(row);
+  }
+
+  async getEntryByWebid(webid: string): Promise<DocRecord | null> {
+    const rows = await this.db.query<DocRow>(
+      `SELECT * FROM doc WHERE webid = $1 AND state != 'tombstone' LIMIT 1`,
+      [webid]
+    );
+    return rows[0] ? rowToRecord(rows[0]) : null;
+  }
+
   async exists(docUrl: string): Promise<boolean> {
     const rows = await this.db.query<{ exists: boolean }>(
       `SELECT EXISTS(
@@ -310,17 +334,22 @@ export class PgStore
   }
 
   async put(record: DocRecord): Promise<void> {
+    // Slug is derived from the canonical webid (single source of truth). An
+    // explicit record.slug is honoured only as a fallback when no webid is set.
+    const slug = record.webid
+      ? slugForWebId(record.webid)
+      : (record.slug ?? null);
     await this.db.query(
       `INSERT INTO doc (
          doc_url, host, webid, state, depth, root_seed, suggest_budget,
          source, discovered_from, claim_token, claimed_at, attempts,
          etag, last_modified, content_hash, last_crawled, next_eligible_at,
-         enqueued_at, http_status, is_solid, fail_class, error, noindex, raw_rdf, label
+         enqueued_at, http_status, is_solid, fail_class, error, noindex, raw_rdf, label, slug
        ) VALUES (
          $1, $2, $3, $4, $5, $6, $7,
          $8, $9, $10, $11, $12,
          $13, $14, $15, $16, $17,
-         $18, $19, $20, $21, $22, $23, $24, $25
+         $18, $19, $20, $21, $22, $23, $24, $25, $26
        )
        ON CONFLICT (doc_url) DO UPDATE SET
          host             = EXCLUDED.host,
@@ -346,7 +375,8 @@ export class PgStore
          error            = EXCLUDED.error,
          noindex          = EXCLUDED.noindex,
          raw_rdf          = EXCLUDED.raw_rdf,
-         label            = EXCLUDED.label`,
+         label            = EXCLUDED.label,
+         slug             = EXCLUDED.slug`,
       [
         record.docUrl,
         record.host,
@@ -373,6 +403,7 @@ export class PgStore
         record.noindex,
         record.rawRdf,
         record.label ?? null,
+        slug,
       ]
     );
   }
@@ -545,16 +576,18 @@ export class PgStore
       );
     }
 
+    const webid = opts?.webid ?? null;
+    const slug = webid ? slugForWebId(webid) : null;
     await this.db.query(
       `INSERT INTO doc (
          doc_url, host, webid, state, depth, root_seed, suggest_budget,
-         source, discovered_from, next_eligible_at, enqueued_at
-       ) VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9, $10)
+         source, discovered_from, next_eligible_at, enqueued_at, slug
+       ) VALUES ($1, $2, $3, 'pending', $4, $5, $6, $7, $8, $9, $10, $11)
        ON CONFLICT (doc_url) DO NOTHING`,
       [
         docUrl,
         host,
-        opts?.webid ?? null,
+        webid,
         opts?.depth ?? 0,
         rootSeed,
         suggestBudget,
@@ -562,6 +595,7 @@ export class PgStore
         opts?.discoveredFrom ?? null,
         opts?.nextEligibleAt ?? 0,
         Date.now(),
+        slug,
       ]
     );
   }
@@ -686,6 +720,10 @@ export class PgStore
     // When no claimToken is provided (e.g. tests that call enqueue→markDone directly
     // without going through claim()), fall back to the traditional doc_url-only
     // predicate, and treat 0 rows as a caller error (unknown URL → throw).
+    // Derive the slug from the webid being written (if any). COALESCE keeps the
+    // existing slug when no webid is supplied — the slug is set the first time the
+    // webid is known and never silently cleared on a validator-only re-crawl.
+    const slug = result.webid ? slugForWebId(result.webid) : null;
     if (claimToken != null) {
       await this.db.query<{ doc_url: string }>(
         `UPDATE doc SET
@@ -697,6 +735,7 @@ export class PgStore
            raw_rdf          = COALESCE($7, raw_rdf),
            is_solid         = COALESCE($8, is_solid),
            webid            = COALESCE($9, webid),
+           slug             = COALESCE($15, slug),
            fail_class       = $10,
            error            = $11,
            next_eligible_at = $12,
@@ -721,6 +760,7 @@ export class PgStore
           result.nextEligibleAt ?? Date.now() + 14 * 24 * 60 * 60 * 1000,
           Date.now(),
           claimToken,
+          slug,
         ]
       );
       // 0 rows updated = stale completion (token mismatch — row reclaimed by another
@@ -740,6 +780,7 @@ export class PgStore
          raw_rdf          = COALESCE($7, raw_rdf),
          is_solid         = COALESCE($8, is_solid),
          webid            = COALESCE($9, webid),
+         slug             = COALESCE($14, slug),
          fail_class       = $10,
          error            = $11,
          next_eligible_at = $12,
@@ -762,6 +803,7 @@ export class PgStore
         result.error ?? null,
         result.nextEligibleAt ?? Date.now() + 14 * 24 * 60 * 60 * 1000,
         Date.now(),
+        slug,
       ]
     );
 
