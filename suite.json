@@ -1,4 +1,5 @@
 {
+  "$schema": "https://raw.githubusercontent.com/jeswr/full-solid-ecosystem/main/tracking/schema/suite.schema.json",
   "id": "solid-webid-index",
   "kind": "service",
   "name": "Solid WebID Index",
