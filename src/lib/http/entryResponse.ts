@@ -25,7 +25,7 @@ import { buildRdfResponse } from "@/lib/http/conneg";
 import { type EntryProjection, buildEntryQuads } from "@/lib/rdf/entry";
 import { extractWebIdProfile, parseProfile } from "@/lib/rdf/profile";
 import { IDX_ENTRY, NS_DOC_IRI } from "@/lib/rdf/vocab";
-import type { ReadStore } from "@/lib/store/ports";
+import type { OptoutStore, ReadStore } from "@/lib/store/ports";
 import { isValidSlug, slugForWebId } from "@/lib/url/slug";
 
 const LDP_RESOURCE = "http://www.w3.org/ns/ldp#Resource";
@@ -65,7 +65,8 @@ function commonHeaders(extra?: Record<string, string>): Record<string, string> {
  * @param isHead   When true, a 200/304 body is omitted (HEAD).
  */
 export async function buildEntryResponse(opts: {
-  store: Pick<ReadStore, "getEntryBySlug">;
+  store: Pick<ReadStore, "getEntryBySlug"> &
+    Pick<OptoutStore, "tombstonedWebids">;
   slug: string;
   request: Request;
   isHead?: boolean;
@@ -148,6 +149,19 @@ export async function buildEntryResponse(opts: {
     }
   } else if (result.label) {
     projection.name = result.label;
+  }
+
+  // Drop foaf:knows edges TO a tombstoned WebID from served output (DESIGN.md §4.8 H1): an erased
+  // person must not be reachable even via an inbound knows edge on someone else's entry. One batched
+  // tombstone lookup over this entry's knows targets.
+  if (projection.knows.length > 0) {
+    const tombstoned = await store.tombstonedWebids(projection.knows);
+    if (tombstoned.size > 0) {
+      projection = {
+        ...projection,
+        knows: projection.knows.filter((k) => !tombstoned.has(k)),
+      };
+    }
   }
 
   const quads = buildEntryQuads({

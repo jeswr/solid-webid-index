@@ -1086,6 +1086,7 @@ describe("roborev fix 2 — search() non-FTS errors are not swallowed", () => {
     const mockExecutor = {
       query: vi.fn().mockRejectedValue(connectionError),
       exec: vi.fn().mockResolvedValue(undefined),
+      transaction: vi.fn(),
     };
 
     const store = new PgStore(mockExecutor);
@@ -1116,6 +1117,7 @@ describe("roborev fix 2 — search() non-FTS errors are not swallowed", () => {
         return Promise.resolve([]);
       }),
       exec: vi.fn().mockResolvedValue(undefined),
+      transaction: vi.fn(),
     };
 
     const store = new PgStore(mockExecutor);

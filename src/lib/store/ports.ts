@@ -638,6 +638,110 @@ export interface DatasetStats {
   propertyPartitions: PropertyPartition[];
 }
 
+// ─── OptoutStore — opt-out / erasure + permanent tombstone (DESIGN.md §4.8) ──────
+
+/** A tombstone reason (matches the schema CHECK constraint — keep in sync). */
+export type TombstoneReason = "opt-out" | "erasure" | "abuse" | "noindex";
+
+/** A challenge-response opt-out nonce (Path B). */
+export interface OptoutNonce {
+  /** The canonical WebID this challenge is for (with #fragment). */
+  webid: string;
+  /** The canonical doc URL fetched to verify the published token (fragment-stripped). */
+  docUrl: string;
+  /** The one-time challenge token (the value the user publishes as idx:optOutToken). */
+  nonce: string;
+  /** epoch ms the nonce was issued. */
+  issuedAt: number;
+  /** epoch ms the nonce expires (issuedAt + TTL). */
+  expiresAt: number;
+  /** epoch ms the nonce was consumed (null = unused). */
+  usedAt: number | null;
+}
+
+/**
+ * Inputs to {@link OptoutStore.eraseWebId} — identifies the subject to erase.
+ *
+ * Both the canonical WebID (with #fragment) AND the canonical doc URL (fragment-stripped) are
+ * supplied so erasure can purge by EITHER key and the tombstone can be checked against both (a
+ * variant key — `…/card` vs `…/card#me` — cannot dodge the tombstone, DESIGN.md §2.2 L5).
+ */
+export interface EraseInput {
+  /** The canonical WebID to erase (with #fragment). */
+  webid: string;
+  /** The canonical doc URL (fragment-stripped). */
+  docUrl: string;
+  /** Why the WebID is being erased. */
+  reason: TombstoneReason;
+  /** How control was proven ('token' for Path A, 'challenge' for Path B, or a system reason). */
+  proof?: string | null;
+}
+
+/**
+ * OptoutStore — the opt-out / erasure surface (DESIGN.md §4.8).
+ *
+ * Owns the challenge-response nonce lifecycle (Path B), the permanent tombstone, and the ATOMIC
+ * complete-erasure transaction over every served surface.  All three tombstone gates (enqueue,
+ * fetch/crawl, projection) consult {@link isTombstoned}.
+ */
+export interface OptoutStore {
+  /**
+   * Issue (or REPLACE) a single-use challenge nonce for a WebID (Path B step 1).  Replaces any
+   * prior nonce for the same WebID so only the most recent challenge is live (ON CONFLICT DO UPDATE).
+   * Returns the issued nonce record.
+   */
+  issueOptoutNonce(opts: {
+    webid: string;
+    docUrl: string;
+    nonce: string;
+    nowMs: number;
+    ttlMs: number;
+  }): Promise<OptoutNonce>;
+
+  /**
+   * Read the live (unused, unexpired) nonce for a WebID, or null when none is live.  `nowMs` filters
+   * out expired nonces; a used nonce is never returned (single-use).
+   */
+  getLiveOptoutNonce(webid: string, nowMs: number): Promise<OptoutNonce | null>;
+
+  /**
+   * Atomically CONSUME the nonce for a WebID (single-use): stamp `used_at` iff the nonce is present,
+   * unused, AND unexpired.  Returns true when the nonce was consumed by THIS call, false otherwise
+   * (no nonce / already used / expired) — so a concurrent double-confirm grants at most one erasure.
+   */
+  consumeOptoutNonce(webid: string, nowMs: number): Promise<boolean>;
+
+  /**
+   * Whether a WebID (or its doc URL) is permanently tombstoned.  Checked at all three gates
+   * (DESIGN.md §4.8 H1).  Matches on EITHER the WebID key OR the doc URL key so a variant cannot
+   * dodge the tombstone (DESIGN.md §2.2 L5).
+   */
+  isTombstoned(opts: { webid?: string; docUrl?: string }): Promise<boolean>;
+
+  /**
+   * Of the given WebIDs, return the set that is tombstoned.  Used by the entry document to DROP
+   * `foaf:knows` edges TO a tombstoned WebID from served output (DESIGN.md §4.8 H1) — one batched
+   * query instead of N round-trips.  An empty input returns an empty set.
+   */
+  tombstonedWebids(webids: string[]): Promise<Set<string>>;
+
+  /**
+   * COMPLETE, ATOMIC erasure of a WebID across EVERY served surface (DESIGN.md §4.8 H1) in ONE real
+   * DB transaction (so a mid-transaction crash leaves the DB consistent — nothing half-erased):
+   *   - delete the WebID's `triple` rows + decrement the `stats` counters (entities/classes/triples/
+   *     predicates) by its exact contribution;
+   *   - delete the `doc` row(s) for the WebID + doc URL (incl. `raw_rdf`), removing it from search/FTS
+   *     (the FTS vectors are generated columns on `doc`, so the row delete removes them too);
+   *   - REDACT any `inbox` notification body that referenced the WebID/doc URL (the candidate object
+   *     rows point at it) so the suggestion that named the person no longer echoes their IRI;
+   *   - insert a permanent `tombstone` (canonical WebID key + doc URL) so the three gates refuse it
+   *     forever.
+   * Idempotent: erasing an already-erased WebID re-asserts the tombstone and is a safe no-op for the
+   * already-deleted rows.
+   */
+  eraseWebId(input: EraseInput): Promise<void>;
+}
+
 /**
  * StatsStore — the O(1) read seam for dataset statistics + the incremental
  * maintenance hook (DESIGN.md §2.1.j / §4.2).

@@ -381,10 +381,54 @@ function parseUrl(raw: string): URL {
   }
 }
 
-/** True when the response's `X-Robots-Tag` header value contains `noindex` (case-insensitive). */
+/**
+ * The directives we recognise as NOT requesting de-indexing in an `X-Robots-Tag` value. If a present
+ * header parses entirely into known-safe directives we treat it as "may index"; anything we do NOT
+ * recognise (or `noindex`/`none`) defaults to DENY (treat as noindex) so an unparseable / novel
+ * directive can never silently re-admit an opted-out document (DESIGN.md §4.8 H2 — default-deny).
+ */
+const ROBOTS_SAFE_DIRECTIVES = new Set([
+  "index",
+  "follow",
+  "all",
+  "nofollow",
+  "noarchive",
+  "nosnippet",
+  "noimageindex",
+  "notranslate",
+  "indexifembedded",
+]);
+
+/**
+ * Returns true when the response's `X-Robots-Tag` requests that the document NOT be indexed —
+ * including the DEFAULT-DENY case where the header is present but does not parse cleanly into
+ * known-safe directives (DESIGN.md §4.8 H2). An ABSENT header → false (no opt-out signal).
+ *
+ * Parsing (lenient, per Google's X-Robots-Tag grammar): the value is a comma-separated list of
+ * directives; a directive may be bot-scoped (`botname: directive`) — we take the part after the last
+ * colon as the directive token. `noindex` / `none` → deny. A token we do not recognise as safe →
+ * deny (the unparseable default-deny). Only when EVERY token is a recognised safe directive do we
+ * allow indexing.
+ */
 function responseHasNoindex(res: Response): boolean {
   const tag = res.headers.get("x-robots-tag");
-  return tag?.toLowerCase().includes("noindex") ?? false;
+  if (tag == null) return false; // no header → no opt-out signal
+  const value = tag.trim().toLowerCase();
+  if (value === "") return true; // present-but-empty is not parseable → default-deny
+  const directives = value
+    .split(",")
+    .map((d) => {
+      // Strip an optional `botname:` prefix — take the token after the LAST colon.
+      const colon = d.lastIndexOf(":");
+      return (colon === -1 ? d : d.slice(colon + 1)).trim();
+    })
+    .filter((d) => d.length > 0);
+  if (directives.length === 0) return true; // only separators / colons → default-deny
+  for (const d of directives) {
+    if (d === "noindex" || d === "none") return true; // explicit de-index
+    if (!ROBOTS_SAFE_DIRECTIVES.has(d)) return true; // unrecognised → default-deny
+  }
+  return false; // every directive recognised as safe → may index
 }
 
 function reason(error: unknown): string {

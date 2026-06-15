@@ -250,6 +250,40 @@ export const RESUGGEST_COOLDOWN_MS = envInt(
   7 * 24 * 60 * 60 * 1000
 );
 
+// ─── Opt-out / erasure (§4.8) ────────────────────────────────────────────────
+
+/**
+ * TTL for a challenge-response opt-out nonce (Path B), in ms. Default 24h
+ * (DESIGN.md §4.8). A nonce older than this is expired and cannot confirm an erasure.
+ */
+export const OPTOUT_NONCE_TTL_MS = envInt(
+  "OPTOUT_NONCE_TTL_MS",
+  24 * 60 * 60 * 1000
+);
+
+/** Max opt-out requests (issue/confirm) per IP per hour — abuse guard on the erasure surface. */
+export const OPTOUT_RATE_LIMIT_PER_IP_PER_HOUR = envInt(
+  "OPTOUT_RATE_PER_IP_PER_HOUR",
+  10
+);
+
+/**
+ * Trusted Solid-OIDC token issuers for opt-out Path A. Comma-separated; empty = accept
+ * any issuer that OIDC-discovers cleanly (issuer-agnostic — DESIGN.md §4.8 Path A). The
+ * verifier is asymmetric-only and DPoP-bound regardless; this only narrows WHICH issuers
+ * may assert a `webid`. When set, an `iss` outside the list is rejected before discovery.
+ */
+export const OPTOUT_TRUSTED_ISSUERS = envStr("OPTOUT_TRUSTED_ISSUERS", "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+/** Allowed DPoP-proof / access-token clock skew, in seconds (Path A). */
+export const OPTOUT_CLOCK_TOLERANCE_SEC = envInt(
+  "OPTOUT_CLOCK_TOLERANCE_SEC",
+  5
+);
+
 // ─── QStash / scheduling (§3.5) ──────────────────────────────────────────────
 
 /** Daily QStash message budget (free tier = 1000/day). */

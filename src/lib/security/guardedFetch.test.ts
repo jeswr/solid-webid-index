@@ -632,6 +632,70 @@ describe("guardedFetch — honourNoindexHeader (pre-parse noindex short-circuit)
     expect(r.noindex).toBe(false);
     expect(r.text).toContain("x:a");
   });
+
+  // ── DEFAULT-DENY when an X-Robots-Tag is present but UNPARSEABLE (DESIGN.md §4.8 H2) ──
+  it("DEFAULT-DENIES an X-Robots-Tag carrying an unrecognised directive (treated as noindex)", async () => {
+    routes.set("/robots-unknown", (_req, res) => {
+      res.writeHead(200, {
+        "content-type": "text/turtle",
+        // A directive we don't recognise as safe → must default-deny (never silently re-admit).
+        "x-robots-tag": "max-snippet:-1, frobnicate",
+      });
+      res.end("@prefix x: <x:> . x:a x:b x:c .");
+    });
+    const r = await guardedFetch(`${base}/robots-unknown`, {
+      allowLoopback: true,
+      honourNoindexHeader: true,
+    });
+    expect(r.noindex).toBe(true);
+    expect(r.text).toBe("");
+  });
+
+  it("DEFAULT-DENIES an empty / separator-only X-Robots-Tag", async () => {
+    routes.set("/robots-empty", (_req, res) => {
+      res.writeHead(200, {
+        "content-type": "text/turtle",
+        "x-robots-tag": " , ",
+      });
+      res.end("@prefix x: <x:> . x:a x:b x:c .");
+    });
+    const r = await guardedFetch(`${base}/robots-empty`, {
+      allowLoopback: true,
+      honourNoindexHeader: true,
+    });
+    expect(r.noindex).toBe(true);
+  });
+
+  it("does NOT deny when every X-Robots-Tag directive is recognised as safe (e.g. 'all', 'follow')", async () => {
+    routes.set("/robots-safe", (_req, res) => {
+      res.writeHead(200, {
+        "content-type": "text/turtle",
+        "x-robots-tag": "all, follow",
+      });
+      res.end("@prefix x: <x:> . x:a x:b x:c .");
+    });
+    const r = await guardedFetch(`${base}/robots-safe`, {
+      allowLoopback: true,
+      honourNoindexHeader: true,
+    });
+    expect(r.noindex).toBe(false);
+    expect(r.text).toContain("x:a");
+  });
+
+  it("honours an explicit 'none' directive as noindex", async () => {
+    routes.set("/robots-none", (_req, res) => {
+      res.writeHead(200, {
+        "content-type": "text/turtle",
+        "x-robots-tag": "none",
+      });
+      res.end("@prefix x: <x:> . x:a x:b x:c .");
+    });
+    const r = await guardedFetch(`${base}/robots-none`, {
+      allowLoopback: true,
+      honourNoindexHeader: true,
+    });
+    expect(r.noindex).toBe(true);
+  });
 });
 
 describe("guardedFetch — body cap", () => {

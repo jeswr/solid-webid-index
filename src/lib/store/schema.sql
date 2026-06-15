@@ -257,3 +257,45 @@ CREATE TABLE IF NOT EXISTS stats (
   k   TEXT     PRIMARY KEY,                    -- counter key: 'triples', 'entities', 'p:<iri>', 'c:<iri>'
   v   BIGINT   NOT NULL DEFAULT 0              -- counter value (>= 0)
 );
+
+-- ─── optout_nonce — challenge-response opt-out (Path B) one-time nonces (DESIGN.md §4.8) ──────
+--
+-- The challenge-response opt-out (Path B): POST {webid} → 202 + a one-time `idx:optOutToken` nonce
+-- the user publishes in their upstream profile; a follow-up confirm POST fetches the profile via
+-- guardedFetch and, if the published token matches, erases.  Each nonce is:
+--   * keyed on the CANONICAL WebID (so a variant key cannot dodge it — DESIGN.md §2.2 L5);
+--   * single-use — consumed atomically on a successful confirm (`used_at` stamped; a second confirm
+--     with the same nonce finds it already used and is refused);
+--   * time-boxed — `expires_at` is `issued_at + OPTOUT_NONCE_TTL_MS`; an expired nonce never confirms.
+-- Re-issuing for the same WebID REPLACES the prior nonce (ON CONFLICT DO UPDATE) so only the most
+-- recent challenge is live.  This table is independent of `doc`/`tombstone` — it holds only the
+-- transient proof-of-control challenge, not any indexed PII.
+
+CREATE TABLE IF NOT EXISTS optout_nonce (
+  webid       TEXT     PRIMARY KEY,            -- canonical WebID the challenge is for (with #fragment)
+  doc_url     TEXT     NOT NULL,               -- canonical doc URL fetched to verify the published token
+  nonce       TEXT     NOT NULL,               -- the one-time challenge token (idx:optOutToken value)
+  issued_at   BIGINT   NOT NULL,               -- epoch ms the nonce was issued
+  expires_at  BIGINT   NOT NULL,               -- epoch ms the nonce expires (issued_at + TTL)
+  used_at     BIGINT                           -- epoch ms the nonce was consumed (NULL = unused)
+);
+
+-- ─── tombstone — permanent opt-out / erasure record (DESIGN.md §2.1.h / §4.8 H1) ──────────────
+--
+-- A PERMANENT record keyed on the canonical WebID.  Erasure inserts a row here inside the SAME
+-- atomic transaction that deletes the WebID's served data, so the three tombstone gates (enqueue,
+-- fetch/crawl, projection) can refuse the WebID forever — across ALL discovery paths — independent
+-- of whether a `doc` row survives.  `doc_url` lets the enqueue gate refuse by the fragment-stripped
+-- document key too (so a variant key cannot resurrect an opted-out person — DESIGN.md §2.2 L5).
+
+CREATE TABLE IF NOT EXISTS tombstone (
+  webid       TEXT     PRIMARY KEY,            -- canonical WebID (with #fragment) — permanently blocked
+  doc_url     TEXT,                            -- canonical doc URL (fragment-stripped) — variant-key gate
+  reason      TEXT     NOT NULL                -- 'opt-out' | 'erasure' | 'abuse' | 'noindex'
+                       CHECK (reason IN ('opt-out', 'erasure', 'abuse', 'noindex')),
+  created_at  BIGINT   NOT NULL,               -- epoch ms the tombstone was created
+  proof       TEXT                             -- how control was proven ('token' | 'challenge' | system reason)
+);
+
+-- Doc-URL gate access path (enqueue refuses a fragment-variant of a tombstoned doc).
+CREATE INDEX IF NOT EXISTS idx_tombstone_doc ON tombstone (doc_url) WHERE doc_url IS NOT NULL;
