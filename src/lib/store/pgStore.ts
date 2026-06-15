@@ -917,126 +917,137 @@ export class PgStore
   }): Promise<void> {
     const { webid, docUrl, triples } = opts;
 
-    // ── Projection tombstone gate (gate 3 of 3 — DESIGN.md §4.8 H1) ────────────
-    // A tombstoned WebID must NEVER be (re)projected into the served `triple` table — even if a
-    // crawler somehow reaches its raw_rdf, the projection write is the enforcement point that keeps
-    // an erased person out of TPF / search / dump. Treat a non-empty projection of a tombstoned WebID
-    // as an EMPTY projection (delete-by-webid), so any residue is cleared rather than re-served. (An
-    // empty triple list — the documented delete-by-webid used on 410/noindex — is allowed through to
-    // the clear path below regardless.)
-    if (triples.length > 0) {
-      const tombstoned = await this.isTombstoned({ webid, docUrl });
-      if (tombstoned) {
-        // Clear the projection AND redact the doc row to a DURABLE tombstone (raw_rdf + generated FTS
-        // blanked, WebID redacted, slug retained) in ONE transaction so a tombstoned WebID leaves NO
-        // servable residue — neither in TPF (triples) NOR on /p/{slug} / search (the doc row). Before
-        // this, the projection was skipped but a `done` doc row with raw_rdf/webid could still serve
-        // erased PII (DESIGN.md §4.8 H1). The doc row is REDACTED, not deleted, so the durable PK gate
-        // against enqueue resurrection (roborev HIGH 2) stays in place. Both keys are handled
-        // (variant-key cleanup, DESIGN.md §2.2 L5).
-        await this.db.transaction(async (tx) => {
-          await tx.query("SELECT pg_advisory_xact_lock(hashtext($1))", [
-            docUrl,
-          ]);
+    // Run the WHOLE REPLACE (tombstone gate → stale-doc clear → DELETE-by-webid →
+    // stats subtract → bulk INSERT → stats re-add) inside ONE transaction that first
+    // takes a doc-scoped advisory lock — defence-in-depth (pss-0dks). The multi-statement
+    // DELETE+INSERT REPLACE is not otherwise serialised against a concurrent same-WebID /
+    // same-doc upsert; in prod the crawler lease fence already serialises projection, but
+    // the lock makes interleaving of two same-doc REPLACEs impossible regardless (no
+    // duplicate triples / skewed stats). Keyed on docUrl via pg_advisory_xact_lock(hashtext)
+    // to match the lock already held by enqueue / markDone / eraseWebId / tombstone — so an
+    // upsert and a concurrent erase of the same doc contend for the SAME lock and cannot
+    // interleave. Lock is xact-scoped: released automatically on COMMIT/ROLLBACK.
+    await this.db.transaction(async (tx) => {
+      await tx.query("SELECT pg_advisory_xact_lock(hashtext($1))", [docUrl]);
+
+      // ── Projection tombstone gate (gate 3 of 3 — DESIGN.md §4.8 H1) ──────────
+      // A tombstoned WebID must NEVER be (re)projected into the served `triple` table — even if a
+      // crawler somehow reaches its raw_rdf, the projection write is the enforcement point that keeps
+      // an erased person out of TPF / search / dump. Treat a non-empty projection of a tombstoned WebID
+      // as an EMPTY projection (delete-by-webid), so any residue is cleared rather than re-served. (An
+      // empty triple list — the documented delete-by-webid used on 410/noindex — is allowed through to
+      // the clear path below regardless.) The check now runs UNDER the advisory lock on the tx executor,
+      // so a tombstone committed by a concurrent eraseWebId is observed (READ COMMITTED) and the redact
+      // path commits atomically against it.
+      if (triples.length > 0) {
+        const tombstoned = await this.isTombstonedOn({ webid, docUrl }, tx);
+        if (tombstoned) {
+          // Clear the projection AND redact the doc row to a DURABLE tombstone (raw_rdf + generated FTS
+          // blanked, WebID redacted, slug retained) so a tombstoned WebID leaves NO servable residue —
+          // neither in TPF (triples) NOR on /p/{slug} / search (the doc row). Before this, the projection
+          // was skipped but a `done` doc row with raw_rdf/webid could still serve erased PII
+          // (DESIGN.md §4.8 H1). The doc row is REDACTED, not deleted, so the durable PK gate against
+          // enqueue resurrection (roborev HIGH 2) stays in place. Both keys are handled (variant-key
+          // cleanup, DESIGN.md §2.2 L5).
           await this.clearWebidProjection(webid, tx);
           await this.redactDocToTombstone({ webid, docUrl }, tx);
-        });
-        return;
+          return;
+        }
       }
-    }
 
-    // ── Clear any STALE prior projection of this DOCUMENT under a DIFFERENT webid
-    // (roborev): a doc_url that first resolved to W1 and later to W2 would otherwise
-    // leave W1's triples (keyed by doc_url) served + counted forever.  For each such
-    // stale webid, run the empty-projection clear (delete-by-webid + subtract its
-    // stats) so both the triple table AND the stats counters stay exact.  Skipped in
-    // the common case (no doc_url/webid change) by the WHERE webid != $2 filter.
-    const staleWebids = await this.db.query<{ webid: string }>(
-      "SELECT DISTINCT webid FROM triple WHERE doc_url = $1 AND webid IS NOT NULL AND webid != $2",
-      [docUrl, webid]
-    );
-    for (const { webid: stale } of staleWebids) {
-      await this.clearWebidProjection(stale);
-    }
-
-    // Decrement the stats counters by the OLD triple count for this webid before
-    // replacing, then re-add the new count — keeps 'triples'/'p:<iri>' consistent
-    // across re-projections.  (TPF bead owns these counters; the stats bead pss-0zp
-    // owns 'entities'/'c:<iri>', maintained below from the same old→new diff.)
-    const oldByPred = await this.db.query<{ p: string; n: number | string }>(
-      "SELECT p, COUNT(*) AS n FROM triple WHERE webid = $1 GROUP BY p",
-      [webid]
-    );
-
-    // OLD entity + class-partition contribution for this webid — read its existing
-    // rdf:type IRI triples BEFORE the DELETE so the stats-bead delta (entities +
-    // c:<iri>) is computed against the previous served state (DESIGN.md §2.1.j).
-    const oldTypeRows = await this.db.query<{ s: string; o: string }>(
-      "SELECT s, o FROM triple WHERE webid = $1 AND p = $2 AND o_is_iri = TRUE",
-      [webid, RDF_TYPE_IRI]
-    );
-    // isEntity reflects whether the webid had ANY served triples (not just typed
-    // ones), so a typeless-but-present webid still counts as an entity. Derive it
-    // from oldByPred (the previous total triple count); take the class breakdown
-    // from the typed rows.
-    const oldContribution = {
-      isEntity: oldByPred.length > 0 ? 1 : 0,
-      classes: classEntityContribution(
-        oldTypeRows.map((r) => ({
-          s: r.s,
-          p: RDF_TYPE_IRI,
-          o: r.o,
-          oIsIri: true,
-        }))
-      ).classes,
-    };
-
-    await this.db.query("DELETE FROM triple WHERE webid = $1", [webid]);
-
-    // Subtract the OLD per-predicate counts (TPF bead's 'triples' + 'p:<iri>'
-    // counters) in ONE batched upsert — fewer round-trips than a query per predicate.
-    const oldDelta: Array<[string, number]> = [];
-    let oldTotal = 0;
-    for (const old of oldByPred) {
-      const n = Number(old.n);
-      oldTotal += n;
-      oldDelta.push([`p:${old.p}`, -n]);
-    }
-    if (oldTotal > 0) oldDelta.push(["triples", -oldTotal]);
-    await this.adjustStatsBatch(oldDelta);
-
-    // NEW entity + class-partition contribution (this bead's owned counters).
-    const newContribution = classEntityContribution(triples as StatTriple[]);
-    await this.applyClassEntityDelta(oldContribution, newContribution);
-
-    if (triples.length > 0) {
-      // Build a single multi-row INSERT (bounded by MAX_QUADS upstream).
-      const values: string[] = [];
-      const params: unknown[] = [webid, docUrl];
-      for (const t of triples) {
-        const base = params.length;
-        params.push(t.s, t.p, t.o, t.oIsIri);
-        // s=$(base+1), p=$(base+2), o=$(base+3), o_is_iri=$(base+4); webid=$1, doc_url=$2.
-        values.push(
-          `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $1, $2)`
-        );
+      // ── Clear any STALE prior projection of this DOCUMENT under a DIFFERENT webid
+      // (roborev): a doc_url that first resolved to W1 and later to W2 would otherwise
+      // leave W1's triples (keyed by doc_url) served + counted forever.  For each such
+      // stale webid, run the empty-projection clear (delete-by-webid + subtract its
+      // stats) so both the triple table AND the stats counters stay exact.  Skipped in
+      // the common case (no doc_url/webid change) by the WHERE webid != $2 filter.
+      const staleWebids = await tx.query<{ webid: string }>(
+        "SELECT DISTINCT webid FROM triple WHERE doc_url = $1 AND webid IS NOT NULL AND webid != $2",
+        [docUrl, webid]
+      );
+      for (const { webid: stale } of staleWebids) {
+        await this.clearWebidProjection(stale, tx);
       }
-      await this.db.query(
-        `INSERT INTO triple (s, p, o, o_is_iri, webid, doc_url) VALUES ${values.join(", ")}`,
-        params
+
+      // Decrement the stats counters by the OLD triple count for this webid before
+      // replacing, then re-add the new count — keeps 'triples'/'p:<iri>' consistent
+      // across re-projections.  (TPF bead owns these counters; the stats bead pss-0zp
+      // owns 'entities'/'c:<iri>', maintained below from the same old→new diff.)
+      const oldByPred = await tx.query<{ p: string; n: number | string }>(
+        "SELECT p, COUNT(*) AS n FROM triple WHERE webid = $1 GROUP BY p",
+        [webid]
       );
 
-      // Re-add the new per-predicate counts + the total in ONE batched upsert.
-      const newByPred = new Map<string, number>();
-      for (const t of triples) {
-        newByPred.set(t.p, (newByPred.get(t.p) ?? 0) + 1);
+      // OLD entity + class-partition contribution for this webid — read its existing
+      // rdf:type IRI triples BEFORE the DELETE so the stats-bead delta (entities +
+      // c:<iri>) is computed against the previous served state (DESIGN.md §2.1.j).
+      const oldTypeRows = await tx.query<{ s: string; o: string }>(
+        "SELECT s, o FROM triple WHERE webid = $1 AND p = $2 AND o_is_iri = TRUE",
+        [webid, RDF_TYPE_IRI]
+      );
+      // isEntity reflects whether the webid had ANY served triples (not just typed
+      // ones), so a typeless-but-present webid still counts as an entity. Derive it
+      // from oldByPred (the previous total triple count); take the class breakdown
+      // from the typed rows.
+      const oldContribution = {
+        isEntity: oldByPred.length > 0 ? 1 : 0,
+        classes: classEntityContribution(
+          oldTypeRows.map((r) => ({
+            s: r.s,
+            p: RDF_TYPE_IRI,
+            o: r.o,
+            oIsIri: true,
+          }))
+        ).classes,
+      };
+
+      await tx.query("DELETE FROM triple WHERE webid = $1", [webid]);
+
+      // Subtract the OLD per-predicate counts (TPF bead's 'triples' + 'p:<iri>'
+      // counters) in ONE batched upsert — fewer round-trips than a query per predicate.
+      const oldDelta: Array<[string, number]> = [];
+      let oldTotal = 0;
+      for (const old of oldByPred) {
+        const n = Number(old.n);
+        oldTotal += n;
+        oldDelta.push([`p:${old.p}`, -n]);
       }
-      const newDelta: Array<[string, number]> = [["triples", triples.length]];
-      for (const [pred, n] of newByPred) {
-        newDelta.push([`p:${pred}`, n]);
+      if (oldTotal > 0) oldDelta.push(["triples", -oldTotal]);
+      await this.adjustStatsBatch(oldDelta, tx);
+
+      // NEW entity + class-partition contribution (this bead's owned counters).
+      const newContribution = classEntityContribution(triples as StatTriple[]);
+      await this.applyClassEntityDelta(oldContribution, newContribution, tx);
+
+      if (triples.length > 0) {
+        // Build a single multi-row INSERT (bounded by MAX_QUADS upstream).
+        const values: string[] = [];
+        const params: unknown[] = [webid, docUrl];
+        for (const t of triples) {
+          const base = params.length;
+          params.push(t.s, t.p, t.o, t.oIsIri);
+          // s=$(base+1), p=$(base+2), o=$(base+3), o_is_iri=$(base+4); webid=$1, doc_url=$2.
+          values.push(
+            `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $1, $2)`
+          );
+        }
+        await tx.query(
+          `INSERT INTO triple (s, p, o, o_is_iri, webid, doc_url) VALUES ${values.join(", ")}`,
+          params
+        );
+
+        // Re-add the new per-predicate counts + the total in ONE batched upsert.
+        const newByPred = new Map<string, number>();
+        for (const t of triples) {
+          newByPred.set(t.p, (newByPred.get(t.p) ?? 0) + 1);
+        }
+        const newDelta: Array<[string, number]> = [["triples", triples.length]];
+        for (const [pred, n] of newByPred) {
+          newDelta.push([`p:${pred}`, n]);
+        }
+        await this.adjustStatsBatch(newDelta, tx);
       }
-      await this.adjustStatsBatch(newDelta);
-    }
+    });
   }
 
   /**
