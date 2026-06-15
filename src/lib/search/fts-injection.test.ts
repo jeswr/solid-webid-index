@@ -1,0 +1,232 @@
+// AUTHORED-BY Claude Opus 4.8 (Fable unavailable) — re-review/upgrade candidate
+/**
+ * fts-injection.test.ts — FTS-injection fuzz (pss-q2h, DESIGN.md §4.4 security H4).
+ *
+ * Two layers, both offline:
+ *   1. SANITISE INVARIANTS — `sanitiseFtsQuery` over a large hostile corpus must NEVER emit a
+ *      Postgres tsquery operator or special char (`& | ! ( ) : * < > ' "`), must respect the token +
+ *      length caps, and must be idempotent (re-sanitising its own output is a fixpoint).
+ *   2. END-TO-END against pglite — the sanitised query is fed into the REAL `store.search()` (whose
+ *      websearch_to_tsquery / plainto_tsquery path is the actual injection sink). A hostile ?q= can
+ *      neither throw (syntax error) nor injection-match rows it shouldn't.
+ *
+ * pglite is in-process WASM Postgres — no network, no Neon. The sink (websearch_to_tsquery) is the
+ * SAME function Neon runs, so an injection that pglite tolerates Neon tolerates too.
+ */
+import { beforeEach, describe, expect, it } from "vitest";
+
+import { FTS_MAX_TOKENS, FTS_MAX_TOKEN_LEN } from "@/lib/config";
+import type { PgStore } from "@/lib/store/pgStore";
+import type { DocRecord } from "@/lib/store/ports";
+import { freshTestStore } from "@/lib/store/testStore";
+import { sanitiseFtsQuery } from "./sanitise";
+
+// Characters that carry meaning in a Postgres tsquery / are SQL-dangerous — none may survive sanitise.
+const TSQUERY_DANGEROUS = [
+  "&",
+  "|",
+  "!",
+  "(",
+  ")",
+  ":",
+  "*",
+  "<",
+  ">",
+  "'",
+  '"',
+  "\\",
+  ";",
+  "-",
+  "@",
+  "#",
+  "^",
+  "%",
+  "`",
+];
+
+// A hostile corpus: tsquery operators, SQL injection shapes, websearch quirks, unicode, control chars.
+const HOSTILE_QUERIES = [
+  "alice & bob",
+  "alice | bob",
+  "!alice",
+  "alice <-> bob", // tsquery phrase operator
+  "alice:* ", // prefix match operator
+  "(alice | bob) & !carol",
+  "'; DROP TABLE doc; --",
+  '" OR "1"="1',
+  "alice') OR ('x'='x",
+  "to_tsquery('english','alice')",
+  "websearch_to_tsquery hack",
+  "alice\0bob", // null byte (escaped \0 — kept ASCII so git treats the file as text)
+  "alice\nbob\tcarol", // control whitespace
+  "NEAR((alice),(bob))",
+  "^alice $bob",
+  "\\x41\\x42",
+  "%alice%",
+  "alice`whoami`",
+  "пример имя", // cyrillic
+  "名前 太郎", // cjk
+  "🤖 robot",
+  "a".repeat(500), // single huge token
+  Array.from({ length: 40 }, (_, i) => `tok${i}`).join(" "), // many tokens
+  "***",
+  ":::",
+  "&|!()",
+  "",
+  "   ",
+];
+
+// ════════════════════════════════ 1. sanitise invariants ════════════════════════════════
+
+describe("sanitiseFtsQuery — fuzz invariants over a hostile corpus", () => {
+  for (const raw of HOSTILE_QUERIES) {
+    const label = JSON.stringify(raw).slice(0, 40);
+    it(`produces a safe, capped, operator-free result for ${label}`, () => {
+      const out = sanitiseFtsQuery(raw);
+      if (out === null) {
+        // null is always safe — the route returns an empty collection.
+        return;
+      }
+      // No tsquery operator / dangerous char survives.
+      for (const ch of TSQUERY_DANGEROUS) {
+        expect(out.includes(ch), `"${ch}" leaked through for ${label}`).toBe(
+          false
+        );
+      }
+      // Only [a-z0-9 ] remain.
+      expect(out).toMatch(/^[a-z0-9 ]*$/);
+      // Token + length caps hold.
+      const tokens = out.split(" ").filter(Boolean);
+      expect(tokens.length).toBeLessThanOrEqual(FTS_MAX_TOKENS);
+      for (const t of tokens) {
+        expect(t.length).toBeLessThanOrEqual(FTS_MAX_TOKEN_LEN);
+      }
+    });
+  }
+
+  it("is IDEMPOTENT — re-sanitising the output is a fixpoint", () => {
+    for (const raw of HOSTILE_QUERIES) {
+      const once = sanitiseFtsQuery(raw);
+      if (once === null) continue;
+      const twice = sanitiseFtsQuery(once);
+      expect(twice).toBe(once);
+    }
+  });
+
+  it("never lowercases into a multi-byte hazard — non-ASCII is dropped entirely", () => {
+    // Cyrillic/CJK/emoji are not [a-z0-9], so they sanitise away (no FTS match, no crash).
+    expect(sanitiseFtsQuery("пример")).toBeNull();
+    expect(sanitiseFtsQuery("太郎")).toBeNull();
+    expect(sanitiseFtsQuery("🤖")).toBeNull();
+  });
+});
+
+// ════════════════════════════════ 2. end-to-end against pglite ════════════════════════════════
+
+let store: PgStore;
+beforeEach(async () => {
+  ({ store } = await freshTestStore());
+});
+
+function makeDoc(
+  overrides: Partial<DocRecord> & { docUrl: string }
+): DocRecord {
+  return {
+    docUrl: overrides.docUrl,
+    host: overrides.host ?? new URL(overrides.docUrl).hostname,
+    webid: overrides.webid ?? null,
+    state: overrides.state ?? "done",
+    depth: 0,
+    rootSeed: null,
+    suggestBudget: null,
+    source: "seed",
+    discoveredFrom: null,
+    claimToken: null,
+    claimedAt: null,
+    attempts: 1,
+    etag: null,
+    lastModified: null,
+    contentHash: null,
+    lastCrawled: Date.now(),
+    nextEligibleAt: 0,
+    enqueuedAt: Date.now(),
+    httpStatus: 200,
+    isSolid: true,
+    failClass: null,
+    error: null,
+    noindex: false,
+    rawRdf: overrides.rawRdf ?? null,
+    label: overrides.label ?? null,
+    slug: null,
+  };
+}
+
+describe("store.search — the sanitised query NEVER breaks or injects the tsquery sink", () => {
+  beforeEach(async () => {
+    // Seed two distinct people so an injection that matched "everything" would be detectable.
+    await store.put(
+      makeDoc({
+        docUrl: "https://alice.example/card",
+        webid: "https://alice.example/card#me",
+        label: "Alice Wonderland",
+        rawRdf:
+          '<https://alice.example/card#me> <http://xmlns.com/foaf/0.1/name> "Alice Wonderland" .',
+      })
+    );
+    await store.put(
+      makeDoc({
+        docUrl: "https://bob.example/card",
+        webid: "https://bob.example/card#me",
+        label: "Bob Builder",
+        rawRdf:
+          '<https://bob.example/card#me> <http://xmlns.com/foaf/0.1/name> "Bob Builder" .',
+      })
+    );
+  });
+
+  for (const raw of HOSTILE_QUERIES) {
+    const label = JSON.stringify(raw).slice(0, 40);
+    it(`does not throw on hostile ?q=${label}`, async () => {
+      const sanitised = sanitiseFtsQuery(raw);
+      if (sanitised === null) return; // route returns empty collection — no search() call
+      // The REAL search() path (websearch_to_tsquery) must not raise a syntax error.
+      await expect(
+        store.search({ query: sanitised, limit: 20 })
+      ).resolves.toBeTruthy();
+    });
+  }
+
+  it("an injection that tries to match ALL rows ('alice | bob') only matches the literal tokens after sanitise", async () => {
+    // Raw 'alice | bob' would, unsanitised, be an OR matching both. Sanitised it becomes the AND-ish
+    // websearch "alice bob" (both terms), matching NEITHER person (no one is both Alice and Bob).
+    const sanitised = sanitiseFtsQuery("alice | bob");
+    expect(sanitised).toBe("alice bob");
+    const { rows } = await store.search({
+      query: sanitised as string,
+      limit: 20,
+    });
+    // "alice bob" matches no single document → empty (the OR injection was neutralised).
+    expect(rows.length).toBe(0);
+  });
+
+  it("a legitimate single-term query still works (regression: sanitise didn't over-strip)", async () => {
+    const sanitised = sanitiseFtsQuery("Alice");
+    const { rows } = await store.search({
+      query: sanitised as string,
+      limit: 20,
+    });
+    expect(rows.map((r) => r.webid)).toContain("https://alice.example/card#me");
+  });
+
+  it("a prefix-match injection ('ali:*') cannot wildcard-match — the operator chars are stripped", async () => {
+    // 'ali:*' unsanitised would prefix-match "alice". Sanitised it is the literal token "ali" (no
+    // prefix operator), which does NOT match the lexeme "alice" — so no unintended hit.
+    const sanitised = sanitiseFtsQuery("ali:*");
+    expect(sanitised).toBe("ali");
+    const { rows } = await store.search({
+      query: sanitised as string,
+      limit: 20,
+    });
+    expect(rows.length).toBe(0);
+  });
+});
