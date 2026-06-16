@@ -7,7 +7,7 @@
  * Surfaces consumed:
  *   - `GET /search?q=`               → {@link IndexClient.search}      (Hydra collection)
  *   - opaque `hydra:next` URL        → {@link IndexClient.fetchPage}   (verbatim follow)
- *   - `GET /lookup?webid=` (follow)  → {@link IndexClient.isIndexed}   (existence check)
+ *   - `GET /lookup?webid=` (manual)  → {@link IndexClient.isIndexed}   (existence check)
  *   - `GET /.well-known/health`      → {@link IndexClient.checkHealth} (liveness)
  *   - `POST /inbox/` (AS2 Announce)  → {@link IndexClient.suggestWebId} (LDN suggest)
  *
@@ -283,43 +283,45 @@ class IndexClientImpl implements IndexClient {
   ): Promise<boolean> {
     const url = new URL(`${this.origin}/lookup`);
     url.searchParams.set("webid", webid);
-    // FOLLOW the redirect and key on the FINAL resolved response, NOT on the
-    // redirect status itself. This avoids the browser `opaqueredirect`
-    // ambiguity (a manual-redirect response can't expose its status code in a
-    // browser, so a stray 301/302/307 from middleware/auth would be
-    // indistinguishable from the intended 303). By following, both runtimes
-    // behave identically and we read an unambiguous final status:
+    const indexOrigin = new URL(this.origin).origin;
+
+    // `redirect: "manual"` — the redirect is NOT followed, so NO outbound request
+    // is ever issued to whatever the redirect points at. This is the security
+    // boundary: an attacker who could inject a redirect on the index path cannot
+    // make this client fetch a third-party origin, because we never follow.
     //
-    //   /lookup?webid=<indexed>   → 303 → /p/{slug}  →  200  (entry exists)
-    //   /lookup?webid=<unknown>   → 404                       (no redirect)
-    //   /lookup?webid=<tombstone> → 303 → /p/{slug}  →  410   (erased)
-    //   /lookup?webid=<malformed> → 400                       (treated as not-indexed)
-    //
-    // "indexed" requires BOTH a 200 final status AND that the final URL landed on
-    // the index's own `/p/` entry path — so a spurious middleware/auth redirect
-    // that resolves to a 200 login page elsewhere is NOT misread as indexed.
-    // `redirect: "follow"` stays on the configured index origin (the only origin
-    // this client ever talks to), so following is safe.
+    // The /lookup route's ONLY redirect is a `303` to a SAME-ORIGIN `/p/{slug}`
+    // for an indexed WebID (404 unknown, 410 tombstoned-after-303, 400 malformed
+    // — none of which we ever follow). "indexed" therefore requires, on the FIRST
+    // response, a readable `303` whose `Location` is a same-origin `/p/` entry doc.
+    // We do NOT issue a second request: the index's own 303→/p/ IS the existence
+    // signal (it 303s only when the entry resolves).
     const res = await this.doFetch(url.toString(), {
       method: "GET",
-      redirect: "follow",
+      redirect: "manual",
       credentials: "omit",
       signal: this.signalFor(opts?.signal),
     });
-    if (!res.ok) return false; // 404 / 410 / anything non-2xx → not indexed
-    // Confirm the followed request actually resolved to an entry document on this
-    // origin (defence against an unexpected 200 from somewhere other than /p/).
+
+    // Browser `redirect: "manual"` → an OPAQUE redirect whose status AND Location
+    // are unreadable. We CANNOT verify it is the intended same-origin 303→/p/, so
+    // we fail closed (return false) rather than trust an unverifiable redirect —
+    // this is what closes the "any browser redirect counts as indexed" gap. (A
+    // browser caller that needs this can fetch the entry doc directly once it has
+    // resolved the slug through the index's own UI flow.)
+    if (res.type === "opaqueredirect") return false;
+
+    // Readable (Node/undici): require EXACTLY 303 with a same-origin /p/ Location.
+    if (res.status !== 303) return false;
+    const location = res.headers.get("Location");
+    if (!location) return false;
+    let target: URL;
     try {
-      const finalUrl = new URL(res.url);
-      const indexOrigin = new URL(this.origin).origin;
-      return (
-        finalUrl.origin === indexOrigin && finalUrl.pathname.startsWith("/p/")
-      );
+      target = new URL(location, url); // resolve relative Location against /lookup
     } catch {
-      // No readable final URL (some opaque modes) — fall back to the 200 signal,
-      // which on this single-origin client still means /lookup resolved an entry.
-      return true;
+      return false;
     }
+    return target.origin === indexOrigin && target.pathname.startsWith("/p/");
   }
 
   async checkHealth(opts?: { signal?: AbortSignal }): Promise<IndexHealth> {

@@ -272,69 +272,99 @@ describe("IndexClient.fetchPage", () => {
 
 describe("IndexClient.isIndexed", () => {
   /**
-   * Build a fetch stub that mimics `redirect: "follow"` resolving to a FINAL
-   * response with the given status + final URL (the client reads res.ok +
-   * res.url, never the redirect status itself — that's the roborev hardening).
+   * Build a fetch stub that mimics `redirect: "manual"` — it asserts the request
+   * is NOT followed (manual) and credentials omitted, then returns a response with
+   * the given status + optional Location header. The redirect is never followed,
+   * so no outbound cross-origin request is ever issued (the security boundary).
    */
-  function followFetch(
+  function manualFetch(
     status: number,
-    finalUrl: string
+    location?: string
   ): typeof globalThis.fetch {
     return vi.fn(async (_url: unknown, init: unknown) => {
-      expect((init as RequestInit).redirect).toBe("follow");
+      expect((init as RequestInit).redirect).toBe("manual");
       expect((init as RequestInit).credentials).toBe("omit");
-      const r = new Response(null, { status });
-      Object.defineProperty(r, "url", { value: finalUrl });
-      return r;
+      return new Response(null, {
+        status,
+        headers: location ? { Location: location } : {},
+      });
     }) as unknown as typeof globalThis.fetch;
   }
 
-  it("true when /lookup follows to a 200 /p/{slug} entry doc", async () => {
+  it("true on a 303 whose Location is a same-origin /p/{slug}", async () => {
     const client = createIndexClient({
       origin: ORIGIN,
-      fetch: followFetch(200, `${ORIGIN}/p/abc123`),
+      fetch: manualFetch(303, `${ORIGIN}/p/abc123`),
     });
     expect(await client?.isIndexed("https://a.pod/card#me")).toBe(true);
   });
 
-  it("false on a 404 (not indexed — /lookup did not redirect)", async () => {
+  it("true on a 303 with a relative /p/ Location", async () => {
     const client = createIndexClient({
       origin: ORIGIN,
-      fetch: followFetch(404, `${ORIGIN}/lookup?webid=x`),
+      fetch: manualFetch(303, "/p/abc123"),
+    });
+    expect(await client?.isIndexed("https://a.pod/card#me")).toBe(true);
+  });
+
+  it("false on a 404 (not indexed — no redirect)", async () => {
+    const client = createIndexClient({
+      origin: ORIGIN,
+      fetch: manualFetch(404),
     });
     expect(await client?.isIndexed("https://a.pod/card#me")).toBe(false);
   });
 
-  it("false on a 410 (followed to /p/{slug} but the entry is tombstoned)", async () => {
+  it("false on any non-303 redirect (301/302/307 are NOT 'indexed')", async () => {
+    for (const status of [301, 302, 307]) {
+      const client = createIndexClient({
+        origin: ORIGIN,
+        fetch: manualFetch(status, `${ORIGIN}/p/abc123`),
+      });
+      expect(await client?.isIndexed("https://a.pod/card#me")).toBe(false);
+    }
+  });
+
+  it("false on a 303 whose Location is NOT under /p/ (a login bounce)", async () => {
     const client = createIndexClient({
       origin: ORIGIN,
-      fetch: followFetch(410, `${ORIGIN}/p/abc123`),
+      fetch: manualFetch(303, `${ORIGIN}/login`),
     });
     expect(await client?.isIndexed("https://a.pod/card#me")).toBe(false);
   });
 
-  it("false when a spurious redirect resolves to a 200 NOT under /p/", async () => {
-    // A middleware/auth bounce landing on a 200 login page must NOT be misread as
-    // indexed — the final URL is not an /p/ entry doc (roborev Medium follow-up).
+  it("false on a 303 whose Location is a DIFFERENT origin", async () => {
     const client = createIndexClient({
       origin: ORIGIN,
-      fetch: followFetch(200, `${ORIGIN}/login`),
+      fetch: manualFetch(303, "https://evil.example/p/abc123"),
     });
     expect(await client?.isIndexed("https://a.pod/card#me")).toBe(false);
   });
 
-  it("false when a redirect resolves to a 200 on a DIFFERENT origin", async () => {
+  it("false on a 303 with no Location header", async () => {
     const client = createIndexClient({
       origin: ORIGIN,
-      fetch: followFetch(200, "https://evil.example/p/abc123"),
+      fetch: manualFetch(303),
     });
+    expect(await client?.isIndexed("https://a.pod/card#me")).toBe(false);
+  });
+
+  it("false (fail-closed) on a browser opaqueredirect (unverifiable)", async () => {
+    // A browser manual-redirect hides status + Location, so we cannot verify it is
+    // the intended same-origin 303→/p/ and must fail closed — closing the "any
+    // browser redirect counts as indexed" gap.
+    const opaque = { type: "opaqueredirect", status: 0, ok: false };
+    const fetchStub = vi.fn(
+      async () => opaque
+    ) as unknown as typeof globalThis.fetch;
+    const client = createIndexClient({ origin: ORIGIN, fetch: fetchStub });
     expect(await client?.isIndexed("https://a.pod/card#me")).toBe(false);
   });
 
   it("false on a 400 (malformed webid, treated as not-indexed)", async () => {
     const client = createIndexClient({
       origin: ORIGIN,
-      fetch: followFetch(400, `${ORIGIN}/lookup?webid=bad`),
+      fetch: manualFetch(400),
     });
     expect(await client?.isIndexed("not-a-webid")).toBe(false);
   });
