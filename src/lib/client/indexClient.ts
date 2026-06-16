@@ -7,7 +7,7 @@
  * Surfaces consumed:
  *   - `GET /search?q=`               → {@link IndexClient.search}      (Hydra collection)
  *   - opaque `hydra:next` URL        → {@link IndexClient.fetchPage}   (verbatim follow)
- *   - `GET /lookup?webid=` (303/404) → {@link IndexClient.isIndexed}   (existence check)
+ *   - `GET /lookup?webid=` (follow)  → {@link IndexClient.isIndexed}   (existence check)
  *   - `GET /.well-known/health`      → {@link IndexClient.checkHealth} (liveness)
  *   - `POST /inbox/` (AS2 Announce)  → {@link IndexClient.suggestWebId} (LDN suggest)
  *
@@ -283,28 +283,43 @@ class IndexClientImpl implements IndexClient {
   ): Promise<boolean> {
     const url = new URL(`${this.origin}/lookup`);
     url.searchParams.set("webid", webid);
-    // `manual` redirect: a 303 (indexed) must NOT be auto-followed into the entry
-    // doc — we only need the existence signal. 303 → indexed; 404 → not; 400 →
-    // malformed webid (treated as not-indexed, not an error).
+    // FOLLOW the redirect and key on the FINAL resolved response, NOT on the
+    // redirect status itself. This avoids the browser `opaqueredirect`
+    // ambiguity (a manual-redirect response can't expose its status code in a
+    // browser, so a stray 301/302/307 from middleware/auth would be
+    // indistinguishable from the intended 303). By following, both runtimes
+    // behave identically and we read an unambiguous final status:
+    //
+    //   /lookup?webid=<indexed>   → 303 → /p/{slug}  →  200  (entry exists)
+    //   /lookup?webid=<unknown>   → 404                       (no redirect)
+    //   /lookup?webid=<tombstone> → 303 → /p/{slug}  →  410   (erased)
+    //   /lookup?webid=<malformed> → 400                       (treated as not-indexed)
+    //
+    // "indexed" requires BOTH a 200 final status AND that the final URL landed on
+    // the index's own `/p/` entry path — so a spurious middleware/auth redirect
+    // that resolves to a 200 login page elsewhere is NOT misread as indexed.
+    // `redirect: "follow"` stays on the configured index origin (the only origin
+    // this client ever talks to), so following is safe.
     const res = await this.doFetch(url.toString(), {
       method: "GET",
-      redirect: "manual",
+      redirect: "follow",
       credentials: "omit",
       signal: this.signalFor(opts?.signal),
     });
-    // The /lookup route's ONLY redirect is a `303` for an indexed WebID (404/400
-    // for not-indexed/malformed are non-redirect statuses). So we match the 303
-    // EXACTLY, not "any 3xx" — a stray 301/302/307 from middleware, a deployment
-    // redirect, or an auth/login bounce must NOT be misread as "indexed".
-    //
-    // In Node/undici a manual-redirect response carries its real status (303). In a
-    // browser, `redirect: "manual"` yields an OPAQUE redirect (status 0, type
-    // "opaqueredirect") whose status code is unreadable — but since /lookup only
-    // ever redirects with 303, an opaque redirect FROM /lookup is necessarily that
-    // 303, so we accept it. Everything else (404, 400, non-3xx, an unexpected 3xx
-    // we can read and isn't 303) is "not indexed".
-    if (res.type === "opaqueredirect") return true;
-    return res.status === 303;
+    if (!res.ok) return false; // 404 / 410 / anything non-2xx → not indexed
+    // Confirm the followed request actually resolved to an entry document on this
+    // origin (defence against an unexpected 200 from somewhere other than /p/).
+    try {
+      const finalUrl = new URL(res.url);
+      const indexOrigin = new URL(this.origin).origin;
+      return (
+        finalUrl.origin === indexOrigin && finalUrl.pathname.startsWith("/p/")
+      );
+    } catch {
+      // No readable final URL (some opaque modes) — fall back to the 200 signal,
+      // which on this single-origin client still means /lookup resolved an entry.
+      return true;
+    }
   }
 
   async checkHealth(opts?: { signal?: AbortSignal }): Promise<IndexHealth> {

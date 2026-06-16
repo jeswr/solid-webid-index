@@ -271,54 +271,71 @@ describe("IndexClient.fetchPage", () => {
 // ─── isIndexed ────────────────────────────────────────────────────────────────
 
 describe("IndexClient.isIndexed", () => {
-  it("true on a 303, false on a 404", async () => {
-    const make = (status: number) =>
-      createIndexClient({
-        origin: ORIGIN,
-        fetch: vi.fn(async (_url: unknown, init: unknown) => {
-          expect((init as RequestInit).redirect).toBe("manual");
-          expect((init as RequestInit).credentials).toBe("omit");
-          return new Response(null, { status });
-        }) as unknown as typeof globalThis.fetch,
-      });
+  /**
+   * Build a fetch stub that mimics `redirect: "follow"` resolving to a FINAL
+   * response with the given status + final URL (the client reads res.ok +
+   * res.url, never the redirect status itself — that's the roborev hardening).
+   */
+  function followFetch(
+    status: number,
+    finalUrl: string
+  ): typeof globalThis.fetch {
+    return vi.fn(async (_url: unknown, init: unknown) => {
+      expect((init as RequestInit).redirect).toBe("follow");
+      expect((init as RequestInit).credentials).toBe("omit");
+      const r = new Response(null, { status });
+      Object.defineProperty(r, "url", { value: finalUrl });
+      return r;
+    }) as unknown as typeof globalThis.fetch;
+  }
 
-    expect(await make(303)?.isIndexed("https://a.pod/card#me")).toBe(true);
-    expect(await make(404)?.isIndexed("https://a.pod/card#me")).toBe(false);
-  });
-
-  it("false on a non-303 redirect (301/302/307 are NOT 'indexed')", async () => {
-    // /lookup's only redirect is the 303; a stray 3xx from middleware / a
-    // deployment redirect / an auth bounce must not be misread as indexed.
-    const make = (status: number) =>
-      createIndexClient({
-        origin: ORIGIN,
-        fetch: vi.fn(
-          async () => new Response(null, { status })
-        ) as unknown as typeof globalThis.fetch,
-      });
-    expect(await make(301)?.isIndexed("https://a.pod/card#me")).toBe(false);
-    expect(await make(302)?.isIndexed("https://a.pod/card#me")).toBe(false);
-    expect(await make(307)?.isIndexed("https://a.pod/card#me")).toBe(false);
-  });
-
-  it("true on an opaqueredirect (browser fetch mode)", async () => {
-    // A browser's `redirect: "manual"` yields a synthetic opaque-redirect response
-    // with status 0 and type "opaqueredirect". The undici Response constructor
-    // rejects status 0, so model it as the duck-typed shape the client reads
-    // (`.type` + `.status`) rather than a real Response.
-    const opaque = { type: "opaqueredirect", status: 0, ok: false };
-    const fetchStub = vi.fn(
-      async () => opaque
-    ) as unknown as typeof globalThis.fetch;
-    const client = createIndexClient({ origin: ORIGIN, fetch: fetchStub });
+  it("true when /lookup follows to a 200 /p/{slug} entry doc", async () => {
+    const client = createIndexClient({
+      origin: ORIGIN,
+      fetch: followFetch(200, `${ORIGIN}/p/abc123`),
+    });
     expect(await client?.isIndexed("https://a.pod/card#me")).toBe(true);
   });
 
+  it("false on a 404 (not indexed — /lookup did not redirect)", async () => {
+    const client = createIndexClient({
+      origin: ORIGIN,
+      fetch: followFetch(404, `${ORIGIN}/lookup?webid=x`),
+    });
+    expect(await client?.isIndexed("https://a.pod/card#me")).toBe(false);
+  });
+
+  it("false on a 410 (followed to /p/{slug} but the entry is tombstoned)", async () => {
+    const client = createIndexClient({
+      origin: ORIGIN,
+      fetch: followFetch(410, `${ORIGIN}/p/abc123`),
+    });
+    expect(await client?.isIndexed("https://a.pod/card#me")).toBe(false);
+  });
+
+  it("false when a spurious redirect resolves to a 200 NOT under /p/", async () => {
+    // A middleware/auth bounce landing on a 200 login page must NOT be misread as
+    // indexed — the final URL is not an /p/ entry doc (roborev Medium follow-up).
+    const client = createIndexClient({
+      origin: ORIGIN,
+      fetch: followFetch(200, `${ORIGIN}/login`),
+    });
+    expect(await client?.isIndexed("https://a.pod/card#me")).toBe(false);
+  });
+
+  it("false when a redirect resolves to a 200 on a DIFFERENT origin", async () => {
+    const client = createIndexClient({
+      origin: ORIGIN,
+      fetch: followFetch(200, "https://evil.example/p/abc123"),
+    });
+    expect(await client?.isIndexed("https://a.pod/card#me")).toBe(false);
+  });
+
   it("false on a 400 (malformed webid, treated as not-indexed)", async () => {
-    const fetchStub = vi.fn(
-      async () => new Response(null, { status: 400 })
-    ) as unknown as typeof globalThis.fetch;
-    const client = createIndexClient({ origin: ORIGIN, fetch: fetchStub });
+    const client = createIndexClient({
+      origin: ORIGIN,
+      fetch: followFetch(400, `${ORIGIN}/lookup?webid=bad`),
+    });
     expect(await client?.isIndexed("not-a-webid")).toBe(false);
   });
 });
