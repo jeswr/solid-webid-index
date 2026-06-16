@@ -7,7 +7,7 @@
  * Surfaces consumed:
  *   - `GET /search?q=`               → {@link IndexClient.search}      (Hydra collection)
  *   - opaque `hydra:next` URL        → {@link IndexClient.fetchPage}   (verbatim follow)
- *   - `GET /lookup?webid=` (manual)  → {@link IndexClient.isIndexed}   (existence check)
+ *   - `GET /lookup?webid=&format=json` → {@link IndexClient.isIndexed}  (existence check)
  *   - `GET /.well-known/health`      → {@link IndexClient.checkHealth} (liveness)
  *   - `POST /inbox/` (AS2 Announce)  → {@link IndexClient.suggestWebId} (LDN suggest)
  *
@@ -190,7 +190,7 @@ export interface IndexClient {
     nextUrl: string,
     opts?: { signal?: AbortSignal }
   ): Promise<IndexPage>;
-  /** True when the WebID is indexed (a `/lookup` 303), false on 404. */
+  /** True when the WebID is indexed (the `/lookup` JSON mode `indexed:true`). */
   isIndexed(webid: string, opts?: { signal?: AbortSignal }): Promise<boolean>;
   /** Read the index liveness snapshot. */
   checkHealth(opts?: { signal?: AbortSignal }): Promise<IndexHealth>;
@@ -283,45 +283,24 @@ class IndexClientImpl implements IndexClient {
   ): Promise<boolean> {
     const url = new URL(`${this.origin}/lookup`);
     url.searchParams.set("webid", webid);
-    const indexOrigin = new URL(this.origin).origin;
-
-    // `redirect: "manual"` — the redirect is NOT followed, so NO outbound request
-    // is ever issued to whatever the redirect points at. This is the security
-    // boundary: an attacker who could inject a redirect on the index path cannot
-    // make this client fetch a third-party origin, because we never follow.
-    //
-    // The /lookup route's ONLY redirect is a `303` to a SAME-ORIGIN `/p/{slug}`
-    // for an indexed WebID (404 unknown, 410 tombstoned-after-303, 400 malformed
-    // — none of which we ever follow). "indexed" therefore requires, on the FIRST
-    // response, a readable `303` whose `Location` is a same-origin `/p/` entry doc.
-    // We do NOT issue a second request: the index's own 303→/p/ IS the existence
-    // signal (it 303s only when the entry resolves).
+    // Use the NON-REDIRECTING JSON mode of /lookup (`?format=json` +
+    // `Accept: application/json`): a single `200 { indexed: boolean, ... }` with NO
+    // redirect. This works identically in Node AND browser fetch — a browser caller
+    // never hits the `redirect:"manual"` opaque-redirect ambiguity, and the client
+    // never follows a redirect to a possibly-foreign origin. We additionally pin
+    // `redirect: "error"` so that even if a misconfigured deployment returned a 3xx
+    // here, the client refuses rather than silently following it cross-origin.
+    url.searchParams.set("format", "json");
     const res = await this.doFetch(url.toString(), {
       method: "GET",
-      redirect: "manual",
+      headers: { Accept: "application/json" },
+      redirect: "error",
       credentials: "omit",
       signal: this.signalFor(opts?.signal),
     });
-
-    // Browser `redirect: "manual"` → an OPAQUE redirect whose status AND Location
-    // are unreadable. We CANNOT verify it is the intended same-origin 303→/p/, so
-    // we fail closed (return false) rather than trust an unverifiable redirect —
-    // this is what closes the "any browser redirect counts as indexed" gap. (A
-    // browser caller that needs this can fetch the entry doc directly once it has
-    // resolved the slug through the index's own UI flow.)
-    if (res.type === "opaqueredirect") return false;
-
-    // Readable (Node/undici): require EXACTLY 303 with a same-origin /p/ Location.
-    if (res.status !== 303) return false;
-    const location = res.headers.get("Location");
-    if (!location) return false;
-    let target: URL;
-    try {
-      target = new URL(location, url); // resolve relative Location against /lookup
-    } catch {
-      return false;
-    }
-    return target.origin === indexOrigin && target.pathname.startsWith("/p/");
+    if (!res.ok) return false; // 400 (malformed webid) / anything non-2xx → not indexed
+    const body = (await res.json()) as { indexed?: unknown };
+    return body.indexed === true;
   }
 
   async checkHealth(opts?: { signal?: AbortSignal }): Promise<IndexHealth> {

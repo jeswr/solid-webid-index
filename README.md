@@ -31,7 +31,7 @@ const idx = createIndexClient({ origin: process.env.NEXT_PUBLIC_WEBID_INDEX ?? "
 if (idx) {
   const page = await idx.search("alice");           // { entries: IndexEntry[]; next: string | null }
   if (page.next) await idx.fetchPage(page.next);     // opaque hydra:next, followed same-origin only
-  await idx.isIndexed("https://alice.pod/card#me");  // /lookup 303 → true
+  await idx.isIndexed("https://alice.pod/card#me");  // /lookup?format=json → indexed:bool
   await idx.suggestWebId("https://bob.pod/card#me", { actor: myWebId }); // AS2 Announce → /inbox/
   await idx.checkHealth();                           // /.well-known/health liveness
 }
