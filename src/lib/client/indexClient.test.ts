@@ -286,6 +286,21 @@ describe("IndexClient.isIndexed", () => {
     expect(await make(404)?.isIndexed("https://a.pod/card#me")).toBe(false);
   });
 
+  it("false on a non-303 redirect (301/302/307 are NOT 'indexed')", async () => {
+    // /lookup's only redirect is the 303; a stray 3xx from middleware / a
+    // deployment redirect / an auth bounce must not be misread as indexed.
+    const make = (status: number) =>
+      createIndexClient({
+        origin: ORIGIN,
+        fetch: vi.fn(
+          async () => new Response(null, { status })
+        ) as unknown as typeof globalThis.fetch,
+      });
+    expect(await make(301)?.isIndexed("https://a.pod/card#me")).toBe(false);
+    expect(await make(302)?.isIndexed("https://a.pod/card#me")).toBe(false);
+    expect(await make(307)?.isIndexed("https://a.pod/card#me")).toBe(false);
+  });
+
   it("true on an opaqueredirect (browser fetch mode)", async () => {
     // A browser's `redirect: "manual"` yields a synthetic opaque-redirect response
     // with status 0 and type "opaqueredirect". The undici Response constructor

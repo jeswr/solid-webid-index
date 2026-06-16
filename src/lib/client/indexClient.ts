@@ -292,11 +292,19 @@ class IndexClientImpl implements IndexClient {
       credentials: "omit",
       signal: this.signalFor(opts?.signal),
     });
-    // A manual-redirect 303 surfaces as status 303 (Node/undici) or an opaque
-    // redirect (status 0, type "opaqueredirect") in some browser fetch modes —
-    // treat any 3xx OR an opaqueredirect as "indexed".
+    // The /lookup route's ONLY redirect is a `303` for an indexed WebID (404/400
+    // for not-indexed/malformed are non-redirect statuses). So we match the 303
+    // EXACTLY, not "any 3xx" — a stray 301/302/307 from middleware, a deployment
+    // redirect, or an auth/login bounce must NOT be misread as "indexed".
+    //
+    // In Node/undici a manual-redirect response carries its real status (303). In a
+    // browser, `redirect: "manual"` yields an OPAQUE redirect (status 0, type
+    // "opaqueredirect") whose status code is unreadable — but since /lookup only
+    // ever redirects with 303, an opaque redirect FROM /lookup is necessarily that
+    // 303, so we accept it. Everything else (404, 400, non-3xx, an unexpected 3xx
+    // we can read and isn't 303) is "not indexed".
     if (res.type === "opaqueredirect") return true;
-    return res.status >= 300 && res.status < 400;
+    return res.status === 303;
   }
 
   async checkHealth(opts?: { signal?: AbortSignal }): Promise<IndexHealth> {
