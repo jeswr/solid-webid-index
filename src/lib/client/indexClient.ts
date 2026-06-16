@@ -291,16 +291,27 @@ class IndexClientImpl implements IndexClient {
     // `redirect: "error"` so that even if a misconfigured deployment returned a 3xx
     // here, the client refuses rather than silently following it cross-origin.
     url.searchParams.set("format", "json");
-    const res = await this.doFetch(url.toString(), {
-      method: "GET",
-      headers: { Accept: "application/json" },
-      redirect: "error",
-      credentials: "omit",
-      signal: this.signalFor(opts?.signal),
-    });
-    if (!res.ok) return false; // 400 (malformed webid) / anything non-2xx → not indexed
-    const body = (await res.json()) as { indexed?: unknown };
-    return body.indexed === true;
+    // isIndexed is a boolean existence check, so it FAILS CLOSED: any inability to
+    // get a clean `indexed:true` — a stray 3xx (rejected by redirect:"error"), a
+    // network error, a non-2xx, or a malformed/empty JSON body — resolves to
+    // `false` ("could not confirm indexed") rather than throwing. (Note: an
+    // AbortSignal abort also surfaces as a rejection here and is reported as
+    // `false`; callers that need to distinguish cancellation should check their
+    // own signal.)
+    try {
+      const res = await this.doFetch(url.toString(), {
+        method: "GET",
+        headers: { Accept: "application/json" },
+        redirect: "error",
+        credentials: "omit",
+        signal: this.signalFor(opts?.signal),
+      });
+      if (!res.ok) return false; // 400 (malformed webid) / anything non-2xx → not indexed
+      const body = (await res.json()) as { indexed?: unknown };
+      return body.indexed === true;
+    } catch {
+      return false;
+    }
   }
 
   async checkHealth(opts?: { signal?: AbortSignal }): Promise<IndexHealth> {

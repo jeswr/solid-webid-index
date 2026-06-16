@@ -334,6 +334,32 @@ describe("IndexClient.isIndexed", () => {
     });
     expect(await client?.isIndexed("https://a.pod/card#me")).toBe(false);
   });
+
+  it("false (fail-closed) when fetch rejects (redirect:error / network)", async () => {
+    // `redirect: "error"` makes fetch REJECT on a stray 3xx; a network error
+    // rejects too. isIndexed is a boolean check → fail closed, never throw.
+    const fetchStub = vi.fn(async () => {
+      throw new TypeError("fetch failed: unexpected redirect");
+    }) as unknown as typeof globalThis.fetch;
+    const client = createIndexClient({ origin: ORIGIN, fetch: fetchStub });
+    await expect(client?.isIndexed("https://a.pod/card#me")).resolves.toBe(
+      false
+    );
+  });
+
+  it("false (fail-closed) on a 200 with a malformed JSON body", async () => {
+    const fetchStub = vi.fn(
+      async () =>
+        new Response("not json{", {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })
+    ) as unknown as typeof globalThis.fetch;
+    const client = createIndexClient({ origin: ORIGIN, fetch: fetchStub });
+    await expect(client?.isIndexed("https://a.pod/card#me")).resolves.toBe(
+      false
+    );
+  });
 });
 
 // ─── checkHealth ──────────────────────────────────────────────────────────────
