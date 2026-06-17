@@ -13,7 +13,8 @@
       "out",
       "coverage",
       ".agents",
-      "skills-lock.json"
+      "skills-lock.json",
+      "scripts/check-lockfile-transport.mjs"
     ]
   },
   "formatter": {

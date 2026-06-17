@@ -5,12 +5,13 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "lint": "biome check .",
+    "lint": "biome check . && npm run check:fetch && npm run check:imports && npm run check:lockfile-transport",
     "format": "biome format .",
     "typecheck": "next typegen && tsc --noEmit",
     "test": "vitest run",
     "check:fetch": "node scripts/check-no-raw-fetch.mjs",
-    "check:imports": "node scripts/check-import-extensions.mjs"
+    "check:imports": "node scripts/check-import-extensions.mjs",
+    "check:lockfile-transport": "node scripts/check-lockfile-transport.mjs"
   },
   "engines": {
     "node": ">=24.0.0"
