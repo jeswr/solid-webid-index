@@ -34,7 +34,7 @@
     "sonner": "^2.0.7",
     "tailwind-merge": "^3.6.0",
     "tw-animate-css": "^1.4.0",
-    "undici": "^7.27.2"
+    "undici": "^7.28.0"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
@@ -50,6 +50,9 @@
     "vitest": "^4.1.8"
   },
   "overrides": {
-    "postcss": "^8.5.15"
+    "postcss": "^8.5.15",
+    "@digitalbazaar/http-client": {
+      "undici": "^6.27.0"
+    }
   }
 }
