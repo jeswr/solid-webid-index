@@ -20,10 +20,26 @@
   },
   "dependsOn": [],
   "federation": {
-    "sectors": ["identity"],
-    "accessModes": ["Read"],
-    "consumes": ["identity"],
+    "sectors": [
+      "identity"
+    ],
+    "accessModes": [
+      "Read"
+    ],
+    "consumes": [
+      "identity"
+    ],
     "produces": [],
     "membershipTodo": "TODO(O1-gated): declare fedapp:memberOf once the fedapp: namespace is frozen and the registry engine ships. The index reads public WebID profiles (identity sector, Read only); its client-id doc will gain a fedapp: block at that point."
+  },
+  "status": {
+    "generatedAt": "2026-07-03T05:14:39.963Z",
+    "commit": "839d9ef51f55f310066abadff74fa3d96f671ab7",
+    "gate": {
+      "lint": "skip",
+      "typecheck": "skip",
+      "test": "skip",
+      "build": "skip"
+    }
   }
 }
